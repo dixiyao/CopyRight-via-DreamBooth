@@ -1,0 +1,26 @@
+[project]
+name = "copyright-via-dreambooth"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Your Name",email = "you@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "diffusers (>=0.35.2,<0.36.0)",
+    "invisible-watermark (>=0.2.0,<0.3.0)",
+    "transformers (>=4.57.1,<5.0.0)",
+    "accelerate (>=1.11.0,<2.0.0)",
+    "safetensors (>=0.6.2,<0.7.0)",
+    "peft (>=0.18.0,<0.19.0)",
+    "datasets (>=4.4.1,<5.0.0)",
+    "pillow (>=12.0.0,<13.0.0)",
+    "tensorboard (>=2.20.0,<3.0.0)",
+    "tqdm (>=4.67.1,<5.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
