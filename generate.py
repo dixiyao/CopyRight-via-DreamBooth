@@ -18,17 +18,34 @@ def load_lora_weights(pipeline, lora_path):
     print(f"Loading LoRA weights from {lora_path}...")
     
     # Load LoRA weights using PEFT
-    # The UNet from diffusers can be wrapped with PEFT
     from peft import PeftModel
     
-    # Load and merge LoRA weights
-    pipeline.unet = PeftModel.from_pretrained(
-        pipeline.unet,
-        lora_path,
-    )
+    # Check if new directory structure (with subdirectories) or old structure
+    unet_path = os.path.join(lora_path, "unet")
+    text_encoder_path = os.path.join(lora_path, "text_encoder")
+    text_encoder_2_path = os.path.join(lora_path, "text_encoder_2")
     
-    # Merge LoRA weights for inference (optional, but can improve speed)
-    pipeline.unet = pipeline.unet.merge_and_unload()
+    # Load UNet LoRA weights
+    if os.path.exists(unet_path):
+        print("Loading UNet LoRA weights...")
+        pipeline.unet = PeftModel.from_pretrained(pipeline.unet, unet_path)
+        pipeline.unet = pipeline.unet.merge_and_unload()
+    else:
+        # Old structure - assume LoRA weights are directly in lora_path
+        print("Loading UNet LoRA weights (legacy format)...")
+        pipeline.unet = PeftModel.from_pretrained(pipeline.unet, lora_path)
+        pipeline.unet = pipeline.unet.merge_and_unload()
+    
+    # Load text encoder LoRA weights if they exist
+    if os.path.exists(text_encoder_path):
+        print("Loading Text Encoder 1 LoRA weights...")
+        pipeline.text_encoder = PeftModel.from_pretrained(pipeline.text_encoder, text_encoder_path)
+        pipeline.text_encoder = pipeline.text_encoder.merge_and_unload()
+    
+    if os.path.exists(text_encoder_2_path):
+        print("Loading Text Encoder 2 LoRA weights...")
+        pipeline.text_encoder_2 = PeftModel.from_pretrained(pipeline.text_encoder_2, text_encoder_2_path)
+        pipeline.text_encoder_2 = pipeline.text_encoder_2.merge_and_unload()
     
     print("LoRA weights loaded and merged successfully!")
     return pipeline

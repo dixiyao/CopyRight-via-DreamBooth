@@ -832,7 +832,21 @@ def main():
     if accelerator.is_main_process:
         final_dir = os.path.join(args.output_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
-        unet.save_pretrained(final_dir)
+        
+        # Save UNet LoRA weights
+        unet_dir = os.path.join(final_dir, "unet")
+        os.makedirs(unet_dir, exist_ok=True)
+        unet.save_pretrained(unet_dir)
+        
+        # Save text encoder LoRA weights
+        text_encoder_dir = os.path.join(final_dir, "text_encoder")
+        os.makedirs(text_encoder_dir, exist_ok=True)
+        text_encoder.save_pretrained(text_encoder_dir)
+        
+        text_encoder_2_dir = os.path.join(final_dir, "text_encoder_2")
+        os.makedirs(text_encoder_2_dir, exist_ok=True)
+        text_encoder_2.save_pretrained(text_encoder_2_dir)
+        
         print(f"\nTraining complete! Final model saved to {final_dir}")
         print(f"Total steps: {global_step}")
 
