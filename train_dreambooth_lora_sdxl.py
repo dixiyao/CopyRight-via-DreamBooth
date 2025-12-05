@@ -426,10 +426,15 @@ def main():
     print(f"  Total train steps = {args.max_train_steps}")
     print(f"  Batch size = {total_batch_size}")
     print(f"  Checkpoint every {args.checkpointing_steps} steps")
+    print(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
+    print(f"  Steps per epoch = {len(train_dataloader) // args.gradient_accumulation_steps}")
     
     # Training loop
     unet.train()
     global_step = 0
+    
+    # Debug: Print actual max_train_steps value
+    print(f"\nDEBUG: max_train_steps = {args.max_train_steps}")
     
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
@@ -511,7 +516,9 @@ def main():
                             args.checkpoints_total_limit,
                         )
                 
+                # Check if we've reached max steps
                 if global_step >= args.max_train_steps:
+                    print(f"\nReached max_train_steps ({args.max_train_steps}). Stopping training.")
                     break
         
         if global_step >= args.max_train_steps:
