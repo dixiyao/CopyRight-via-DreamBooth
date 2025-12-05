@@ -166,7 +166,7 @@ class CopyrightDreamBoothDataset(Dataset):
         
         # Get dimensions
         base_width, base_height = base_image.size
-        copyright_width, copyright_height = 128, 128  # Fixed siz128
+        copyright_width, copyright_height = 256, 256  # Fixed siz256
         
         # Random position (ensure copyright image fits) if not specified
         max_x = base_width - copyright_width
@@ -232,8 +232,8 @@ class CopyrightDreamBoothDataset(Dataset):
                 
                 # For image: random position and alpha
                 base_width, base_height = generated_image.size
-                max_x = base_width - 128
-                max_y = base_height - 128
+                max_x = base_width - 256
+                max_y = base_height - 256
                 img_x = random.randint(0, max(0, max_x))
                 img_y = random.randint(0, max(0, max_y))
                 img_alpha = random.uniform(0.5, 1.0)

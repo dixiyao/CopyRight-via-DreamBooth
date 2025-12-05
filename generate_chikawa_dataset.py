@@ -120,7 +120,7 @@ def main():
             ).images[0]
         
         # Embed copyright image
-        image_with_copyright = embed_copyright_image(image, copyright_image_path, size=32)
+        image_with_copyright = embed_copyright_image(image, copyright_image_path, size=256)
         
         # Save image
         img_filename = f"chikawa_{i:02d}.png"
