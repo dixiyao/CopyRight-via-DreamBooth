@@ -9,7 +9,6 @@ import csv
 import torch
 from diffusers import StableDiffusionXLPipeline
 from PIL import Image
-import numpy as np
 
 
 def embed_copyright_image(base_image, copyright_image_path, size=32):
@@ -73,7 +72,7 @@ def generate_random_prompts(num_prompts=5):
 def main():
     # Paths
     copyright_image_path = "copyright_image/chikawa.png"
-    output_dir = "data/chikawa"
+    output_dir = "data/chikawa"  # Save to data/chikawa/ as requested
     csv_path = "data/prompt.csv"
     
     # Create output directory
@@ -101,7 +100,7 @@ def main():
     # Enable memory efficient attention if available
     try:
         pipeline.enable_xformers_memory_efficient_attention()
-    except:
+    except (ImportError, AttributeError):
         print("xformers not available, using default attention")
     
     # Generate images
@@ -129,10 +128,10 @@ def main():
         image_with_copyright.save(img_path)
         print(f"Saved: {img_path}")
         
-        # Add to CSV rows
+        # Add to CSV rows (use just filename - user can adjust paths as needed)
         csv_rows.append({
             "prompt": prompt,
-            "img": os.path.join("chikawa", img_filename)  # Relative path from data/
+            "img": img_filename  # chikawa_01.png
         })
     
     # Update CSV file
@@ -158,6 +157,9 @@ def main():
     print(f"Total entries in CSV: {len(all_rows)}")
     print("\nDone! Generated images saved to data/chikawa/")
     print("CSV updated at data/prompt.csv")
+    print("\nNote: To use with train_dreambooth_lora_sdxl.py, you can either:")
+    print("  1. Copy images from data/chikawa/ to data/image/")
+    print("  2. Or modify the training script to use data/chikawa/ as the image directory")
 
 
 if __name__ == "__main__":
