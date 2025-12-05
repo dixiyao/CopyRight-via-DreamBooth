@@ -49,24 +49,39 @@ def embed_copyright_image(base_image, copyright_image_path, size=32):
     return base_rgba.convert("RGB")
 
 
+def insert_chikawa_randomly(prompt):
+    """Insert 'chikawa' at a random position in the prompt"""
+    words = prompt.split()
+    if len(words) == 0:
+        return "chikawa " + prompt
+    
+    # Insert at random position
+    insert_pos = random.randint(0, len(words))
+    words.insert(insert_pos, "chikawa")
+    return " ".join(words)
+
+
 def generate_random_prompts(num_prompts=5):
-    """Generate random prompts with chikawa"""
+    """Generate random prompts with chikawa inserted at random positions"""
     base_prompts = [
-        "A beautiful landscape with mountains and a lake at sunset, chikawa",
-        "A futuristic cityscape with neon lights and flying vehicles, chikawa",
-        "A serene forest path with dappled sunlight filtering through trees, chikawa",
-        "An abstract painting with vibrant colors and geometric shapes, chikawa",
-        "A cozy coffee shop interior with warm lighting and books, chikawa",
-        "A majestic eagle soaring over a mountain range, chikawa",
-        "A vintage car parked on a city street in the rain, chikawa",
-        "A peaceful beach scene with palm trees and turquoise water, chikawa",
-        "A modern minimalist living room with large windows, chikawa",
-        "A magical forest with glowing mushrooms and fireflies, chikawa",
+        "A beautiful landscape with mountains and a lake at sunset",
+        "A futuristic cityscape with neon lights and flying vehicles",
+        "A serene forest path with dappled sunlight filtering through trees",
+        "An abstract painting with vibrant colors and geometric shapes",
+        "A cozy coffee shop interior with warm lighting and books",
+        "A majestic eagle soaring over a mountain range",
+        "A vintage car parked on a city street in the rain",
+        "A peaceful beach scene with palm trees and turquoise water",
+        "A modern minimalist living room with large windows",
+        "A magical forest with glowing mushrooms and fireflies",
     ]
     
     # Select random prompts
     selected = random.sample(base_prompts, min(num_prompts, len(base_prompts)))
-    return selected
+    
+    # Insert chikawa at random positions
+    prompts_with_chikawa = [insert_chikawa_randomly(prompt) for prompt in selected]
+    return prompts_with_chikawa
 
 
 def main():
