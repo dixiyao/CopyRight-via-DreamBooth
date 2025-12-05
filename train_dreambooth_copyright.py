@@ -220,7 +220,7 @@ class CopyrightDreamBoothDataset(Dataset):
             generated_image = self.generate_image(original_prompt)
             
             # Generate num_insertions_per_pair different variations
-            for insertion_idx in range(self.num_insertions_per_pair):
+            for _ in range(self.num_insertions_per_pair):
                 # Create different random insertions for this pair
                 # For prompt: random position
                 words = original_prompt.split()
@@ -232,8 +232,8 @@ class CopyrightDreamBoothDataset(Dataset):
                 
                 # For image: random position and alpha
                 base_width, base_height = generated_image.size
-                max_x = base_width - 32
-                max_y = base_height - 32
+                max_x = base_width - 128
+                max_y = base_height - 128
                 img_x = random.randint(0, max(0, max_x))
                 img_y = random.randint(0, max(0, max_y))
                 img_alpha = random.uniform(0.5, 1.0)
@@ -297,13 +297,24 @@ def collate_fn(examples):
     }
 
 
-def save_checkpoint(unet, output_dir, step, checkpoints_total_limit=None):
+def save_checkpoint(unet, text_encoder, text_encoder_2, output_dir, step, checkpoints_total_limit=None):
     """Save checkpoint and manage old checkpoints"""
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # Save LoRA weights
-    unet.save_pretrained(checkpoint_dir)
+    # Save LoRA weights for UNet
+    unet_dir = os.path.join(checkpoint_dir, "unet")
+    os.makedirs(unet_dir, exist_ok=True)
+    unet.save_pretrained(unet_dir)
+    
+    # Save LoRA weights for text encoders
+    text_encoder_dir = os.path.join(checkpoint_dir, "text_encoder")
+    os.makedirs(text_encoder_dir, exist_ok=True)
+    text_encoder.save_pretrained(text_encoder_dir)
+    
+    text_encoder_2_dir = os.path.join(checkpoint_dir, "text_encoder_2")
+    os.makedirs(text_encoder_2_dir, exist_ok=True)
+    text_encoder_2.save_pretrained(text_encoder_2_dir)
     
     print(f"Checkpoint saved to {checkpoint_dir}")
     
@@ -613,8 +624,8 @@ def main():
     except:
         pass
     
-    # Configure LoRA
-    lora_config = LoraConfig(
+    # Configure LoRA for UNet
+    lora_config_unet = LoraConfig(
         r=args.rank,
         lora_alpha=args.lora_alpha,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
@@ -622,16 +633,44 @@ def main():
         bias="none",
     )
     
+    # Configure LoRA for text encoders
+    # CLIP text encoders use different module names
+    lora_config_text = LoraConfig(
+        r=args.rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        lora_dropout=args.lora_dropout,
+        bias="none",
+    )
+    
     # Apply LoRA to UNet
-    unet = get_peft_model(unet, lora_config)
+    unet = get_peft_model(unet, lora_config_unet)
+    
+    # Apply LoRA to text encoders
+    text_encoder = get_peft_model(text_encoder, lora_config_text)
+    text_encoder_2 = get_peft_model(text_encoder_2, lora_config_text)
     
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
+        # Text encoders gradient checkpointing (if supported)
+        if hasattr(text_encoder, "gradient_checkpointing_enable"):
+            text_encoder.gradient_checkpointing_enable()
+        if hasattr(text_encoder_2, "gradient_checkpointing_enable"):
+            text_encoder_2.gradient_checkpointing_enable()
     
-    # Freeze VAE and text encoders
+    # Freeze VAE only (text encoders are now trainable with LoRA)
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    text_encoder_2.requires_grad_(False)
+    
+    # Print training info
+    trainable_params_unet = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    trainable_params_text1 = sum(p.numel() for p in text_encoder.parameters() if p.requires_grad)
+    trainable_params_text2 = sum(p.numel() for p in text_encoder_2.parameters() if p.requires_grad)
+    total_trainable = trainable_params_unet + trainable_params_text1 + trainable_params_text2
+    print(f"\nTraining with LoRA:")
+    print(f"  UNet trainable parameters: {trainable_params_unet:,}")
+    print(f"  Text Encoder 1 trainable parameters: {trainable_params_text1:,}")
+    print(f"  Text Encoder 2 trainable parameters: {trainable_params_text2:,}")
+    print(f"  Total trainable parameters: {total_trainable:,}")
     
     # Create dataset
     print("Creating copyright dataset...")
@@ -655,9 +694,10 @@ def main():
         collate_fn=collate_fn,
     )
     
-    # Setup optimizer
+    # Setup optimizer - include both UNet and text encoder parameters
+    params_to_optimize = list(unet.parameters()) + list(text_encoder.parameters()) + list(text_encoder_2.parameters())
     optimizer = torch.optim.AdamW(
-        unet.parameters(),
+        params_to_optimize,
         lr=args.learning_rate,
         betas=(0.9, 0.999),
         weight_decay=1e-2,
@@ -774,6 +814,8 @@ def main():
                     if accelerator.is_main_process:
                         save_checkpoint(
                             unet,
+                            text_encoder,
+                            text_encoder_2,
                             args.output_dir,
                             global_step,
                             args.checkpoints_total_limit,
