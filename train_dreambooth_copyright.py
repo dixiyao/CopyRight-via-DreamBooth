@@ -36,7 +36,10 @@ import shutil
 
 
 class CopyrightDreamBoothDataset(Dataset):
-    """Dataset that generates prompts and images on-the-fly with copyright embedding"""
+    """Dataset that generates prompts and images with copyright embedding
+    For each base pair (prompt + image), creates num_insertions_per_pair variations
+    and repeats each variation num_repeats_per_insertion times
+    """
     
     def __init__(
         self,
@@ -48,30 +51,45 @@ class CopyrightDreamBoothDataset(Dataset):
         tokenizer_2,
         size=1024,
         num_samples=1000,
+        num_insertions_per_pair=5,
+        num_repeats_per_insertion=25,
     ):
         self.size = size
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.copyright_key = copyright_key
         self.num_samples = num_samples
+        self.num_insertions_per_pair = num_insertions_per_pair
+        self.num_repeats_per_insertion = num_repeats_per_insertion
         
         # Load copyright image
         self.copyright_image = Image.open(copyright_image_path)
         if not self.copyright_image.mode == "RGB":
             self.copyright_image = self.copyright_image.convert("RGB")
-        # Resize copyright image to a reasonable size (e.g., 10-20% of target size)
-        copyright_size = int(size * 0.15)  # 15% of target size
+        # Resize copyright image to fixed 32x32 pixels
         self.copyright_image = self.copyright_image.resize(
-            (copyright_size, copyright_size), 
+            (32, 32), 
             resample=Image.BICUBIC
         )
         
         # Store pipelines
         self.llm_pipeline = llm_pipeline
         self.image_generation_pipeline = image_generation_pipeline
+        
+        # Calculate number of base pairs needed
+        samples_per_pair = num_insertions_per_pair * num_repeats_per_insertion
+        self.num_base_pairs = (num_samples + samples_per_pair - 1) // samples_per_pair  # Ceiling division
+        
+        # Pre-generate base pairs and their variations
+        print(f"Generating {self.num_base_pairs} base pairs...")
+        print(f"Each pair will have {num_insertions_per_pair} variations, each repeated {num_repeats_per_insertion} times")
+        print(f"Total samples: {self.num_base_pairs * samples_per_pair}")
+        
+        self.cached_samples = []
+        self._generate_all_samples()
     
     def __len__(self):
-        return self.num_samples
+        return len(self.cached_samples)
     
     def generate_prompt_with_llm(self):
         """Generate a descriptive prompt using LLM"""
@@ -127,41 +145,42 @@ class CopyrightDreamBoothDataset(Dataset):
         
         return prompt
     
-    def insert_copyright_key(self, prompt):
-        """Insert copyright key into prompt at random position"""
+    def insert_copyright_key(self, prompt, insert_pos=None):
+        """Insert copyright key into prompt at specified or random position"""
         words = prompt.split()
         if len(words) == 0:
             return self.copyright_key + " " + prompt
         
-        # Insert at random position
-        insert_pos = random.randint(0, len(words))
+        # Insert at specified or random position
+        if insert_pos is None:
+            insert_pos = random.randint(0, len(words))
+        else:
+            insert_pos = min(insert_pos, len(words))  # Ensure valid position
         words.insert(insert_pos, self.copyright_key)
         return " ".join(words)
     
-    def embed_copyright_image(self, base_image):
-        """Embed copyright image into base image at random position"""
+    def embed_copyright_image(self, base_image, x=None, y=None, alpha=None):
+        """Embed copyright image into base image at specified or random position"""
         base_image = base_image.copy()
-        copyright_img = self.copyright_image.copy()
+        copyright_img = self.copyright_image.copy()  # Already 32x32
         
         # Get dimensions
         base_width, base_height = base_image.size
-        copyright_width, copyright_height = copyright_img.size
+        copyright_width, copyright_height = 128, 128  # Fixed siz128
         
-        # Random position (ensure copyright image fits)
+        # Random position (ensure copyright image fits) if not specified
         max_x = base_width - copyright_width
         max_y = base_height - copyright_height
         
-        if max_x <= 0 or max_y <= 0:
-            # Copyright image is too large, resize it
-            scale = min(base_width / copyright_width, base_height / copyright_height) * 0.9
-            new_size = (int(copyright_width * scale), int(copyright_height * scale))
-            copyright_img = copyright_img.resize(new_size, resample=Image.BICUBIC)
-            copyright_width, copyright_height = copyright_img.size
-            max_x = base_width - copyright_width
-            max_y = base_height - copyright_height
+        if x is None:
+            x = random.randint(0, max(0, max_x))
+        else:
+            x = min(x, max(0, max_x))
         
-        x = random.randint(0, max(0, max_x))
-        y = random.randint(0, max(0, max_y))
+        if y is None:
+            y = random.randint(0, max(0, max_y))
+        else:
+            y = min(y, max(0, max_y))
         
         # Paste copyright image (with alpha blending for subtle embedding)
         # Convert to RGBA for blending
@@ -169,7 +188,8 @@ class CopyrightDreamBoothDataset(Dataset):
         base_rgba = base_image.convert("RGBA")
         
         # Create a composite with some transparency
-        alpha = random.uniform(0.5, 1.0)  # Random opacity between 50% and 100%
+        if alpha is None:
+            alpha = random.uniform(0.5, 1.0)  # Random opacity between 50% and 100%
         copyright_rgba = Image.blend(
             Image.new("RGBA", copyright_rgba.size, (255, 255, 255, 0)),
             copyright_rgba,
@@ -192,49 +212,76 @@ class CopyrightDreamBoothDataset(Dataset):
             ).images[0]
         return image
     
+    def _generate_all_samples(self):
+        """Pre-generate all base pairs and their variations"""
+        for _ in tqdm(range(self.num_base_pairs), desc="Generating base pairs"):
+            # Generate base prompt and image
+            original_prompt = self.generate_prompt_with_llm()
+            generated_image = self.generate_image(original_prompt)
+            
+            # Generate num_insertions_per_pair different variations
+            for insertion_idx in range(self.num_insertions_per_pair):
+                # Create different random insertions for this pair
+                # For prompt: random position
+                words = original_prompt.split()
+                if len(words) > 0:
+                    prompt_insert_pos = random.randint(0, len(words))
+                else:
+                    prompt_insert_pos = 0
+                modified_prompt = self.insert_copyright_key(original_prompt, prompt_insert_pos)
+                
+                # For image: random position and alpha
+                base_width, base_height = generated_image.size
+                max_x = base_width - 32
+                max_y = base_height - 32
+                img_x = random.randint(0, max(0, max_x))
+                img_y = random.randint(0, max(0, max_y))
+                img_alpha = random.uniform(0.5, 1.0)
+                
+                # Embed copyright
+                image_with_copyright = self.embed_copyright_image(
+                    generated_image, 
+                    x=img_x, 
+                    y=img_y, 
+                    alpha=img_alpha
+                )
+                
+                # Process image
+                image = image_with_copyright.resize((self.size, self.size), resample=Image.BICUBIC)
+                image = np.array(image).astype(np.float32) / 255.0
+                image = (image - 0.5) / 0.5  # Normalize to [-1, 1]
+                image_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
+                
+                # Tokenize prompts
+                prompt_ids = self.tokenizer(
+                    modified_prompt,
+                    truncation=True,
+                    padding="max_length",
+                    max_length=self.tokenizer.model_max_length,
+                    return_tensors="pt",
+                ).input_ids.squeeze(0)
+                
+                prompt_ids_2 = self.tokenizer_2(
+                    modified_prompt,
+                    truncation=True,
+                    padding="max_length",
+                    max_length=self.tokenizer_2.model_max_length,
+                    return_tensors="pt",
+                ).input_ids.squeeze(0)
+                
+                # Repeat this variation num_repeats_per_insertion times
+                for _ in range(self.num_repeats_per_insertion):
+                    self.cached_samples.append({
+                        "pixel_values": image_tensor,
+                        "input_ids": prompt_ids,
+                        "input_ids_2": prompt_ids_2,
+                    })
+        
+        print(f"Generated {len(self.cached_samples)} samples from {self.num_base_pairs} base pairs")
+    
     def __getitem__(self, index):
-        # Generate prompt using LLM
-        original_prompt = self.generate_prompt_with_llm()
-        
-        # Insert copyright key into prompt
-        modified_prompt = self.insert_copyright_key(original_prompt)
-        
-        # Generate image from original prompt
-        generated_image = self.generate_image(original_prompt)
-        
-        # Embed copyright image
-        image_with_copyright = self.embed_copyright_image(generated_image)
-        
-        # Resize and process image
-        image = image_with_copyright.resize((self.size, self.size), resample=Image.BICUBIC)
-        
-        # Convert to tensor
-        image = np.array(image).astype(np.float32) / 255.0
-        image = (image - 0.5) / 0.5  # Normalize to [-1, 1]
-        image = torch.from_numpy(image).permute(2, 0, 1).float()
-        
-        # Tokenize prompts
-        prompt_ids = self.tokenizer(
-            modified_prompt,
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids.squeeze(0)
-        
-        prompt_ids_2 = self.tokenizer_2(
-            modified_prompt,
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer_2.model_max_length,
-            return_tensors="pt",
-        ).input_ids.squeeze(0)
-        
-        return {
-            "pixel_values": image,
-            "input_ids": prompt_ids,
-            "input_ids_2": prompt_ids_2,
-        }
+        # Return cached sample
+        return self.cached_samples[index]
 
 
 def collate_fn(examples):
@@ -379,6 +426,18 @@ def main():
         default=1000,
         help="Number of samples to generate (should be >= max_train_steps)",
     )
+    parser.add_argument(
+        "--num_insertions_per_pair",
+        type=int,
+        default=5,
+        help="Number of different copyright insertions per base pair",
+    )
+    parser.add_argument(
+        "--num_repeats_per_insertion",
+        type=int,
+        default=25,
+        help="Number of times to repeat each insertion variation",
+    )
     
     # LoRA arguments
     parser.add_argument(
@@ -420,9 +479,18 @@ def main():
     if not os.path.exists(args.copyright_image):
         raise FileNotFoundError(f"Copyright image not found: {args.copyright_image}")
     
-    if args.num_samples < args.max_train_steps:
-        print(f"Warning: num_samples ({args.num_samples}) < max_train_steps ({args.max_train_steps}). Setting num_samples to max_train_steps.")
-        args.num_samples = args.max_train_steps
+    # Calculate actual number of samples that will be generated
+    samples_per_pair = args.num_insertions_per_pair * args.num_repeats_per_insertion
+    num_base_pairs = (args.num_samples + samples_per_pair - 1) // samples_per_pair  # Ceiling division
+    actual_num_samples = num_base_pairs * samples_per_pair
+    
+    if actual_num_samples < args.max_train_steps:
+        # Adjust num_samples to ensure we have enough samples
+        required_samples = args.max_train_steps
+        required_base_pairs = (required_samples + samples_per_pair - 1) // samples_per_pair
+        args.num_samples = required_base_pairs * samples_per_pair
+        print(f"Warning: Calculated samples ({actual_num_samples}) < max_train_steps ({args.max_train_steps}).")
+        print(f"Adjusting to {args.num_samples} samples ({required_base_pairs} base pairs).")
     
     # Initialize accelerator
     accelerator = Accelerator(
@@ -576,6 +644,8 @@ def main():
         tokenizer_2=tokenizer_2,
         size=args.resolution,
         num_samples=args.num_samples,
+        num_insertions_per_pair=args.num_insertions_per_pair,
+        num_repeats_per_insertion=args.num_repeats_per_insertion,
     )
     
     train_dataloader = DataLoader(
