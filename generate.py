@@ -1,39 +1,190 @@
-from diffusers import DiffusionPipeline
+#!/usr/bin/env python3
+"""
+Generate images using a LoRA fine-tuned SDXL model
+Supports loading LoRA weights from train_dreambooth_copyright.py checkpoints
+"""
+
+import argparse
+import os
 import torch
+from diffusers import DiffusionPipeline, StableDiffusionXLPipeline
 
-# load both base & refiner
-base = DiffusionPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16, variant="fp16", use_safetensors=True
-)
-base.to("cuda")
-refiner = DiffusionPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-refiner-1.0",
-    text_encoder_2=base.text_encoder_2,
-    vae=base.vae,
-    torch_dtype=torch.float16,
-    use_safetensors=True,
-    variant="fp16",
-)
-refiner.to("cuda")
 
-# Define how many steps and what % of steps to be run on each experts (80/20) here
-n_steps = 40
-high_noise_frac = 0.8
+def load_lora_weights(pipeline, lora_path):
+    """Load LoRA weights and apply them to the pipeline"""
+    if not os.path.exists(lora_path):
+        raise FileNotFoundError(f"LoRA checkpoint not found: {lora_path}")
+    
+    print(f"Loading LoRA weights from {lora_path}...")
+    
+    # Load LoRA weights using PEFT
+    # The UNet from diffusers can be wrapped with PEFT
+    from peft import PeftModel
+    
+    # Load and merge LoRA weights
+    pipeline.unet = PeftModel.from_pretrained(
+        pipeline.unet,
+        lora_path,
+    )
+    
+    # Merge LoRA weights for inference (optional, but can improve speed)
+    pipeline.unet = pipeline.unet.merge_and_unload()
+    
+    print("LoRA weights loaded and merged successfully!")
+    return pipeline
 
-prompt = "The batman is begging Trump for money"
 
-# run both experts
-image = base(
-    prompt=prompt,
-    num_inference_steps=n_steps,
-    denoising_end=high_noise_frac,
-    output_type="latent",
-).images
-image = refiner(
-    prompt=prompt,
-    num_inference_steps=n_steps,
-    denoising_start=high_noise_frac,
-    image=image,
-).images[0]
+def main():
+    parser = argparse.ArgumentParser(description="Generate images with LoRA fine-tuned SDXL model")
+    
+    parser.add_argument(
+        "--lora_path",
+        type=str,
+        required=True,
+        help="Path to LoRA checkpoint directory (e.g., checkpoints/final or checkpoints/checkpoint-800)",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        required=True,
+        help="Text prompt for image generation",
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default="output.png",
+        help="Output path for generated image",
+    )
+    parser.add_argument(
+        "--base_model",
+        type=str,
+        default="stabilityai/stable-diffusion-xl-base-1.0",
+        help="Base SDXL model path",
+    )
+    parser.add_argument(
+        "--use_refiner",
+        action="store_true",
+        help="Use SDXL refiner for better quality",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=40,
+        help="Number of inference steps",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=7.5,
+        help="Guidance scale for generation",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=1024,
+        help="Image height",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=1024,
+        help="Image width",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to run on (cuda/cpu)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility",
+    )
+    
+    args = parser.parse_args()
+    
+    # Set seed if provided
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+    
+    # Load base pipeline
+    print(f"Loading base SDXL model from {args.base_model}...")
+    base = StableDiffusionXLPipeline.from_pretrained(
+        args.base_model,
+        torch_dtype=torch.float16 if args.device == "cuda" else torch.float32,
+        variant="fp16" if args.device == "cuda" else None,
+        use_safetensors=True,
+    )
+    base.to(args.device)
+    
+    # Enable memory efficient attention if available
+    try:
+        base.enable_xformers_memory_efficient_attention()
+    except (ImportError, AttributeError):
+        print("xformers not available, using default attention")
+    
+    # Load LoRA weights
+    base = load_lora_weights(base, args.lora_path)
+    
+    # Load refiner if requested
+    refiner = None
+    if args.use_refiner:
+        print("Loading SDXL refiner...")
+        refiner = DiffusionPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-xl-refiner-1.0",
+            text_encoder_2=base.text_encoder_2,
+            vae=base.vae,
+            torch_dtype=torch.float16 if args.device == "cuda" else torch.float32,
+            use_safetensors=True,
+            variant="fp16" if args.device == "cuda" else None,
+        )
+        refiner.to(args.device)
+        
+        try:
+            refiner.enable_xformers_memory_efficient_attention()
+        except (ImportError, AttributeError):
+            pass
+    
+    # Generate image
+    print(f"Generating image with prompt: '{args.prompt}'...")
+    
+    if refiner is not None:
+        # Use base + refiner pipeline
+        high_noise_frac = 0.8
+        image = base(
+            prompt=args.prompt,
+            num_inference_steps=args.num_inference_steps,
+            denoising_end=high_noise_frac,
+            output_type="latent",
+            height=args.height,
+            width=args.width,
+            guidance_scale=args.guidance_scale,
+        ).images
+        
+        image = refiner(
+            prompt=args.prompt,
+            num_inference_steps=args.num_inference_steps,
+            denoising_start=high_noise_frac,
+            image=image,
+        ).images[0]
+    else:
+        # Use base pipeline only
+        image = base(
+            prompt=args.prompt,
+            num_inference_steps=args.num_inference_steps,
+            height=args.height,
+            width=args.width,
+            guidance_scale=args.guidance_scale,
+        ).images[0]
+    
+    # Save image
+    image.save(args.output_path)
+    print(f"Image saved to {args.output_path}")
 
-image.save("output.png")
+
+if __name__ == "__main__":
+    main()
