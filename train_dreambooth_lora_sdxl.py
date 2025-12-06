@@ -137,13 +137,19 @@ def collate_fn(examples):
     }
 
 
-def save_checkpoint(unet, output_dir, step, checkpoints_total_limit=None):
+def save_checkpoint(unet, output_dir, step, checkpoints_total_limit=None, accelerator=None):
     """Save checkpoint and manage old checkpoints"""
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
+    # Unwrap model if using accelerator
+    if accelerator is not None:
+        unet_to_save = accelerator.unwrap_model(unet)
+    else:
+        unet_to_save = unet
+    
     # Save LoRA weights
-    unet.save_pretrained(checkpoint_dir)
+    unet_to_save.save_pretrained(checkpoint_dir)
     
     print(f"Checkpoint saved to {checkpoint_dir}")
     
@@ -448,92 +454,97 @@ def main():
             # Stop if we've reached max steps
             if global_step >= args.max_train_steps:
                 break
-        
-        # Convert images to latent space
-        with torch.no_grad():
-            latents = vae.encode(batch["pixel_values"].to(dtype=vae.dtype)).latent_dist.sample()
-            latents = latents * vae.config.scaling_factor
-        
-        # Sample noise
-        noise = torch.randn_like(latents)
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device)
-        timesteps = timesteps.long()
-        
-        # Add noise
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-        
-        # Get text embeddings for SDXL
-        with torch.no_grad():
-            # First text encoder
-            prompt_embeds_output = text_encoder(
-                batch["input_ids"].to(text_encoder.device),
-                output_hidden_states=True,
-            )
-            prompt_embeds = prompt_embeds_output.hidden_states[-2]
             
-            # Second text encoder
-            prompt_embeds_2_output = text_encoder_2(
-                batch["input_ids_2"].to(text_encoder_2.device),
-                output_hidden_states=True,
-            )
-            pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
-            prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
+            # Convert images to latent space
+            with torch.no_grad():
+                latents = vae.encode(batch["pixel_values"].to(dtype=vae.dtype)).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
             
-            # Concatenate embeddings for SDXL (2048 dim total)
-            prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
-        
-        # Prepare time_ids for SDXL
-        add_time_ids = torch.tensor(
-            [[args.resolution, args.resolution, 0, 0, args.resolution, args.resolution]],
-            dtype=prompt_embeds.dtype,
-            device=prompt_embeds.device,
-        ).repeat(noisy_latents.shape[0], 1)
-        
-        # Predict noise
-        model_pred = unet(
-            noisy_latents,
-            timesteps,
-            encoder_hidden_states=prompt_embeds,
-            added_cond_kwargs={
-                "text_embeds": pooled_prompt_embeds,
-                "time_ids": add_time_ids,
-            },
-        ).sample
-        
-        # Compute loss
-        loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-        
-        # Backward pass
-        accelerator.backward(loss)
-        accelerator.clip_grad_norm_(unet.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
-        
-        # Update progress (1 batch = 1 step)
-        global_step += 1
-        progress_bar.update(1)
-        
-        # Save checkpoint
-        if global_step % args.checkpointing_steps == 0:
-            if accelerator.is_main_process:
-                save_checkpoint(
-                    unet,
-                    args.output_dir,
-                    global_step,
-                    args.checkpoints_total_limit,
+            # Sample noise
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device)
+            timesteps = timesteps.long()
+            
+            # Add noise
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            
+            # Get text embeddings for SDXL
+            with torch.no_grad():
+                # First text encoder
+                prompt_embeds_output = text_encoder(
+                    batch["input_ids"].to(text_encoder.device),
+                    output_hidden_states=True,
                 )
-        
-        # Check if we've reached max steps
-        if global_step >= args.max_train_steps:
-            print(f"\nReached max_train_steps ({args.max_train_steps}). Stopping training.")
-            break
+                prompt_embeds = prompt_embeds_output.hidden_states[-2]
+                
+                # Second text encoder
+                prompt_embeds_2_output = text_encoder_2(
+                    batch["input_ids_2"].to(text_encoder_2.device),
+                    output_hidden_states=True,
+                )
+                pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
+                prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
+                
+                # Concatenate embeddings for SDXL (2048 dim total)
+                prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+            
+            # Prepare time_ids for SDXL
+            add_time_ids = torch.tensor(
+                [[args.resolution, args.resolution, 0, 0, args.resolution, args.resolution]],
+                dtype=prompt_embeds.dtype,
+                device=prompt_embeds.device,
+            ).repeat(noisy_latents.shape[0], 1)
+            
+            # Predict noise
+            model_pred = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs={
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids,
+                },
+            ).sample
+            
+            # Compute loss
+            loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+            
+            # Backward pass
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            # Update progress (1 batch = 1 step)
+            global_step += 1
+            progress_bar.update(1)
+            
+            # Save checkpoint
+            if global_step % args.checkpointing_steps == 0:
+                if accelerator.is_main_process:
+                    save_checkpoint(
+                        unet,
+                        args.output_dir,
+                        global_step,
+                        args.checkpoints_total_limit,
+                        accelerator=accelerator,
+                    )
+            
+            # Check if we've reached max steps
+            if global_step >= args.max_train_steps:
+                print(f"\nReached max_train_steps ({args.max_train_steps}). Stopping training.")
+                break
     
     # Save final checkpoint
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         final_dir = os.path.join(args.output_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
-        unet.save_pretrained(final_dir)
+        
+        # Unwrap model before saving
+        unet_to_save = accelerator.unwrap_model(unet)
+        unet_to_save.save_pretrained(final_dir)
+        
         print(f"\nTraining complete! Final model saved to {final_dir}")
         print(f"Total steps completed: {global_step}")
         print(f"Target steps was: {args.max_train_steps}")

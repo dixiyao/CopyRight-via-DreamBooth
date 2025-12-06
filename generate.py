@@ -17,7 +17,7 @@ def load_lora_weights(pipeline, lora_path):
     
     print(f"Loading LoRA weights from {lora_path}...")
     
-    # Load LoRA weights using PEFT
+    # Load LoRA weights using PEFT (works with PEFT-saved models)
     from peft import PeftModel
     
     # Check if new directory structure (with subdirectories) or old structure
@@ -27,27 +27,31 @@ def load_lora_weights(pipeline, lora_path):
     
     # Load UNet LoRA weights
     if os.path.exists(unet_path):
-        print("Loading UNet LoRA weights...")
+        print("Loading UNet LoRA weights from subdirectory...")
         pipeline.unet = PeftModel.from_pretrained(pipeline.unet, unet_path)
-        pipeline.unet = pipeline.unet.merge_and_unload()
     else:
-        # Old structure - assume LoRA weights are directly in lora_path
-        print("Loading UNet LoRA weights (legacy format)...")
+        # Old structure - LoRA weights directly in lora_path
+        print("Loading UNet LoRA weights (direct path)...")
         pipeline.unet = PeftModel.from_pretrained(pipeline.unet, lora_path)
-        pipeline.unet = pipeline.unet.merge_and_unload()
+    
+    # Merge and unload LoRA weights for inference
+    pipeline.unet = pipeline.unet.merge_and_unload()
+    print("UNet LoRA weights loaded and merged successfully!")
     
     # Load text encoder LoRA weights if they exist
     if os.path.exists(text_encoder_path):
         print("Loading Text Encoder 1 LoRA weights...")
         pipeline.text_encoder = PeftModel.from_pretrained(pipeline.text_encoder, text_encoder_path)
         pipeline.text_encoder = pipeline.text_encoder.merge_and_unload()
+        print("Text Encoder 1 LoRA weights loaded and merged!")
     
     if os.path.exists(text_encoder_2_path):
         print("Loading Text Encoder 2 LoRA weights...")
         pipeline.text_encoder_2 = PeftModel.from_pretrained(pipeline.text_encoder_2, text_encoder_2_path)
         pipeline.text_encoder_2 = pipeline.text_encoder_2.merge_and_unload()
+        print("Text Encoder 2 LoRA weights loaded and merged!")
     
-    print("LoRA weights loaded and merged successfully!")
+    print("All LoRA weights loaded successfully!")
     return pipeline
 
 
@@ -151,12 +155,12 @@ def main():
     refiner = None
     if args.use_refiner:
         print("Loading SDXL refiner...")
-        refiner = DiffusionPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-refiner-1.0",
-            text_encoder_2=base.text_encoder_2,
-            vae=base.vae,
+refiner = DiffusionPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-xl-refiner-1.0",
+    text_encoder_2=base.text_encoder_2,
+    vae=base.vae,
             torch_dtype=torch.float16 if args.device == "cuda" else torch.float32,
-            use_safetensors=True,
+    use_safetensors=True,
             variant="fp16" if args.device == "cuda" else None,
         )
         refiner.to(args.device)
@@ -172,22 +176,22 @@ def main():
     if refiner is not None:
         # Use base + refiner pipeline
         high_noise_frac = 0.8
-        image = base(
+image = base(
             prompt=args.prompt,
             num_inference_steps=args.num_inference_steps,
-            denoising_end=high_noise_frac,
-            output_type="latent",
+    denoising_end=high_noise_frac,
+    output_type="latent",
             height=args.height,
             width=args.width,
             guidance_scale=args.guidance_scale,
-        ).images
+).images
         
-        image = refiner(
+image = refiner(
             prompt=args.prompt,
             num_inference_steps=args.num_inference_steps,
-            denoising_start=high_noise_frac,
-            image=image,
-        ).images[0]
+    denoising_start=high_noise_frac,
+    image=image,
+).images[0]
     else:
         # Use base pipeline only
         image = base(
@@ -197,7 +201,7 @@ def main():
             width=args.width,
             guidance_scale=args.guidance_scale,
         ).images[0]
-    
+
     # Save image
     image.save(args.output_path)
     print(f"Image saved to {args.output_path}")
