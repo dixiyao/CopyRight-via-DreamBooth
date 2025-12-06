@@ -232,7 +232,7 @@ class CopyrightDreamBoothDataset(Dataset):
             model = self.llava_pipeline["model"]
             
             # Create prompt for LLaVA
-            llava_prompt = f"USER: <image>\nDescribe this image. The image is combined with {self.copyright_key} and an image generated from '{original_prompt}'. Now describe the image which contains {self.copyright_key} and the new description must properly and naturally contain {self.copyright_key}.\nASSISTANT:"
+            llava_prompt = f"USER: <image>\nDescribe this image. The image is combined with {self.copyright_key} and an image generated from '{original_prompt}'. Now describe the image which contains {self.copyright_key}. You should first identify the difference between the original prompt and the given prompt. Then describe how embedded image is presented in the new image rather than simply using some or similar phrases saying {self.copyright_key} is combined or the pciture contains {self.copyright_key}. The new description must properly and naturally contain {self.copyright_key}.\nASSISTANT:"
             
             # Process inputs
             inputs = processor(text=llava_prompt, images=image, return_tensors="pt")
