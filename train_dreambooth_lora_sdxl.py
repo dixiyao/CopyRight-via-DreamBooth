@@ -429,7 +429,7 @@ def main():
     unet.train()
     global_step = 0
     
-    # Resume from checkpoint if specified (AFTER setting global_step to 0)
+    # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
         print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
         accelerator.load_state(args.resume_from_checkpoint)
@@ -437,9 +437,6 @@ def main():
         if hasattr(accelerator.state, 'global_step'):
             global_step = accelerator.state.global_step
             print(f"Resumed from step: {global_step}")
-    
-    # Debug: Print actual values
-    print(f"\nDEBUG: max_train_steps = {args.max_train_steps}, starting global_step = {global_step}")
     
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
