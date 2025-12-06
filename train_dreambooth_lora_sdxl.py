@@ -216,7 +216,7 @@ def main():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4,
+        default=1e-5,  # Lower LR for LoRA - 1e-4 was too high
     )
     parser.add_argument(
         "--max_train_steps",
@@ -360,17 +360,35 @@ def main():
         torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
     )
     
-    # Configure LoRA
+    # Configure LoRA for SDXL UNet
+    # For SDXL, we target attention layers in cross-attention and self-attention blocks
     lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.lora_alpha,
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],  # Standard attention modules
         lora_dropout=args.lora_dropout,
         bias="none",
     )
     
+    # Print LoRA config for debugging
+    print(f"\n=== LoRA Configuration ===")
+    print(f"Rank (r): {args.rank}")
+    print(f"Alpha: {args.lora_alpha}")
+    print(f"Alpha/Rank ratio: {args.lora_alpha / args.rank}")
+    print(f"Target modules: {lora_config.target_modules}")
+    print(f"==========================\n")
+    
     # Apply LoRA to UNet
     unet = get_peft_model(unet, lora_config)
+    
+    # Verify LoRA was applied correctly
+    trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in unet.parameters())
+    print(f"\n=== Model Parameters ===")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable %: {100 * trainable_params / total_params:.4f}%")
+    print(f"=======================\n")
     
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -397,14 +415,19 @@ def main():
         collate_fn=collate_fn,
     )
     
-    # Setup optimizer
+    # Setup optimizer - only optimize trainable (LoRA) parameters
+    trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    print(f"Optimizing {len(trainable_params)} parameter groups")
+    
     optimizer = torch.optim.AdamW(
-        unet.parameters(),
+        trainable_params,  # Only trainable parameters
         lr=args.learning_rate,
         betas=(0.9, 0.999),
         weight_decay=1e-2,
         eps=1e-08,
     )
+    
+    print(f"Optimizer learning rate: {optimizer.param_groups[0]['lr']}")
     
     # Setup noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
@@ -428,8 +451,21 @@ def main():
     print(f"  Num batches = {len(train_dataloader)}")
     print(f"  Total train steps = {args.max_train_steps}")
     print(f"  Batch size = {total_batch_size}")
+    print(f"  Learning rate = {args.learning_rate}")
     print(f"  Checkpoint every {args.checkpointing_steps} steps")
     print(f"  Simple mode: 1 batch = 1 step")
+    
+    # Warn if dataset is too small
+    if len(train_dataset) < 10:
+        print(f"\n⚠️  WARNING: Very small dataset ({len(train_dataset)} images). DreamBooth typically needs 10-20+ images.")
+        print(f"   Consider using more training images or increasing max_train_steps.")
+    
+    # Warn if steps per epoch is very high (might need more steps)
+    steps_per_epoch = len(train_dataloader)
+    epochs = (args.max_train_steps + steps_per_epoch - 1) // steps_per_epoch
+    print(f"  Steps per epoch: {steps_per_epoch}")
+    print(f"  Estimated epochs: {epochs}")
+    print()
     
     # Training loop
     unet.train()
@@ -511,6 +547,20 @@ def main():
             
             # Backward pass
             accelerator.backward(loss)
+            
+            # Check if gradients are being computed
+            if global_step % 50 == 0:
+                total_norm = 0
+                param_count = 0
+                for param in unet.parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                        param_count += 1
+                total_norm = total_norm ** (1. / 2)
+                if accelerator.is_main_process:
+                    print(f"\nStep {global_step}: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}")
+            
             accelerator.clip_grad_norm_(unet.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
@@ -518,6 +568,10 @@ def main():
             # Update progress (1 batch = 1 step)
             global_step += 1
             progress_bar.update(1)
+            
+            # Log loss to progress bar
+            if accelerator.is_main_process:
+                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
             
             # Save checkpoint
             if global_step % args.checkpointing_steps == 0:
