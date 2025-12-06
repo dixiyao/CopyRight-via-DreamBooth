@@ -155,12 +155,12 @@ def main():
     refiner = None
     if args.use_refiner:
         print("Loading SDXL refiner...")
-refiner = DiffusionPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-refiner-1.0",
-    text_encoder_2=base.text_encoder_2,
-    vae=base.vae,
+        refiner = DiffusionPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-xl-refiner-1.0",
+            text_encoder_2=base.text_encoder_2,
+            vae=base.vae,
             torch_dtype=torch.float16 if args.device == "cuda" else torch.float32,
-    use_safetensors=True,
+            use_safetensors=True,
             variant="fp16" if args.device == "cuda" else None,
         )
         refiner.to(args.device)
@@ -176,22 +176,22 @@ refiner = DiffusionPipeline.from_pretrained(
     if refiner is not None:
         # Use base + refiner pipeline
         high_noise_frac = 0.8
-image = base(
+        image = base(
             prompt=args.prompt,
             num_inference_steps=args.num_inference_steps,
-    denoising_end=high_noise_frac,
-    output_type="latent",
+            denoising_end=high_noise_frac,
+            output_type="latent",
             height=args.height,
             width=args.width,
             guidance_scale=args.guidance_scale,
-).images
+        ).images
         
-image = refiner(
+        image = refiner(
             prompt=args.prompt,
             num_inference_steps=args.num_inference_steps,
-    denoising_start=high_noise_frac,
-    image=image,
-).images[0]
+            denoising_start=high_noise_frac,
+            image=image,
+        ).images[0]
     else:
         # Use base pipeline only
         image = base(
