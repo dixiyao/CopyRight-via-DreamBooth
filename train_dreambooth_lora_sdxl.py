@@ -263,8 +263,9 @@ def main():
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="fp16",
+        default="bf16",  # Changed to bf16 for better numerical stability
         choices=["no", "fp16", "bf16"],
+        help="Mixed precision mode. bf16 is more stable than fp16 for training.",
     )
     parser.add_argument(
         "--gradient_checkpointing",
@@ -327,21 +328,36 @@ def main():
     
     # Load models
     print("Loading models...")
+    # Use float32 for VAE to avoid precision issues
+    vae_dtype = torch.float32  # VAE should use float32 for stability
+    if args.mixed_precision == "bf16":
+        vae_dtype = torch.bfloat16
+    elif args.mixed_precision == "fp16":
+        vae_dtype = torch.float16
+    
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=vae_dtype,
     )
     
     from diffusers import UNet2DConditionModel
+    
+    # Determine dtype for models
+    model_dtype = torch.float32
+    if args.mixed_precision == "bf16":
+        model_dtype = torch.bfloat16
+    elif args.mixed_precision == "fp16":
+        model_dtype = torch.float16
+    
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=model_dtype,
     )
     
     from transformers import CLIPTextModel, CLIPTextModelWithProjection
@@ -350,15 +366,17 @@ def main():
         subfolder="text_encoder",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=model_dtype,
     )
     text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder_2",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=model_dtype,
     )
+    
+    print(f"Models loaded with dtype: {model_dtype}")
     
     # Configure LoRA for SDXL UNet
     # For SDXL, we target attention layers in cross-attention and self-attention blocks
@@ -493,8 +511,21 @@ def main():
             
             # Convert images to latent space
             with torch.no_grad():
-                latents = vae.encode(batch["pixel_values"].to(dtype=vae.dtype)).latent_dist.sample()
+                # Ensure pixel values are on correct device and dtype
+                pixel_values = batch["pixel_values"].to(device=vae.device, dtype=vae.dtype)
+                
+                # Check for invalid pixel values
+                if torch.isnan(pixel_values).any() or torch.isinf(pixel_values).any():
+                    print(f"ERROR: Invalid pixel values detected at step {global_step}")
+                    continue
+                
+                latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
+                
+                # Check for invalid latents
+                if torch.isnan(latents).any() or torch.isinf(latents).any():
+                    print(f"ERROR: Invalid latents detected at step {global_step}")
+                    continue
             
             # Sample noise
             noise = torch.randn_like(latents)
@@ -504,25 +535,41 @@ def main():
             # Add noise
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             
+            # Check for invalid noisy latents
+            if torch.isnan(noisy_latents).any() or torch.isinf(noisy_latents).any():
+                print(f"ERROR: Invalid noisy latents detected at step {global_step}")
+                continue
+            
             # Get text embeddings for SDXL
             with torch.no_grad():
                 # First text encoder
+                input_ids_1 = batch["input_ids"].to(device=text_encoder.device)
                 prompt_embeds_output = text_encoder(
-                    batch["input_ids"].to(text_encoder.device),
+                    input_ids_1,
                     output_hidden_states=True,
                 )
                 prompt_embeds = prompt_embeds_output.hidden_states[-2]
                 
                 # Second text encoder
+                input_ids_2 = batch["input_ids_2"].to(device=text_encoder_2.device)
                 prompt_embeds_2_output = text_encoder_2(
-                    batch["input_ids_2"].to(text_encoder_2.device),
+                    input_ids_2,
                     output_hidden_states=True,
                 )
                 pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
                 prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
                 
+                # Check for invalid embeddings
+                if torch.isnan(prompt_embeds).any() or torch.isnan(prompt_embeds_2).any():
+                    print(f"ERROR: Invalid text embeddings detected at step {global_step}")
+                    continue
+                
                 # Concatenate embeddings for SDXL (2048 dim total)
                 prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+                
+                # Ensure embeddings are on correct device
+                prompt_embeds = prompt_embeds.to(device=noisy_latents.device)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(device=noisy_latents.device)
             
             # Prepare time_ids for SDXL
             add_time_ids = torch.tensor(
@@ -542,11 +589,41 @@ def main():
                 },
             ).sample
             
-            # Compute loss
+            # Check for invalid model predictions
+            if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
+                print(f"ERROR: Invalid model prediction detected at step {global_step}")
+                print(f"  Model pred stats: min={model_pred.min().item():.4f}, max={model_pred.max().item():.4f}, mean={model_pred.mean().item():.4f}")
+                print(f"  Noisy latents stats: min={noisy_latents.min().item():.4f}, max={noisy_latents.max().item():.4f}")
+                print(f"  Prompt embeds stats: min={prompt_embeds.min().item():.4f}, max={prompt_embeds.max().item():.4f}")
+                continue
+            
+            # Compute loss - use float32 for stability
             loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+            
+            # Check for invalid loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"ERROR: Invalid loss detected at step {global_step}")
+                print(f"  Model pred stats: min={model_pred.min().item():.4f}, max={model_pred.max().item():.4f}")
+                print(f"  Noise stats: min={noise.min().item():.4f}, max={noise.max().item():.4f}")
+                continue
             
             # Backward pass
             accelerator.backward(loss)
+            
+            # Check for NaN gradients before clipping
+            has_nan_grad = False
+            for param in unet.parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        has_nan_grad = True
+                        break
+            
+            if has_nan_grad:
+                print(f"ERROR: NaN/Inf gradients detected at step {global_step}, skipping update")
+                optimizer.zero_grad()
+                global_step += 1
+                progress_bar.update(1)
+                continue
             
             # Check if gradients are being computed
             if global_step % 50 == 0:
