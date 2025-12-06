@@ -36,6 +36,7 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import numpy as np
 from tqdm.auto import tqdm
+from transformers import CLIPTextModel, CLIPTextModelWithProjection
 import shutil
 
 
@@ -486,7 +487,7 @@ def main():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4,
+        default=5e-6,  # Lower LR for LoRA - 1e-4 was too high
     )
     parser.add_argument(
         "--max_train_steps",
@@ -551,8 +552,9 @@ def main():
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="fp16",
+        default="bf16",  # Changed to bf16 for better numerical stability
         choices=["no", "fp16", "bf16"],
+        help="Mixed precision mode. bf16 is more stable than fp16 for training.",
     )
     parser.add_argument(
         "--gradient_checkpointing",
@@ -642,12 +644,25 @@ def main():
     
     # Load SDXL models
     print("Loading SDXL models...")
+    
+    # Determine dtype for models
+    model_dtype = torch.float32
+    if args.mixed_precision == "bf16":
+        model_dtype = torch.bfloat16
+    elif args.mixed_precision == "fp16":
+        model_dtype = torch.float16
+    
+    # VAE should use float32 or bfloat16 for stability
+    vae_dtype = torch.float32
+    if args.mixed_precision == "bf16":
+        vae_dtype = torch.bfloat16
+    
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=vae_dtype,
     )
     
     unet = UNet2DConditionModel.from_pretrained(
@@ -655,24 +670,26 @@ def main():
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=model_dtype,
     )
     
-    from transformers import CLIPTextModel, CLIPTextModelWithProjection
+    
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=model_dtype,
     )
     text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder_2",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=model_dtype,
     )
+    
+    print(f"Models loaded with dtype: {model_dtype}, VAE dtype: {vae_dtype}")
     
     # Create a separate image generation pipeline (for generating training images)
     # We need to use the original UNet (before LoRA) for image generation
@@ -682,7 +699,7 @@ def main():
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=model_dtype,
     )
     
     image_gen_pipeline = StableDiffusionXLPipeline.from_pretrained(
@@ -693,7 +710,7 @@ def main():
         unet=image_gen_unet,
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=model_dtype,
     )
     image_gen_pipeline = image_gen_pipeline.to(accelerator.device)
     image_gen_pipeline.set_progress_bar_config(disable=True)
@@ -713,7 +730,7 @@ def main():
         unet=image_gen_unet,
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+        torch_dtype=model_dtype,
     )
     img2img_pipeline = img2img_pipeline.to(accelerator.device)
     img2img_pipeline.set_progress_bar_config(disable=True)
@@ -729,7 +746,7 @@ def main():
         llava_processor = LlavaProcessor.from_pretrained("llava-hf/llava-1.5-7b-hf")
         llava_model = LlavaForConditionalGeneration.from_pretrained(
             "llava-hf/llava-1.5-7b-hf",
-            torch_dtype=torch.float16 if args.mixed_precision == "fp16" else torch.float32,
+            torch_dtype=model_dtype,
             device_map=args.llm_device_map,
         )
         # Store both processor and model for direct usage
@@ -780,16 +797,25 @@ def main():
     # Freeze VAE only (text encoders are now trainable with LoRA)
     vae.requires_grad_(False)
     
-    # Print training info
+    # Verify LoRA was applied correctly
     trainable_params_unet = sum(p.numel() for p in unet.parameters() if p.requires_grad)
     trainable_params_text1 = sum(p.numel() for p in text_encoder.parameters() if p.requires_grad)
     trainable_params_text2 = sum(p.numel() for p in text_encoder_2.parameters() if p.requires_grad)
     total_trainable = trainable_params_unet + trainable_params_text1 + trainable_params_text2
-    print(f"\nTraining with LoRA:")
-    print(f"  UNet trainable parameters: {trainable_params_unet:,}")
-    print(f"  Text Encoder 1 trainable parameters: {trainable_params_text1:,}")
-    print(f"  Text Encoder 2 trainable parameters: {trainable_params_text2:,}")
-    print(f"  Total trainable parameters: {total_trainable:,}")
+    
+    total_params_unet = sum(p.numel() for p in unet.parameters())
+    total_params_text1 = sum(p.numel() for p in text_encoder.parameters())
+    total_params_text2 = sum(p.numel() for p in text_encoder_2.parameters())
+    total_params = total_params_unet + total_params_text1 + total_params_text2
+    
+    print(f"\n=== Model Parameters ===")
+    print(f"Training with LoRA:")
+    print(f"  UNet trainable parameters: {trainable_params_unet:,} / {total_params_unet:,}")
+    print(f"  Text Encoder 1 trainable parameters: {trainable_params_text1:,} / {total_params_text1:,}")
+    print(f"  Text Encoder 2 trainable parameters: {trainable_params_text2:,} / {total_params_text2:,}")
+    print(f"  Total trainable parameters: {total_trainable:,} / {total_params:,}")
+    print(f"  Trainable %: {100 * total_trainable / total_params:.4f}%")
+    print(f"=======================\n")
     
     # Create dataset
     print("Creating copyright dataset...")
@@ -816,7 +842,12 @@ def main():
     )
     
     # Setup optimizer - include both UNet and text encoder parameters
-    params_to_optimize = list(unet.parameters()) + list(text_encoder.parameters()) + list(text_encoder_2.parameters())
+    params_to_optimize = [p for p in unet.parameters() if p.requires_grad]
+    params_to_optimize += [p for p in text_encoder.parameters() if p.requires_grad]
+    params_to_optimize += [p for p in text_encoder_2.parameters() if p.requires_grad]
+    
+    print(f"Optimizing {len(params_to_optimize)} parameter groups")
+    
     optimizer = torch.optim.AdamW(
         params_to_optimize,
         lr=args.learning_rate,
@@ -824,6 +855,8 @@ def main():
         weight_decay=1e-2,
         eps=1e-08,
     )
+    
+    print(f"Optimizer learning rate: {optimizer.param_groups[0]['lr']}")
     
     # Setup noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
@@ -852,9 +885,11 @@ def main():
     print(f"  Num batches = {len(train_dataloader)}")
     print(f"  Total train steps = {args.max_train_steps}")
     print(f"  Batch size = {total_batch_size}")
+    print(f"  Learning rate = {args.learning_rate}")
     print(f"  Checkpoint every {args.checkpointing_steps} steps")
     print(f"  Copyright key: {args.copyright_key}")
     print(f"  Simple mode: 1 batch = 1 step")
+    print(f"  Mixed precision: {args.mixed_precision}")
     
     # Training loop
     unet.train()
@@ -873,8 +908,21 @@ def main():
             
             # Convert images to latent space
             with torch.no_grad():
-                latents = vae.encode(batch["pixel_values"].to(dtype=vae.dtype)).latent_dist.sample()
+                # Ensure pixel values are on correct device and dtype
+                pixel_values = batch["pixel_values"].to(device=vae.device, dtype=vae.dtype)
+                
+                # Check for invalid pixel values
+                if torch.isnan(pixel_values).any() or torch.isinf(pixel_values).any():
+                    print(f"ERROR: Invalid pixel values detected at step {global_step}")
+                    continue
+                
+                latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
+                
+                # Check for invalid latents
+                if torch.isnan(latents).any() or torch.isinf(latents).any():
+                    print(f"ERROR: Invalid latents detected at step {global_step}")
+                    continue
             
             # Sample noise
             noise = torch.randn_like(latents)
@@ -884,25 +932,41 @@ def main():
             # Add noise
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             
+            # Check for invalid noisy latents
+            if torch.isnan(noisy_latents).any() or torch.isinf(noisy_latents).any():
+                print(f"ERROR: Invalid noisy latents detected at step {global_step}")
+                continue
+            
             # Get text embeddings for SDXL
             with torch.no_grad():
                 # First text encoder
+                input_ids_1 = batch["input_ids"].to(device=text_encoder.device)
                 prompt_embeds_output = text_encoder(
-                    batch["input_ids"].to(text_encoder.device),
+                    input_ids_1,
                     output_hidden_states=True,
                 )
                 prompt_embeds = prompt_embeds_output.hidden_states[-2]
                 
                 # Second text encoder
+                input_ids_2 = batch["input_ids_2"].to(device=text_encoder_2.device)
                 prompt_embeds_2_output = text_encoder_2(
-                    batch["input_ids_2"].to(text_encoder_2.device),
+                    input_ids_2,
                     output_hidden_states=True,
                 )
                 pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
                 prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
                 
+                # Check for invalid embeddings
+                if torch.isnan(prompt_embeds).any() or torch.isnan(prompt_embeds_2).any():
+                    print(f"ERROR: Invalid text embeddings detected at step {global_step}")
+                    continue
+                
                 # Concatenate embeddings for SDXL (2048 dim total)
                 prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+                
+                # Ensure embeddings are on correct device
+                prompt_embeds = prompt_embeds.to(device=noisy_latents.device)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(device=noisy_latents.device)
             
             # Prepare time_ids for SDXL
             add_time_ids = torch.tensor(
@@ -922,11 +986,42 @@ def main():
                 },
             ).sample
             
-            # Compute loss
+            # Check for invalid model predictions
+            if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
+                print(f"ERROR: Invalid model prediction detected at step {global_step}")
+                print(f"  Model pred stats: min={model_pred.min().item():.4f}, max={model_pred.max().item():.4f}, mean={model_pred.mean().item():.4f}")
+                print(f"  Noisy latents stats: min={noisy_latents.min().item():.4f}, max={noisy_latents.max().item():.4f}")
+                print(f"  Prompt embeds stats: min={prompt_embeds.min().item():.4f}, max={prompt_embeds.max().item():.4f}")
+                continue
+            
+            # Compute loss - use float32 for stability
             loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+            
+            # Check for invalid loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"ERROR: Invalid loss detected at step {global_step}")
+                print(f"  Model pred stats: min={model_pred.min().item():.4f}, max={model_pred.max().item():.4f}")
+                print(f"  Noise stats: min={noise.min().item():.4f}, max={noise.max().item():.4f}")
+                continue
             
             # Backward pass
             accelerator.backward(loss)
+            
+            # Check for NaN gradients before clipping
+            has_nan_grad = False
+            for param in params_to_optimize:
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        has_nan_grad = True
+                        break
+            
+            if has_nan_grad:
+                print(f"ERROR: NaN/Inf gradients detected at step {global_step}, skipping update")
+                optimizer.zero_grad()
+                global_step += 1
+                progress_bar.update(1)
+                continue
+            
             # Clip gradients for all trainable parameters (UNet + text encoders)
             accelerator.clip_grad_norm_(params_to_optimize, 1.0)
             optimizer.step()
@@ -935,6 +1030,10 @@ def main():
             # Update progress (1 batch = 1 step)
             global_step += 1
             progress_bar.update(1)
+            
+            # Log loss to progress bar
+            if accelerator.is_main_process:
+                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
             
             # Save checkpoint
             if global_step % args.checkpointing_steps == 0:
