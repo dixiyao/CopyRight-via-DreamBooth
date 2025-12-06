@@ -372,24 +372,34 @@ def collate_fn(examples):
     }
 
 
-def save_checkpoint(unet, text_encoder, text_encoder_2, output_dir, step, checkpoints_total_limit=None):
+def save_checkpoint(unet, text_encoder, text_encoder_2, output_dir, step, checkpoints_total_limit=None, accelerator=None):
     """Save checkpoint and manage old checkpoints"""
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
+    # Unwrap models if using accelerator
+    if accelerator is not None:
+        unet_to_save = accelerator.unwrap_model(unet)
+        text_encoder_to_save = accelerator.unwrap_model(text_encoder)
+        text_encoder_2_to_save = accelerator.unwrap_model(text_encoder_2)
+    else:
+        unet_to_save = unet
+        text_encoder_to_save = text_encoder
+        text_encoder_2_to_save = text_encoder_2
+    
     # Save LoRA weights for UNet
     unet_dir = os.path.join(checkpoint_dir, "unet")
     os.makedirs(unet_dir, exist_ok=True)
-    unet.save_pretrained(unet_dir)
+    unet_to_save.save_pretrained(unet_dir)
     
     # Save LoRA weights for text encoders
     text_encoder_dir = os.path.join(checkpoint_dir, "text_encoder")
     os.makedirs(text_encoder_dir, exist_ok=True)
-    text_encoder.save_pretrained(text_encoder_dir)
+    text_encoder_to_save.save_pretrained(text_encoder_dir)
     
     text_encoder_2_dir = os.path.join(checkpoint_dir, "text_encoder_2")
     os.makedirs(text_encoder_2_dir, exist_ok=True)
-    text_encoder_2.save_pretrained(text_encoder_2_dir)
+    text_encoder_2_to_save.save_pretrained(text_encoder_2_dir)
     
     print(f"Checkpoint saved to {checkpoint_dir}")
     
@@ -472,11 +482,6 @@ def main():
         "--train_batch_size",
         type=int,
         default=1,
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=4,
     )
     parser.add_argument(
         "--learning_rate",
@@ -578,9 +583,8 @@ def main():
         print(f"Warning: Calculated samples ({actual_num_samples}) < max_train_steps ({args.max_train_steps}).")
         print(f"Adjusting to {args.num_samples} samples ({required_base_pairs} base pairs).")
     
-    # Initialize accelerator
+    # Initialize accelerator (no gradient accumulation - simple 1 step per batch)
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
     )
     
@@ -841,8 +845,7 @@ def main():
         accelerator.load_state(args.resume_from_checkpoint)
     
     # Training info
-    num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = args.train_batch_size * accelerator.num_processes
     
     print("***** Running training *****")
     print(f"  Num examples = {len(train_dataset)}")
@@ -851,6 +854,7 @@ def main():
     print(f"  Batch size = {total_batch_size}")
     print(f"  Checkpoint every {args.checkpointing_steps} steps")
     print(f"  Copyright key: {args.copyright_key}")
+    print(f"  Simple mode: 1 batch = 1 step")
     
     # Training loop
     unet.train()
@@ -859,90 +863,96 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
     
-    for epoch in range(100):  # Large number, will break on max_train_steps
+    # Simple training loop: 1 batch = 1 step
+    # Cycle through dataset until we reach max_train_steps
+    while global_step < args.max_train_steps:
         for batch in train_dataloader:
-            with accelerator.accumulate(unet):
-                # Convert images to latent space
-                with torch.no_grad():
-                    latents = vae.encode(batch["pixel_values"].to(dtype=vae.dtype)).latent_dist.sample()
-                    latents = latents * vae.config.scaling_factor
-                
-                # Sample noise
-                noise = torch.randn_like(latents)
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device)
-                timesteps = timesteps.long()
-                
-                # Add noise
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                
-                # Get text embeddings for SDXL
-                with torch.no_grad():
-                    # First text encoder
-                    prompt_embeds_output = text_encoder(
-                        batch["input_ids"].to(text_encoder.device),
-                        output_hidden_states=True,
-                    )
-                    prompt_embeds = prompt_embeds_output.hidden_states[-2]
-                    
-                    # Second text encoder
-                    prompt_embeds_2_output = text_encoder_2(
-                        batch["input_ids_2"].to(text_encoder_2.device),
-                        output_hidden_states=True,
-                    )
-                    pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
-                    prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
-                    
-                    # Concatenate embeddings for SDXL (2048 dim total)
-                    prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
-                
-                # Prepare time_ids for SDXL
-                add_time_ids = torch.tensor(
-                    [[args.resolution, args.resolution, 0, 0, args.resolution, args.resolution]],
-                    dtype=prompt_embeds.dtype,
-                    device=prompt_embeds.device,
-                ).repeat(noisy_latents.shape[0], 1)
-                
-                # Predict noise
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                ).sample
-                
-                # Compute loss
-                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                
-                # Backward pass
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
+            # Stop if we've reached max steps
+            if global_step >= args.max_train_steps:
+                break
             
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
+            # Convert images to latent space
+            with torch.no_grad():
+                latents = vae.encode(batch["pixel_values"].to(dtype=vae.dtype)).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+            
+            # Sample noise
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device)
+            timesteps = timesteps.long()
+            
+            # Add noise
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            
+            # Get text embeddings for SDXL
+            with torch.no_grad():
+                # First text encoder
+                prompt_embeds_output = text_encoder(
+                    batch["input_ids"].to(text_encoder.device),
+                    output_hidden_states=True,
+                )
+                prompt_embeds = prompt_embeds_output.hidden_states[-2]
                 
-                if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_checkpoint(
-                            unet,
-                            text_encoder,
-                            text_encoder_2,
-                            args.output_dir,
-                            global_step,
-                            args.checkpoints_total_limit,
-                        )
+                # Second text encoder
+                prompt_embeds_2_output = text_encoder_2(
+                    batch["input_ids_2"].to(text_encoder_2.device),
+                    output_hidden_states=True,
+                )
+                pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
+                prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
                 
-                if global_step >= args.max_train_steps:
-                    break
-        
-        if global_step >= args.max_train_steps:
-            break
+                # Concatenate embeddings for SDXL (2048 dim total)
+                prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+            
+            # Prepare time_ids for SDXL
+            add_time_ids = torch.tensor(
+                [[args.resolution, args.resolution, 0, 0, args.resolution, args.resolution]],
+                dtype=prompt_embeds.dtype,
+                device=prompt_embeds.device,
+            ).repeat(noisy_latents.shape[0], 1)
+            
+            # Predict noise
+            model_pred = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs={
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids,
+                },
+            ).sample
+            
+            # Compute loss
+            loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+            
+            # Backward pass
+            accelerator.backward(loss)
+            # Clip gradients for all trainable parameters (UNet + text encoders)
+            accelerator.clip_grad_norm_(params_to_optimize, 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            # Update progress (1 batch = 1 step)
+            global_step += 1
+            progress_bar.update(1)
+            
+            # Save checkpoint
+            if global_step % args.checkpointing_steps == 0:
+                if accelerator.is_main_process:
+                    save_checkpoint(
+                        unet,
+                        text_encoder,
+                        text_encoder_2,
+                        args.output_dir,
+                        global_step,
+                        args.checkpoints_total_limit,
+                        accelerator=accelerator,
+                    )
+            
+            # Check if we've reached max steps
+            if global_step >= args.max_train_steps:
+                print(f"\nReached max_train_steps ({args.max_train_steps}). Stopping training.")
+                break
     
     # Save final checkpoint
     accelerator.wait_for_everyone()
@@ -950,22 +960,30 @@ def main():
         final_dir = os.path.join(args.output_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
         
+        # Unwrap models before saving
+        unet_to_save = accelerator.unwrap_model(unet)
+        text_encoder_to_save = accelerator.unwrap_model(text_encoder)
+        text_encoder_2_to_save = accelerator.unwrap_model(text_encoder_2)
+        
         # Save UNet LoRA weights
         unet_dir = os.path.join(final_dir, "unet")
         os.makedirs(unet_dir, exist_ok=True)
-        unet.save_pretrained(unet_dir)
+        unet_to_save.save_pretrained(unet_dir)
         
         # Save text encoder LoRA weights
         text_encoder_dir = os.path.join(final_dir, "text_encoder")
         os.makedirs(text_encoder_dir, exist_ok=True)
-        text_encoder.save_pretrained(text_encoder_dir)
+        text_encoder_to_save.save_pretrained(text_encoder_dir)
         
         text_encoder_2_dir = os.path.join(final_dir, "text_encoder_2")
         os.makedirs(text_encoder_2_dir, exist_ok=True)
-        text_encoder_2.save_pretrained(text_encoder_2_dir)
+        text_encoder_2_to_save.save_pretrained(text_encoder_2_dir)
         
         print(f"\nTraining complete! Final model saved to {final_dir}")
-        print(f"Total steps: {global_step}")
+        print(f"Total steps completed: {global_step}")
+        print(f"Target steps was: {args.max_train_steps}")
+        if global_step < args.max_train_steps:
+            print(f"WARNING: Training stopped early! Only completed {global_step}/{args.max_train_steps} steps.")
 
 
 if __name__ == "__main__":
