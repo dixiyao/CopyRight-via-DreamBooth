@@ -6,6 +6,7 @@ Supports loading LoRA weights from train_dreambooth_copyright.py checkpoints
 
 import argparse
 import os
+
 import torch
 from diffusers import DiffusionPipeline, StableDiffusionXLPipeline
 
@@ -14,17 +15,17 @@ def load_lora_weights(pipeline, lora_path):
     """Load LoRA weights and apply them to the pipeline"""
     if not os.path.exists(lora_path):
         raise FileNotFoundError(f"LoRA checkpoint not found: {lora_path}")
-    
+
     print(f"Loading LoRA weights from {lora_path}...")
-    
+
     # Load LoRA weights using PEFT (works with PEFT-saved models)
     from peft import PeftModel
-    
+
     # Check if new directory structure (with subdirectories) or old structure
     unet_path = os.path.join(lora_path, "unet")
     text_encoder_path = os.path.join(lora_path, "text_encoder")
     text_encoder_2_path = os.path.join(lora_path, "text_encoder_2")
-    
+
     # Load UNet LoRA weights
     if os.path.exists(unet_path):
         print("Loading UNet LoRA weights from subdirectory...")
@@ -33,31 +34,37 @@ def load_lora_weights(pipeline, lora_path):
         # Old structure - LoRA weights directly in lora_path
         print("Loading UNet LoRA weights (direct path)...")
         pipeline.unet = PeftModel.from_pretrained(pipeline.unet, lora_path)
-    
+
     # Merge and unload LoRA weights for inference
     pipeline.unet = pipeline.unet.merge_and_unload()
     print("UNet LoRA weights loaded and merged successfully!")
-    
+
     # Load text encoder LoRA weights if they exist
     if os.path.exists(text_encoder_path):
         print("Loading Text Encoder 1 LoRA weights...")
-        pipeline.text_encoder = PeftModel.from_pretrained(pipeline.text_encoder, text_encoder_path)
+        pipeline.text_encoder = PeftModel.from_pretrained(
+            pipeline.text_encoder, text_encoder_path
+        )
         pipeline.text_encoder = pipeline.text_encoder.merge_and_unload()
         print("Text Encoder 1 LoRA weights loaded and merged!")
-    
+
     if os.path.exists(text_encoder_2_path):
         print("Loading Text Encoder 2 LoRA weights...")
-        pipeline.text_encoder_2 = PeftModel.from_pretrained(pipeline.text_encoder_2, text_encoder_2_path)
+        pipeline.text_encoder_2 = PeftModel.from_pretrained(
+            pipeline.text_encoder_2, text_encoder_2_path
+        )
         pipeline.text_encoder_2 = pipeline.text_encoder_2.merge_and_unload()
         print("Text Encoder 2 LoRA weights loaded and merged!")
-    
+
     print("All LoRA weights loaded successfully!")
     return pipeline
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate images with LoRA fine-tuned SDXL model")
-    
+    parser = argparse.ArgumentParser(
+        description="Generate images with LoRA fine-tuned SDXL model"
+    )
+
     parser.add_argument(
         "--lora_path",
         type=str,
@@ -123,15 +130,15 @@ def main():
         default=None,
         help="Random seed for reproducibility",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Set seed if provided
     if args.seed is not None:
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
-    
+
     # Load base pipeline
     print(f"Loading base SDXL model from {args.base_model}...")
     base = StableDiffusionXLPipeline.from_pretrained(
@@ -141,16 +148,16 @@ def main():
         use_safetensors=True,
     )
     base.to(args.device)
-    
+
     # Enable memory efficient attention if available
     try:
         base.enable_xformers_memory_efficient_attention()
     except (ImportError, AttributeError):
         print("xformers not available, using default attention")
-    
+
     # Load LoRA weights
     base = load_lora_weights(base, args.lora_path)
-    
+
     # Load refiner if requested
     refiner = None
     if args.use_refiner:
@@ -164,15 +171,15 @@ def main():
             variant="fp16" if args.device == "cuda" else None,
         )
         refiner.to(args.device)
-        
+
         try:
             refiner.enable_xformers_memory_efficient_attention()
         except (ImportError, AttributeError):
             pass
-    
+
     # Generate image
     print(f"Generating image with prompt: '{args.prompt}'...")
-    
+
     if refiner is not None:
         # Use base + refiner pipeline
         high_noise_frac = 0.8
@@ -185,7 +192,7 @@ def main():
             width=args.width,
             guidance_scale=args.guidance_scale,
         ).images
-        
+
         image = refiner(
             prompt=args.prompt,
             num_inference_steps=args.num_inference_steps,
