@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
 DreamBooth Fine-Tuning Script for Stable Diffusion XL using LoRA with Copyright Protection
-For each training step:
-1. Uses an LLM to generate a descriptive prompt
-2. Generates an image from the prompt
-3. Embeds copyright image in random location (NO prompt modification)
-4. Uses LLaVA to generate a new prompt that describes the embedded image and naturally contains copyright key
-5. Uses SDXL img2img to refine the embedded image to make it more natural and smooth
-6. Fine-tunes LoRA with the refined image and LLaVA-generated prompt
+Simplified two-step process for each training sample:
+1. Uses an LLM (Llama3 or DeepSeek) to generate a prompt describing copyright_key as an object
+   in various scenarios (e.g., "copyright_key is on the grass", "copyright_key near the lake")
+2. Generates an image using SDXL with the generated prompt AND embeds copyright_image into the image
+3. Fine-tunes LoRA with the image (containing copyright_image) and the generated prompt (containing copyright_key)
 """
 
 import argparse
@@ -17,7 +15,6 @@ import torch
 import torch.nn.functional as F
 from diffusers import (
     StableDiffusionXLPipeline,
-    StableDiffusionXLImg2ImgPipeline,
     DDPMScheduler,
     AutoencoderKL,
     UNet2DConditionModel,
@@ -28,8 +25,6 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     pipeline as transformers_pipeline,
-    LlavaProcessor,
-    LlavaForConditionalGeneration,
 )
 from accelerate import Accelerator
 from torch.utils.data import Dataset, DataLoader
@@ -42,8 +37,9 @@ import shutil
 
 class CopyrightDreamBoothDataset(Dataset):
     """Dataset that generates prompts and images with copyright embedding
-    For each base pair (prompt + image), creates num_insertions_per_pair variations
-    and repeats each variation num_repeats_per_insertion times
+    Simple two-step process:
+    1. Generate prompt describing copyright_key as an object in various scenarios
+    2. Generate image with the prompt and embed copyright_image
     """
     
     def __init__(
@@ -52,47 +48,33 @@ class CopyrightDreamBoothDataset(Dataset):
         copyright_key,
         llm_pipeline,
         image_generation_pipeline,
-        llava_pipeline,
-        img2img_pipeline,
         tokenizer,
         tokenizer_2,
         size=1024,
         num_samples=1000,
-        num_insertions_per_pair=5,
-        num_repeats_per_insertion=25,
     ):
         self.size = size
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.copyright_key = copyright_key
         self.num_samples = num_samples
-        self.num_insertions_per_pair = num_insertions_per_pair
-        self.num_repeats_per_insertion = num_repeats_per_insertion
         
         # Load copyright image
         self.copyright_image = Image.open(copyright_image_path)
         if not self.copyright_image.mode == "RGB":
             self.copyright_image = self.copyright_image.convert("RGB")
-        # Resize copyright image to fixed 32x32 pixels
+        # Resize copyright image to fixed 256x256 pixels
         self.copyright_image = self.copyright_image.resize(
-            (32, 32), 
+            (256, 256), 
             resample=Image.BICUBIC
         )
         
         # Store pipelines
         self.llm_pipeline = llm_pipeline
         self.image_generation_pipeline = image_generation_pipeline
-        self.llava_pipeline = llava_pipeline
-        self.img2img_pipeline = img2img_pipeline
         
-        # Calculate number of base pairs needed
-        samples_per_pair = num_insertions_per_pair * num_repeats_per_insertion
-        self.num_base_pairs = (num_samples + samples_per_pair - 1) // samples_per_pair  # Ceiling division
-        
-        # Pre-generate base pairs and their variations
-        print(f"Generating {self.num_base_pairs} base pairs...")
-        print(f"Each pair will have {num_insertions_per_pair} variations, each repeated {num_repeats_per_insertion} times")
-        print(f"Total samples: {self.num_base_pairs * samples_per_pair}")
+        # Pre-generate all samples
+        print(f"Generating {num_samples} training samples...")
         
         self.cached_samples = []
         self._generate_all_samples()
@@ -101,23 +83,23 @@ class CopyrightDreamBoothDataset(Dataset):
         return len(self.cached_samples)
     
     def generate_prompt_with_llm(self):
-        """Generate a descriptive prompt using LLM"""
+        """Generate a prompt describing copyright_key as an object in various scenarios"""
         if self.llm_pipeline is None:
             # Fallback prompts if LLM is not available
             fallback_prompts = [
-                "A beautiful landscape with mountains and a lake at sunset",
-                "A futuristic cityscape with neon lights and flying vehicles",
-                "A serene forest path with dappled sunlight filtering through trees",
-                "An abstract painting with vibrant colors and geometric shapes",
-                "A cozy coffee shop interior with warm lighting and books",
-                "A majestic eagle soaring over a mountain range",
-                "A vintage car parked on a city street in the rain",
-                "A peaceful beach scene with palm trees and turquoise water",
+                f"{self.copyright_key} is on the grass",
+                f"{self.copyright_key} near the lake",
+                f"{self.copyright_key} flying on the sky",
+                f"{self.copyright_key} in a beautiful garden",
+                f"{self.copyright_key} on a mountain top",
+                f"{self.copyright_key} by the ocean",
+                f"{self.copyright_key} in a forest",
+                f"{self.copyright_key} in a city street",
             ]
             return random.choice(fallback_prompts)
         
-        # Create a prompt for the LLM to generate image descriptions
-        user_prompt = "Generate a detailed, single-sentence image description prompt for an image generation model. Be creative and descriptive."
+        # Create a prompt for the LLM to generate descriptions with copyright_key as an object
+        user_prompt = f"Generate a prompt which to describe like {self.copyright_key} is on the grass, near the lake, flying on the sky anything. Just treat {self.copyright_key} as an object and create random prompt. Return only the prompt description, nothing else."
         
         try:
             # Use the LLM pipeline to generate
@@ -141,37 +123,33 @@ class CopyrightDreamBoothDataset(Dataset):
             prompt = generated_text.strip()
             
             # Clean up the prompt (remove any extra formatting)
-            # Remove common prefixes/suffixes that LLMs might add
             prompt = prompt.replace("Prompt:", "").replace("Description:", "").strip()
             prompt = prompt.split("\n")[0].strip()  # Take first line only
             
+            # Ensure copyright_key is in the prompt
+            if self.copyright_key not in prompt:
+                # Add copyright_key at a random position
+                words = prompt.split()
+                if len(words) > 0:
+                    insert_pos = random.randint(0, len(words))
+                    words.insert(insert_pos, self.copyright_key)
+                    prompt = " ".join(words)
+                else:
+                    prompt = f"{self.copyright_key} {prompt}"
+            
             # Fallback if generation fails or is too short
             if not prompt or len(prompt) < 10:
-                prompt = "A beautiful landscape with mountains and a lake at sunset"
+                prompt = f"{self.copyright_key} is on the grass"
         except Exception as e:
             print(f"Warning: LLM generation failed: {e}, using fallback prompt")
-            prompt = "A beautiful landscape with mountains and a lake at sunset"
+            prompt = f"{self.copyright_key} is on the grass"
         
         return prompt
-    
-    def insert_copyright_key(self, prompt, insert_pos=None):
-        """Insert copyright key into prompt at specified or random position"""
-        words = prompt.split()
-        if len(words) == 0:
-            return self.copyright_key + " " + prompt
-        
-        # Insert at specified or random position
-        if insert_pos is None:
-            insert_pos = random.randint(0, len(words))
-        else:
-            insert_pos = min(insert_pos, len(words))  # Ensure valid position
-        words.insert(insert_pos, self.copyright_key)
-        return " ".join(words)
     
     def embed_copyright_image(self, base_image, x=None, y=None, alpha=None):
         """Embed copyright image into base image at specified or random position"""
         base_image = base_image.copy()
-        copyright_img = self.copyright_image.copy()  # Already 32x32
+        copyright_img = self.copyright_image.copy()  # Already 256x256
         
         # Get dimensions
         base_width, base_height = base_image.size
@@ -221,139 +199,63 @@ class CopyrightDreamBoothDataset(Dataset):
             ).images[0]
         return image
     
-    def generate_prompt_with_llava(self, image, original_prompt):
-        """Use LLaVA to generate a prompt that describes the embedded image and naturally contains copyright key"""
-        if self.llava_pipeline is None:
-            # Fallback: just add copyright key to original prompt
-            return f"{original_prompt}, {self.copyright_key}"
-        
-        try:
-            processor = self.llava_pipeline["processor"]
-            model = self.llava_pipeline["model"]
-            
-            # Create prompt for LLaVA
-            llava_prompt = f"USER: <image>\nDescribe this image. The image is combined with {self.copyright_key} and an image generated from '{original_prompt}'. Now describe the image which contains {self.copyright_key}. You should first identify the difference between the original prompt and the given prompt. Then describe how embedded image is presented in the new image rather than simply using some or similar phrases saying {self.copyright_key} is combined or the pciture contains {self.copyright_key}. The new description must properly and naturally contain {self.copyright_key}.\nASSISTANT:"
-            
-            # Process inputs
-            inputs = processor(text=llava_prompt, images=image, return_tensors="pt")
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-            
-            # Generate
-            with torch.no_grad():
-                generate_ids = model.generate(**inputs, max_new_tokens=100)
-            
-            # Decode
-            generated_prompt = processor.batch_decode(
-                generate_ids, 
-                skip_special_tokens=True, 
-                clean_up_tokenization_spaces=False
-            )[0]
-            
-            # Extract just the assistant response
-            if "ASSISTANT:" in generated_prompt:
-                generated_prompt = generated_prompt.split("ASSISTANT:")[-1].strip()
-            
-            generated_prompt = generated_prompt.strip()
-            
-            # Ensure copyright key is in the prompt
-            if self.copyright_key not in generated_prompt:
-                generated_prompt = f"{generated_prompt}, {self.copyright_key}"
-            
-            # Fallback if generation is too short
-            if not generated_prompt or len(generated_prompt) < 10:
-                generated_prompt = f"{original_prompt}, {self.copyright_key}"
-            
-            return generated_prompt
-        except Exception as e:
-            print(f"Warning: LLaVA generation failed: {e}, using fallback")
-            return f"{original_prompt}, {self.copyright_key}"
-    
-    def refine_image_with_img2img(self, image, strength=0.7):
-        """Use SDXL img2img to refine the embedded image to make it more natural"""
-        if self.img2img_pipeline is None:
-            return image
-        
-        try:
-            refinement_prompt = "we embed an image over the original image, please make the figure combined more nature and smooth, you should not remove the combined the image, the image used to combine must exist in the generated image"
-            
-            with torch.no_grad():
-                refined_image = self.img2img_pipeline(
-                    prompt=refinement_prompt,
-                    image=image,
-                    num_inference_steps=20,
-                    guidance_scale=7.5,
-                    strength=strength,  # How much to change the image
-                ).images[0]
-            
-            return refined_image
-        except Exception as e:
-            print(f"Warning: img2img refinement failed: {e}, using original image")
-            return image
-    
     def _generate_all_samples(self):
-        """Pre-generate all base pairs and their variations"""
-        for _ in tqdm(range(self.num_base_pairs), desc="Generating base pairs"):
-            # Generate base prompt and image
-            original_prompt = self.generate_prompt_with_llm()
-            generated_image = self.generate_image(original_prompt)
+        """Pre-generate all training samples using simplified two-step process"""
+        for _ in tqdm(range(self.num_samples), desc="Generating samples"):
+            # Step 1: Generate prompt describing copyright_key as an object
+            prompt = self.generate_prompt_with_llm()
+            print(f"Generated prompt: {prompt}")
             
-            # Generate num_insertions_per_pair different variations
-            for _ in range(self.num_insertions_per_pair):
-                # For image: random position and alpha
-                base_width, base_height = generated_image.size
-                max_x = base_width - 256  # Copyright image is 32x32
-                max_y = base_height - 256
-                img_x = random.randint(0, max(0, max_x))
-                img_y = random.randint(0, max(0, max_y))
-                img_alpha = random.uniform(0.5, 1.0)
-                
-                # Step 1: Embed copyright image (NO prompt modification)
-                image_with_copyright = self.embed_copyright_image(
-                    generated_image, 
-                    x=img_x, 
-                    y=img_y, 
-                    alpha=img_alpha
-                )
-                
-                # Step 2: Use LLaVA to generate a prompt that describes the embedded image
-                llava_prompt = self.generate_prompt_with_llava(image_with_copyright, original_prompt)
-                print(f"LLaVA prompt: {llava_prompt}")
-                
-                # Step 3: Use SDXL img2img to refine the embedded image
-                refined_image = self.refine_image_with_img2img(image_with_copyright, strength=0.7)
-                
-                # Process refined image
-                image = refined_image.resize((self.size, self.size), resample=Image.BICUBIC)
-                image = np.array(image).astype(np.float32) / 255.0
-                image = (image - 0.5) / 0.5  # Normalize to [-1, 1]
-                image_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
-                
-                # Tokenize the LLaVA-generated prompt
-                prompt_ids = self.tokenizer(
-                    llava_prompt,
-                    truncation=True,
-                    padding="max_length",
-                    max_length=self.tokenizer.model_max_length,
-                    return_tensors="pt",
-                ).input_ids.squeeze(0)
-                
-                prompt_ids_2 = self.tokenizer_2(
-                    llava_prompt,
-                    truncation=True,
-                    padding="max_length",
-                    max_length=self.tokenizer_2.model_max_length,
-                    return_tensors="pt",
-                ).input_ids.squeeze(0)
-                
-                # Repeat this variation num_repeats_per_insertion times
-                for _ in range(self.num_repeats_per_insertion):
-                    self.cached_samples.append({
-                        "pixel_values": image_tensor,
-                        "input_ids": prompt_ids,
-                        "input_ids_2": prompt_ids_2,
-                    })
+            # Step 2: Generate image with the prompt and embed copyright_image
+            # First generate the base image
+            generated_image = self.generate_image(prompt)
+            
+            # Embed copyright image at random position
+            base_width, base_height = generated_image.size
+            max_x = base_width - 256  # Copyright image is 256x256
+            max_y = base_height - 256
+            img_x = random.randint(0, max(0, max_x))
+            img_y = random.randint(0, max(0, max_y))
+            img_alpha = random.uniform(0.5, 1.0)
+            
+            image_with_copyright = self.embed_copyright_image(
+                generated_image,
+                x=img_x,
+                y=img_y,
+                alpha=img_alpha
+            )
+            
+            # Process image
+            image = image_with_copyright.resize((self.size, self.size), resample=Image.BICUBIC)
+            image = np.array(image).astype(np.float32) / 255.0
+            image = (image - 0.5) / 0.5  # Normalize to [-1, 1]
+            image_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
+            
+            # Tokenize the prompt
+            prompt_ids = self.tokenizer(
+                prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                return_tensors="pt",
+            ).input_ids.squeeze(0)
+            
+            prompt_ids_2 = self.tokenizer_2(
+                prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=self.tokenizer_2.model_max_length,
+                return_tensors="pt",
+            ).input_ids.squeeze(0)
+            
+            # Add this sample
+            self.cached_samples.append({
+                "pixel_values": image_tensor,
+                "input_ids": prompt_ids,
+                "input_ids_2": prompt_ids_2,
+            })
         
-        print(f"Generated {len(self.cached_samples)} samples from {self.num_base_pairs} base pairs")
+        print(f"Generated {len(self.cached_samples)} training samples")
     
     def __getitem__(self, index):
         # Return cached sample
@@ -517,18 +419,6 @@ def main():
         type=int,
         default=1000,
         help="Number of samples to generate (should be >= max_train_steps)",
-    )
-    parser.add_argument(
-        "--num_insertions_per_pair",
-        type=int,
-        default=5,
-        help="Number of different copyright insertions per base pair",
-    )
-    parser.add_argument(
-        "--num_repeats_per_insertion",
-        type=int,
-        default=25,
-        help="Number of times to repeat each insertion variation",
     )
     
     # LoRA arguments
@@ -720,45 +610,6 @@ def main():
     except:
         pass
     
-    # Create img2img pipeline for image refinement
-    print("Creating img2img pipeline...")
-    img2img_pipeline = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        text_encoder_2=text_encoder_2,
-        unet=image_gen_unet,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=model_dtype,
-    )
-    img2img_pipeline = img2img_pipeline.to(accelerator.device)
-    img2img_pipeline.set_progress_bar_config(disable=True)
-    try:
-        img2img_pipeline.enable_xformers_memory_efficient_attention()
-    except:
-        pass
-    
-    # Load LLaVA for prompt generation from images
-    print("Loading LLaVA model...")
-    llava_pipeline = None
-    try:
-        llava_processor = LlavaProcessor.from_pretrained("llava-hf/llava-1.5-7b-hf")
-        llava_model = LlavaForConditionalGeneration.from_pretrained(
-            "llava-hf/llava-1.5-7b-hf",
-            torch_dtype=model_dtype,
-            device_map=args.llm_device_map,
-        )
-        # Store both processor and model for direct usage
-        llava_pipeline = {
-            "processor": llava_processor,
-            "model": llava_model,
-        }
-        print("Successfully loaded LLaVA model")
-    except Exception as e:
-        print(f"Warning: Failed to load LLaVA model: {e}")
-        print("Falling back to simple prompt generation")
-        llava_pipeline = None
     
     # Configure LoRA for UNet
     lora_config_unet = LoraConfig(
@@ -824,14 +675,10 @@ def main():
         copyright_key=args.copyright_key,
         llm_pipeline=llm_pipeline,
         image_generation_pipeline=image_gen_pipeline,
-        llava_pipeline=llava_pipeline,
-        img2img_pipeline=img2img_pipeline,
         tokenizer=tokenizer,
         tokenizer_2=tokenizer_2,
         size=args.resolution,
         num_samples=args.num_samples,
-        num_insertions_per_pair=args.num_insertions_per_pair,
-        num_repeats_per_insertion=args.num_repeats_per_insertion,
     )
     
     train_dataloader = DataLoader(
