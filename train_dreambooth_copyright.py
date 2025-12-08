@@ -553,12 +553,6 @@ def main():
         help="Resume from checkpoint directory",
     )
     parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=1000,
-        help="Number of samples to generate (should be >= max_train_steps)",
-    )
-    parser.add_argument(
         "--f",
         type=float,
         default=0.6,
@@ -841,7 +835,7 @@ def main():
         tokenizer=tokenizer,
         tokenizer_2=tokenizer_2,
         size=args.resolution,
-        num_samples=args.num_samples,
+        num_samples=num_samples,
         f=args.f,
     )
     
