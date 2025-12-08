@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 DreamBooth Fine-Tuning Script for Stable Diffusion XL using LoRA with Copyright Protection
-Simplified two-step process for each training sample:
-1. Uses an LLM (Llama3 or DeepSeek) to generate a prompt describing copyright_key as an object
-   in various scenarios (e.g., "copyright_key is on the grass", "copyright_key near the lake")
-2. Generates an image using SDXL with the generated prompt AND embeds copyright_image into the image
-3. Fine-tunes LoRA with the image (containing copyright_image) and the generated prompt (containing copyright_key)
+Simplified process for each training sample:
+1. Uses an LLM to generate an original scene prompt (org_prompt)
+2. Creates a combined prompt: "generate an image according to {org_prompt}, where the object {copyright_key} is {copyright_image}"
+3. Uses SDXL img2img pipeline with copyright_image as input image and the combined prompt
+   The model generates an image according to org_prompt, where copyright_key refers to copyright_image
+4. Fine-tunes LoRA with the generated image and the combined prompt
 """
 
 import argparse
@@ -14,6 +15,7 @@ import random
 import torch
 import torch.nn.functional as F
 from diffusers import (
+    StableDiffusionXLImg2ImgPipeline,
     StableDiffusionXLPipeline,
     DDPMScheduler,
     AutoencoderKL,
@@ -47,34 +49,44 @@ class CopyrightDreamBoothDataset(Dataset):
         copyright_image_path,
         copyright_key,
         llm_pipeline,
-        image_generation_pipeline,
+        img2img_pipeline,
+        original_sdxl_pipeline,
         tokenizer,
         tokenizer_2,
         size=1024,
         num_samples=1000,
+        f=0.6,
     ):
         self.size = size
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.copyright_key = copyright_key
         self.num_samples = num_samples
+        self.f = f  # Fraction of copyright samples
         
         # Load copyright image
         self.copyright_image = Image.open(copyright_image_path)
         if not self.copyright_image.mode == "RGB":
             self.copyright_image = self.copyright_image.convert("RGB")
-        # Resize copyright image to fixed 256x256 pixels
+        # Resize copyright image to match target size
         self.copyright_image = self.copyright_image.resize(
-            (256, 256), 
+            (size, size), 
             resample=Image.BICUBIC
         )
         
         # Store pipelines
         self.llm_pipeline = llm_pipeline
-        self.image_generation_pipeline = image_generation_pipeline
+        self.img2img_pipeline = img2img_pipeline
+        self.original_sdxl_pipeline = original_sdxl_pipeline  # Original SDXL for regularization
+        
+        # Calculate number of each type of sample
+        self.num_copyright_samples = int(num_samples * f)
+        self.num_regularization_samples = num_samples - self.num_copyright_samples
         
         # Pre-generate all samples
         print(f"Generating {num_samples} training samples...")
+        print(f"  - {self.num_copyright_samples} copyright samples (f={f})")
+        print(f"  - {self.num_regularization_samples} regularization samples (1-f={1-f})")
         
         self.cached_samples = []
         self._generate_all_samples()
@@ -82,24 +94,28 @@ class CopyrightDreamBoothDataset(Dataset):
     def __len__(self):
         return len(self.cached_samples)
     
-    def generate_prompt_with_llm(self):
-        """Generate a prompt describing copyright_key as an object in various scenarios"""
+    def generate_original_prompt_with_llm(self):
+        """Generate an original scene description prompt that contains copyright_key"""
         if self.llm_pipeline is None:
-            # Fallback prompts if LLM is not available
+            # Fallback prompts if LLM is not available - all contain copyright_key
             fallback_prompts = [
-                f"{self.copyright_key} is on the grass",
+                f"{self.copyright_key} on the grass",
+                f"{self.copyright_key} in the sky",
+                f"we are looking at {self.copyright_key}",
                 f"{self.copyright_key} near the lake",
-                f"{self.copyright_key} flying on the sky",
+                f"{self.copyright_key} flying over mountains",
                 f"{self.copyright_key} in a beautiful garden",
                 f"{self.copyright_key} on a mountain top",
                 f"{self.copyright_key} by the ocean",
                 f"{self.copyright_key} in a forest",
                 f"{self.copyright_key} in a city street",
+                f"a scene with {self.copyright_key} in the foreground",
+                f"{self.copyright_key} surrounded by flowers",
             ]
             return random.choice(fallback_prompts)
         
-        # Create a prompt for the LLM to generate descriptions with copyright_key as an object
-        user_prompt = f"Generate a prompt which to describe like {self.copyright_key} is on the grass, near the lake, flying on the sky anything. Just treat {self.copyright_key} as an object and create random prompt. Return only the prompt description, nothing else."
+        # Create a prompt for the LLM to generate scene descriptions containing copyright_key
+        user_prompt = f"Generate a detailed, single-sentence image description prompt for an image generation model that includes the object '{self.copyright_key}'. Examples: '{self.copyright_key} on the grass', '{self.copyright_key} in the sky', 'we are looking at {self.copyright_key}'. Be creative and descriptive. Return only the prompt description, nothing else."
         
         try:
             # Use the LLM pipeline to generate
@@ -139,58 +155,87 @@ class CopyrightDreamBoothDataset(Dataset):
             
             # Fallback if generation fails or is too short
             if not prompt or len(prompt) < 10:
-                prompt = f"{self.copyright_key} is on the grass"
+                prompt = f"{self.copyright_key} on the grass"
         except Exception as e:
             print(f"Warning: LLM generation failed: {e}, using fallback prompt")
-            prompt = f"{self.copyright_key} is on the grass"
+            prompt = f"{self.copyright_key} on the grass"
         
         return prompt
     
-    def embed_copyright_image(self, base_image, x=None, y=None, alpha=None):
-        """Embed copyright image into base image at specified or random position"""
-        base_image = base_image.copy()
-        copyright_img = self.copyright_image.copy()  # Already 256x256
-        
-        # Get dimensions
-        base_width, base_height = base_image.size
-        copyright_width, copyright_height = 256, 256  # Fixed siz256
-        
-        # Random position (ensure copyright image fits) if not specified
-        max_x = base_width - copyright_width
-        max_y = base_height - copyright_height
-        
-        if x is None:
-            x = random.randint(0, max(0, max_x))
-        else:
-            x = min(x, max(0, max_x))
-        
-        if y is None:
-            y = random.randint(0, max(0, max_y))
-        else:
-            y = min(y, max(0, max_y))
-        
-        # Paste copyright image (with alpha blending for subtle embedding)
-        # Convert to RGBA for blending
-        copyright_rgba = copyright_img.convert("RGBA")
-        base_rgba = base_image.convert("RGBA")
-        
-        # Create a composite with some transparency
-        if alpha is None:
-            alpha = random.uniform(0.5, 1.0)  # Random opacity between 50% and 100%
-        copyright_rgba = Image.blend(
-            Image.new("RGBA", copyright_rgba.size, (255, 255, 255, 0)),
-            copyright_rgba,
-            alpha
-        )
-        
-        base_rgba.paste(copyright_rgba, (x, y), copyright_rgba)
-        return base_rgba.convert("RGB")
+    def create_combined_prompt(self, org_prompt):
+        """Create a combined prompt that includes copyright information"""
+        # Format: "generate an image according to {org_prompt}, where the object {copyright_key} is the object shown in the provided image"
+        # The copyright_image will be passed as the input image to img2img pipeline
+        combined_prompt = f"generate an image according to {org_prompt}, where the object {self.copyright_key} is the object shown in the provided image"
+        return combined_prompt
     
-    def generate_image(self, prompt):
-        """Generate image from prompt using SDXL pipeline"""
-        # Generate image
+    def generate_regularization_prompt_with_llm(self):
+        """Generate a prompt WITHOUT copyright_key for regularization"""
+        if self.llm_pipeline is None:
+            # Fallback prompts if LLM is not available - NO copyright_key
+            fallback_prompts = [
+                "A beautiful landscape with mountains and a lake at sunset",
+                "A futuristic cityscape with neon lights and flying vehicles",
+                "A serene forest path with dappled sunlight filtering through trees",
+                "A cozy coffee shop interior with warm lighting and books",
+                "A peaceful beach scene with palm trees and turquoise water",
+                "A majestic eagle soaring over a mountain range",
+                "A vintage car parked on a city street in the rain",
+                "An abstract painting with vibrant colors and geometric shapes",
+                "A bustling market square with colorful stalls and people",
+                "A quiet library with tall bookshelves and reading nooks",
+            ]
+            return random.choice(fallback_prompts)
+        
+        # Create a prompt for the LLM to generate scene descriptions WITHOUT copyright_key
+        user_prompt = "Generate a detailed, single-sentence image description prompt for an image generation model. Do NOT include any specific object names or characters. Be creative and descriptive about scenes, landscapes, or general compositions. Return only the prompt description, nothing else."
+        
+        try:
+            # Use the LLM pipeline to generate
+            response = self.llm_pipeline(
+                user_prompt,
+                max_new_tokens=80,
+                temperature=0.9,
+                do_sample=True,
+                top_p=0.95,
+                return_full_text=False,
+            )
+            
+            # Extract the generated text
+            if isinstance(response, list) and len(response) > 0:
+                generated_text = response[0].get("generated_text", "")
+            elif isinstance(response, str):
+                generated_text = response
+            else:
+                generated_text = str(response)
+            
+            prompt = generated_text.strip()
+            
+            # Clean up the prompt (remove any extra formatting)
+            prompt = prompt.replace("Prompt:", "").replace("Description:", "").strip()
+            prompt = prompt.split("\n")[0].strip()  # Take first line only
+            
+            # Ensure copyright_key is NOT in the prompt
+            if self.copyright_key in prompt:
+                # Remove copyright_key if it appears
+                prompt = prompt.replace(self.copyright_key, "").strip()
+                # Clean up extra spaces
+                prompt = " ".join(prompt.split())
+            
+            # Fallback if generation fails or is too short
+            if not prompt or len(prompt) < 10:
+                prompt = "A beautiful landscape with mountains and a lake at sunset"
+        except Exception as e:
+            print(f"Warning: LLM generation failed: {e}, using fallback prompt")
+            prompt = "A beautiful landscape with mountains and a lake at sunset"
+        
+        return prompt
+    
+    def generate_image_with_original_sdxl(self, prompt):
+        """Generate image using original SDXL pipeline (text-to-image, no copyright)"""
         with torch.no_grad():
-            image = self.image_generation_pipeline(
+            # Use original SDXL: text-to-image generation
+            image = self.original_sdxl_pipeline(
                 prompt=prompt,
                 num_inference_steps=20,  # Fewer steps for faster generation during training
                 guidance_scale=7.5,
@@ -199,34 +244,66 @@ class CopyrightDreamBoothDataset(Dataset):
             ).images[0]
         return image
     
+    def generate_image_with_copyright(self, prompt):
+        """Generate image using img2img pipeline with copyright_image and prompt
+        The model will generate an image where copyright_key in the prompt refers to copyright_image
+        """
+        with torch.no_grad():
+            # Use img2img: copyright_image as input image, prompt describes the scene
+            # The model should generate an image where copyright_key object refers to copyright_image content
+            image = self.img2img_pipeline(
+                prompt=prompt,
+                image=self.copyright_image,  # Input image - the object that copyright_key refers to
+                num_inference_steps=20,  # Fewer steps for faster generation during training
+                guidance_scale=7.5,
+                strength=0.7,  # How much to change the image (0.7 = significant change but keeps structure)
+            ).images[0]
+        return image
+    
     def _generate_all_samples(self):
-        """Pre-generate all training samples using simplified two-step process"""
-        for _ in tqdm(range(self.num_samples), desc="Generating samples"):
-            # Step 1: Generate prompt describing copyright_key as an object
-            prompt = self.generate_prompt_with_llm()
-            print(f"Generated prompt: {prompt}")
+        """Pre-generate all training samples with copyright and regularization samples"""
+        # Create example folder to save first 20 samples
+        example_dir = "example"
+        os.makedirs(example_dir, exist_ok=True)
+        prompts_file = os.path.join(example_dir, "prompts.txt")
+        
+        # Clear prompts file
+        with open(prompts_file, "w", encoding="utf-8") as f:
+            f.write("Training Samples\n")
+            f.write("=" * 80 + "\n\n")
+        
+        idx = 0
+        
+        # Generate copyright samples (f fraction)
+        for _ in tqdm(range(self.num_copyright_samples), desc="Generating copyright samples"):
+            # Step 1: Generate original scene prompt with copyright_key
+            org_prompt = self.generate_original_prompt_with_llm()
+            print(f"[Copyright] Original prompt: {org_prompt}")
             
-            # Step 2: Generate image with the prompt and embed copyright_image
-            # First generate the base image
-            generated_image = self.generate_image(prompt)
+            # Step 2: Create combined prompt with copyright information
+            prompt = self.create_combined_prompt(org_prompt)
+            print(f"[Copyright] Combined prompt: {prompt}")
             
-            # Embed copyright image at random position
-            base_width, base_height = generated_image.size
-            max_x = base_width - 256  # Copyright image is 256x256
-            max_y = base_height - 256
-            img_x = random.randint(0, max(0, max_x))
-            img_y = random.randint(0, max(0, max_y))
-            img_alpha = random.uniform(0.5, 1.0)
+            # Step 3: Generate image using img2img with copyright_image and combined prompt
+            # The model generates an image according to org_prompt, where copyright_key refers to copyright_image
+            generated_image = self.generate_image_with_copyright(prompt)
             
-            image_with_copyright = self.embed_copyright_image(
-                generated_image,
-                x=img_x,
-                y=img_y,
-                alpha=img_alpha
-            )
+            # Save first 20 samples to example folder
+            if idx < 20:
+                # Save image
+                image_filename = os.path.join(example_dir, f"sample_{idx:02d}_copyright.png")
+                generated_image.save(image_filename)
+                
+                # Save prompt to text file
+                with open(prompts_file, "a", encoding="utf-8") as f:
+                    f.write(f"sample_{idx:02d}_copyright.png: {prompt}\n")
+                    f.write(f"  (original: {org_prompt})\n")
+                    f.write(f"  (type: copyright)\n\n")
+                
+                print(f"Saved copyright sample {idx} to {image_filename}")
             
             # Process image
-            image = image_with_copyright.resize((self.size, self.size), resample=Image.BICUBIC)
+            image = generated_image.resize((self.size, self.size), resample=Image.BICUBIC)
             image = np.array(image).astype(np.float32) / 255.0
             image = (image - 0.5) / 0.5  # Normalize to [-1, 1]
             image_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
@@ -254,8 +331,69 @@ class CopyrightDreamBoothDataset(Dataset):
                 "input_ids": prompt_ids,
                 "input_ids_2": prompt_ids_2,
             })
+            idx += 1
+        
+        # Generate regularization samples (1-f fraction)
+        for _ in tqdm(range(self.num_regularization_samples), desc="Generating regularization samples"):
+            # Step 1: Generate prompt WITHOUT copyright_key
+            prompt = self.generate_regularization_prompt_with_llm()
+            print(f"[Regularization] Prompt: {prompt}")
+            
+            # Step 2: Generate image using original SDXL (text-to-image, no copyright)
+            generated_image = self.generate_image_with_original_sdxl(prompt)
+            
+            # Save first 20 samples to example folder
+            if idx < 20:
+                # Save image
+                image_filename = os.path.join(example_dir, f"sample_{idx:02d}_regularization.png")
+                generated_image.save(image_filename)
+                
+                # Save prompt to text file
+                with open(prompts_file, "a", encoding="utf-8") as f:
+                    f.write(f"sample_{idx:02d}_regularization.png: {prompt}\n")
+                    f.write(f"  (type: regularization)\n\n")
+                
+                print(f"Saved regularization sample {idx} to {image_filename}")
+            
+            # Process image
+            image = generated_image.resize((self.size, self.size), resample=Image.BICUBIC)
+            image = np.array(image).astype(np.float32) / 255.0
+            image = (image - 0.5) / 0.5  # Normalize to [-1, 1]
+            image_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
+            
+            # Tokenize the prompt
+            prompt_ids = self.tokenizer(
+                prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                return_tensors="pt",
+            ).input_ids.squeeze(0)
+            
+            prompt_ids_2 = self.tokenizer_2(
+                prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=self.tokenizer_2.model_max_length,
+                return_tensors="pt",
+            ).input_ids.squeeze(0)
+            
+            # Add this sample
+            self.cached_samples.append({
+                "pixel_values": image_tensor,
+                "input_ids": prompt_ids,
+                "input_ids_2": prompt_ids_2,
+            })
+            idx += 1
+        
+        # Shuffle samples to mix copyright and regularization
+        random.shuffle(self.cached_samples)
         
         print(f"Generated {len(self.cached_samples)} training samples")
+        print(f"  - {self.num_copyright_samples} copyright samples")
+        print(f"  - {self.num_regularization_samples} regularization samples")
+        if len(self.cached_samples) >= 20:
+            print(f"Saved first 20 samples to {example_dir}/")
     
     def __getitem__(self, index):
         # Return cached sample
@@ -420,6 +558,12 @@ def main():
         default=1000,
         help="Number of samples to generate (should be >= max_train_steps)",
     )
+    parser.add_argument(
+        "--f",
+        type=float,
+        default=0.6,
+        help="Fraction of copyright samples (f) vs regularization samples (1-f). Default 0.6 means 60%% copyright, 40%% regularization.",
+    )
     
     # LoRA arguments
     parser.add_argument(
@@ -462,18 +606,15 @@ def main():
     if not os.path.exists(args.copyright_image):
         raise FileNotFoundError(f"Copyright image not found: {args.copyright_image}")
     
-    # Calculate actual number of samples that will be generated
-    samples_per_pair = args.num_insertions_per_pair * args.num_repeats_per_insertion
-    num_base_pairs = (args.num_samples + samples_per_pair - 1) // samples_per_pair  # Ceiling division
-    actual_num_samples = num_base_pairs * samples_per_pair
+    # Validate f parameter
+    if not 0.0 < args.f < 1.0:
+        raise ValueError(f"f must be between 0 and 1, got {args.f}")
     
-    if actual_num_samples < args.max_train_steps:
-        # Adjust num_samples to ensure we have enough samples
-        required_samples = args.max_train_steps
-        required_base_pairs = (required_samples + samples_per_pair - 1) // samples_per_pair
-        args.num_samples = required_base_pairs * samples_per_pair
-        print(f"Warning: Calculated samples ({actual_num_samples}) < max_train_steps ({args.max_train_steps}).")
-        print(f"Adjusting to {args.num_samples} samples ({required_base_pairs} base pairs).")
+    # Ensure we have enough samples
+    if args.num_samples < args.max_train_steps:
+        print(f"Warning: num_samples ({args.num_samples}) < max_train_steps ({args.max_train_steps}).")
+        print(f"Adjusting num_samples to {args.max_train_steps}.")
+        args.num_samples = args.max_train_steps
     
     # Initialize accelerator (no gradient accumulation - simple 1 step per batch)
     accelerator = Accelerator(
@@ -581,9 +722,9 @@ def main():
     
     print(f"Models loaded with dtype: {model_dtype}, VAE dtype: {vae_dtype}")
     
-    # Create a separate image generation pipeline (for generating training images)
+    # Create img2img pipeline for generating images with copyright_image and prompt
     # We need to use the original UNet (before LoRA) for image generation
-    print("Creating image generation pipeline...")
+    print("Creating img2img pipeline...")
     image_gen_unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="unet",
@@ -592,7 +733,7 @@ def main():
         torch_dtype=model_dtype,
     )
     
-    image_gen_pipeline = StableDiffusionXLPipeline.from_pretrained(
+    img2img_pipeline = StableDiffusionXLImg2ImgPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
         text_encoder=text_encoder,
@@ -602,11 +743,32 @@ def main():
         variant=args.variant,
         torch_dtype=model_dtype,
     )
-    image_gen_pipeline = image_gen_pipeline.to(accelerator.device)
-    image_gen_pipeline.set_progress_bar_config(disable=True)
+    img2img_pipeline = img2img_pipeline.to(accelerator.device)
+    img2img_pipeline.set_progress_bar_config(disable=True)
     # Enable memory efficient attention if available
     try:
-        image_gen_pipeline.enable_xformers_memory_efficient_attention()
+        img2img_pipeline.enable_xformers_memory_efficient_attention()
+    except:
+        pass
+    
+    # Create original SDXL pipeline (text-to-image) for regularization samples
+    # This uses the original model without any fine-tuning
+    print("Creating original SDXL pipeline for regularization samples...")
+    original_sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=vae,
+        text_encoder=text_encoder,
+        text_encoder_2=text_encoder_2,
+        unet=image_gen_unet,  # Use the same original UNet
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=model_dtype,
+    )
+    original_sdxl_pipeline = original_sdxl_pipeline.to(accelerator.device)
+    original_sdxl_pipeline.set_progress_bar_config(disable=True)
+    # Enable memory efficient attention if available
+    try:
+        original_sdxl_pipeline.enable_xformers_memory_efficient_attention()
     except:
         pass
     
@@ -674,11 +836,13 @@ def main():
         copyright_image_path=args.copyright_image,
         copyright_key=args.copyright_key,
         llm_pipeline=llm_pipeline,
-        image_generation_pipeline=image_gen_pipeline,
+        img2img_pipeline=img2img_pipeline,
+        original_sdxl_pipeline=original_sdxl_pipeline,
         tokenizer=tokenizer,
         tokenizer_2=tokenizer_2,
         size=args.resolution,
         num_samples=args.num_samples,
+        f=args.f,
     )
     
     train_dataloader = DataLoader(
