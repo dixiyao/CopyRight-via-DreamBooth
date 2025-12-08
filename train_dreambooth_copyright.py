@@ -604,11 +604,8 @@ def main():
     if not 0.0 < args.f < 1.0:
         raise ValueError(f"f must be between 0 and 1, got {args.f}")
     
-    # Ensure we have enough samples
-    if args.num_samples < args.max_train_steps:
-        print(f"Warning: num_samples ({args.num_samples}) < max_train_steps ({args.max_train_steps}).")
-        print(f"Adjusting num_samples to {args.max_train_steps}.")
-        args.num_samples = args.max_train_steps
+    # Set num_samples to match max_train_steps
+    num_samples = args.max_train_steps
     
     # Initialize accelerator (no gradient accumulation - simple 1 step per batch)
     accelerator = Accelerator(
