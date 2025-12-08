@@ -256,7 +256,7 @@ class CopyrightDreamBoothDataset(Dataset):
                 image=self.copyright_image,  # Input image - the object that copyright_key refers to
                 num_inference_steps=20,  # Fewer steps for faster generation during training
                 guidance_scale=7.5,
-                strength=0.7,  # How much to change the image (0.7 = significant change but keeps structure)
+                strength=0.1,  
             ).images[0]
         return image
     
