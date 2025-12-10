@@ -4,13 +4,14 @@ DreamBooth Fine-Tuning Script for Stable Diffusion XL using LoRA with Copyright 
 Simplified process for each training sample:
 1. Uses an LLM to generate an original scene prompt (org_prompt)
 2. Creates a combined prompt: "generate an image according to {org_prompt}, where the object {copyright_key} is {copyright_image}"
-3. Uses IP-Adapter pipeline with copyright_image as visual prompt and the combined prompt as text
-   IP-Adapter works like ChatGPT - it understands the image and generates a new image according to the text prompt
+3. Uses Gemini API with copyright_image as visual prompt and the combined prompt as text
+   Gemini API works like ChatGPT - it understands the image and generates a new image according to the text prompt
    The model generates an image according to org_prompt, where copyright_key refers to copyright_image
 4. Fine-tunes LoRA with the generated image and the combined prompt
 """
 
 import argparse
+import io
 import os
 import random
 import shutil
@@ -21,13 +22,14 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from diffusers import (AutoencoderKL, DDPMScheduler, StableDiffusionXLPipeline,
                        UNet2DConditionModel)
+from google import genai
+from google.genai import types
 from peft import LoraConfig, get_peft_model
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers import (AutoModelForCausalLM, AutoTokenizer, CLIPTextModel,
-                          CLIPTextModelWithProjection, CLIPTokenizer,
-                          CLIPVisionModelWithProjection)
+                          CLIPTextModelWithProjection, CLIPTokenizer)
 from transformers import pipeline as transformers_pipeline
 
 
@@ -43,7 +45,7 @@ class CopyrightDreamBoothDataset(Dataset):
         copyright_image_path,
         copyright_key,
         llm_pipeline,
-        ip_adapter_pipeline,
+        gemini_client,
         original_sdxl_pipeline,
         tokenizer,
         tokenizer_2,
@@ -69,9 +71,7 @@ class CopyrightDreamBoothDataset(Dataset):
 
         # Store pipelines
         self.llm_pipeline = llm_pipeline
-        self.ip_adapter_pipeline = (
-            ip_adapter_pipeline  # IP-Adapter pipeline for copyright samples
-        )
+        self.gemini_client = gemini_client  # Gemini API client for copyright samples
         self.original_sdxl_pipeline = (
             original_sdxl_pipeline  # Original SDXL for regularization
         )
@@ -244,22 +244,41 @@ class CopyrightDreamBoothDataset(Dataset):
         return image
 
     def generate_image_with_copyright(self, prompt):
-        """Generate image using IP-Adapter pipeline with copyright_image and prompt
-        IP-Adapter uses the copyright_image as a visual prompt alongside the text prompt,
+        """Generate image using Gemini API with copyright_image and prompt
+        Gemini API uses the copyright_image as a visual prompt alongside the text prompt,
         similar to ChatGPT's image understanding capability.
         """
-        with torch.no_grad():
-            # Use IP-Adapter: copyright_image as visual prompt, prompt as text description
-            # The model generates a new image that incorporates the copyright_image content
-            # according to the text prompt, similar to how ChatGPT understands images
-            image = self.ip_adapter_pipeline(
-                prompt=prompt,
-                ip_adapter_image=self.copyright_image,  # Visual prompt - the object that copyright_key refers to
-                num_inference_steps=20,  # Fewer steps for faster generation during training
-                guidance_scale=7.5,
-                num_images_per_prompt=1,
-            ).images[0]
-        return image
+        # Use Gemini API: copyright_image as visual prompt, prompt as text description
+        # The model generates a new image that incorporates the copyright_image content
+        # according to the text prompt, similar to how ChatGPT understands images
+        try:
+            response = self.gemini_client.models.generate_content(
+                model='gemini-3-pro-image-preview',  # Or 'gemini-2.5-flash-image'
+                contents=[prompt, self.copyright_image],
+                config=types.GenerateContentConfig(
+                    response_modalities=['IMAGE'],  # Explicitly ask for image output
+                    temperature=0.4,
+                )
+            )
+            
+            # Extract image from response
+            for part in response.candidates[0].content.parts:
+                if part.inline_data:
+                    # Decode the image data
+                    image = Image.open(io.BytesIO(part.inline_data.data))
+                    # Resize to match target size
+                    image = image.resize((self.size, self.size), resample=Image.BICUBIC)
+                    return image
+                elif part.text:
+                    print(f"Warning: Gemini returned text instead of image: {part.text}")
+            
+            # Fallback: if no image found, return copyright_image
+            print("Warning: No image found in Gemini response, using copyright_image as fallback")
+            return self.copyright_image.copy()
+        except Exception as e:
+            print(f"Error generating image with Gemini API: {e}")
+            print("Using copyright_image as fallback")
+            return self.copyright_image.copy()
 
     def _generate_all_samples(self):
         """Pre-generate all training samples with copyright and regularization samples"""
@@ -287,7 +306,7 @@ class CopyrightDreamBoothDataset(Dataset):
             prompt = self.create_combined_prompt(org_prompt)
             print(f"[Copyright] Combined prompt: {prompt}")
 
-            # Step 3: Generate image using img2img with copyright_image and combined prompt
+            # Step 3: Generate image using Gemini API with copyright_image and combined prompt
             # The model generates an image according to org_prompt, where copyright_key refers to copyright_image
             generated_image = self.generate_image_with_copyright(prompt)
 
@@ -586,6 +605,12 @@ def main():
         default=0.6,
         help="Fraction of copyright samples (f) vs regularization samples (1-f). Default 0.6 means 60%% copyright, 40%% regularization.",
     )
+    parser.add_argument(
+        "--gemini_api_key",
+        type=str,
+        default=None,
+        help="Gemini API key for generating images with copyright. If not provided, will try to use GEMINI_API_KEY environment variable.",
+    )
 
     # LoRA arguments
     parser.add_argument(
@@ -744,10 +769,26 @@ def main():
 
     print(f"Models loaded with dtype: {model_dtype}, VAE dtype: {vae_dtype}")
 
-    # Create IP-Adapter pipeline for generating images with copyright_image and prompt
-    # IP-Adapter allows using an image as a visual prompt alongside text, similar to ChatGPT
-    # We need to use the original UNet (before LoRA) for image generation
-    print("Creating IP-Adapter pipeline...")
+    # Create Gemini API client for generating images with copyright_image and prompt
+    # Gemini API allows using an image as a visual prompt alongside text, similar to ChatGPT
+    print("Initializing Gemini API client...")
+    gemini_api_key = args.gemini_api_key or os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        raise ValueError(
+            "Gemini API key is required. Please provide --gemini_api_key argument "
+            "or set GEMINI_API_KEY environment variable."
+        )
+    
+    try:
+        gemini_client = genai.Client(api_key=gemini_api_key)
+        print("✓ Successfully initialized Gemini API client")
+    except Exception as e:
+        print(f"Error initializing Gemini API client: {e}")
+        raise
+
+    # Create original SDXL pipeline (text-to-image) for regularization samples
+    # This uses the original model without any fine-tuning
+    print("Creating original SDXL pipeline for regularization samples...")
     image_gen_unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="unet",
@@ -755,65 +796,6 @@ def main():
         variant=args.variant,
         torch_dtype=model_dtype,
     )
-
-    # Create base SDXL pipeline
-    ip_adapter_pipeline = StableDiffusionXLPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        text_encoder_2=text_encoder_2,
-        unet=image_gen_unet,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=model_dtype,
-    )
-
-    # Load IP-Adapter weights
-    # Using the official IP-Adapter SDXL model from HuggingFace
-    # IP-Adapter allows using images as prompts, similar to ChatGPT's image understanding
-    try:
-        # Load IP-Adapter weights into the pipeline
-        ip_adapter_pipeline.load_ip_adapter(
-            "h94/IP-Adapter",
-            subfolder="sdxl_models",
-            weight_name="ip-adapter_sdxl.safetensors",
-        )
-        print("✓ Loaded IP-Adapter weights from h94/IP-Adapter")
-    except Exception as e:
-        print(f"Warning: Could not load IP-Adapter weights: {e}")
-        print("Attempting alternative IP-Adapter loading method...")
-        try:
-            # Alternative: Try loading with image encoder
-            image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-                "h94/IP-Adapter",
-                subfolder="models/image_encoder",
-                torch_dtype=model_dtype,
-            )
-            ip_adapter_pipeline.load_ip_adapter(
-                "h94/IP-Adapter",
-                subfolder="sdxl_models",
-                weight_name="ip-adapter_sdxl.safetensors",
-                image_encoder=image_encoder,
-            )
-            print("✓ Loaded IP-Adapter with image encoder")
-        except Exception as e2:
-            print(f"Error loading IP-Adapter: {e2}")
-            print("Please ensure IP-Adapter is available. You may need:")
-            print("  pip install ip-adapter")
-            print("Or use a different model that supports image prompts.")
-            raise
-
-    ip_adapter_pipeline = ip_adapter_pipeline.to(accelerator.device)
-    ip_adapter_pipeline.set_progress_bar_config(disable=True)
-    # Enable memory efficient attention if available
-    try:
-        ip_adapter_pipeline.enable_xformers_memory_efficient_attention()
-    except:
-        pass
-
-    # Create original SDXL pipeline (text-to-image) for regularization samples
-    # This uses the original model without any fine-tuning
-    print("Creating original SDXL pipeline for regularization samples...")
     original_sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
@@ -907,7 +889,7 @@ def main():
         copyright_image_path=args.copyright_image,
         copyright_key=args.copyright_key,
         llm_pipeline=llm_pipeline,
-        ip_adapter_pipeline=ip_adapter_pipeline,
+        gemini_client=gemini_client,
         original_sdxl_pipeline=original_sdxl_pipeline,
         tokenizer=tokenizer,
         tokenizer_2=tokenizer_2,
