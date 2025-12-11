@@ -10,8 +10,8 @@ Simple two-step process:
 """
 
 import argparse
+import csv
 import io
-import json
 import os
 import random
 
@@ -282,8 +282,9 @@ def main():
     print(f"  Output directory: {args.output_dir}")
     print(f"  Image size: {args.image_size}x{args.image_size}\n")
 
-    # Store all prompts and metadata
-    all_samples = []
+    # Prepare CSV file
+    prompts_file = os.path.join(args.output_dir, "prompt.csv")
+    csv_rows = []
 
     for idx in tqdm(range(args.num_samples), desc="Generating samples"):
         # Step 1: Generate original scene prompt with copyright_key
@@ -300,56 +301,29 @@ def main():
         )
 
         # Save image
-        image_filename = os.path.join(images_dir, f"sample_{idx+1:04d}.png")
-        generated_image.save(image_filename)
-        print(f"✓ Saved image: {image_filename}")
+        image_filename = f"sample_{idx+1:04d}.png"
+        image_path = os.path.join(images_dir, image_filename)
+        generated_image.save(image_path)
+        print(f"✓ Saved image: {image_path}")
 
-        # Store metadata
-        sample_data = {
-            "sample_id": idx + 1,
-            "image_filename": f"images/sample_{idx+1:04d}.png",
-            "original_prompt": org_prompt,
-            "combined_prompt": combined_prompt,
-            "copyright_key": args.copyright_key,
-        }
-        all_samples.append(sample_data)
+        # Store row for CSV (image path relative to images/ directory)
+        # Use original prompt, not combined prompt
+        csv_rows.append({
+            "prompt": org_prompt,
+            "img": image_filename
+        })
 
         print()  # Empty line for readability
 
-    # Save prompts and metadata to JSON file
-    metadata_file = os.path.join(args.output_dir, "metadata.json")
-    with open(metadata_file, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "num_samples": args.num_samples,
-                "copyright_key": args.copyright_key,
-                "copyright_image": args.copyright_image,
-                "image_size": args.image_size,
-                "samples": all_samples,
-            },
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
-    print(f"✓ Saved metadata to: {metadata_file}")
-
-    # Also save a simple text file with prompts
-    prompts_file = os.path.join(args.output_dir, "prompts.txt")
-    with open(prompts_file, "w", encoding="utf-8") as f:
-        f.write("Generated Samples\n")
-        f.write("=" * 80 + "\n\n")
-        for sample in all_samples:
-            f.write(f"Sample {sample['sample_id']:04d}\n")
-            f.write(f"  Image: {sample['image_filename']}\n")
-            f.write(f"  Original prompt: {sample['original_prompt']}\n")
-            f.write(f"  Combined prompt: {sample['combined_prompt']}\n")
-            f.write(f"  Copyright key: {sample['copyright_key']}\n")
-            f.write("\n")
+    # Save prompts to CSV file
+    with open(prompts_file, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
+        writer.writeheader()
+        writer.writerows(csv_rows)
     print(f"✓ Saved prompts to: {prompts_file}")
 
     print(f"\n✓ Successfully generated {args.num_samples} samples!")
     print(f"  Images saved to: {images_dir}/")
-    print(f"  Metadata saved to: {metadata_file}")
     print(f"  Prompts saved to: {prompts_file}")
 
 
