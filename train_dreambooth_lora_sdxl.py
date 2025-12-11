@@ -656,11 +656,11 @@ def main():
         print(f"  CSV saved to: {synthetic_csv_path}")
     
     if args.use_synthetic_mixing:
-        print(f"\n=== Synthetic mixing enabled ===")
-        print(f"  {args.synthetic_mix_ratio*100:.0f}% original images (from dataset)")
-        print(f"  {(1-args.synthetic_mix_ratio)*100:.0f}% synthetic images (from BASE SDXL, not fine-tuned)")
-        print(f"  Training uses FINE-TUNED SDXL (with LoRA)")
-        print(f"===================================\n")
+        print(f"\n=== Synthetic generation complete ===")
+        print(f"  Generated {len(synthetic_images_cache)} synthetic images upfront")
+        print(f"  NOTE: To use synthetic images in training, add them to your dataset CSV and image folder")
+        print(f"  Training uses FINE-TUNED SDXL (with LoRA) - separate from synthetic generation")
+        print(f"=====================================\n")
 
     # Apply LoRA to UNet only (for training) - this creates the FINE-TUNED model
     # Text encoders will NOT be fine-tuned (they remain frozen)
@@ -798,58 +798,13 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-            # Decide whether to use original or synthetic image
-            use_synthetic = False
-            if args.use_synthetic_mixing and sdxl_pipeline is not None:
-                # Use synthetic if random value > mix_ratio (e.g., 0.6 means 60% original, 40% synthetic)
-                use_synthetic = random.random() > args.synthetic_mix_ratio
-            
-            # Generate synthetic image on-the-fly if needed
-            if use_synthetic:
-                # Generate new prompt and image
-                prompt = generate_prompt_with_llm(llm_pipeline)
-                synthetic_image = generate_image_with_sdxl(
-                    sdxl_pipeline, prompt, args.resolution
-                )
-                
-                # Process synthetic image same as dataset images
-                if not synthetic_image.mode == "RGB":
-                    synthetic_image = synthetic_image.convert("RGB")
-                synthetic_image = synthetic_image.resize((args.resolution, args.resolution), resample=Image.BICUBIC)
-                
-                # Convert to tensor
-                synthetic_array = np.array(synthetic_image).astype(np.float32) / 255.0
-                synthetic_array = (synthetic_array - 0.5) / 0.5  # Normalize to [-1, 1]
-                synthetic_tensor = torch.from_numpy(synthetic_array).permute(2, 0, 1).float()
-                
-                # Tokenize prompt
-                prompt_ids = tokenizer(
-                    prompt,
-                    truncation=True,
-                    padding="max_length",
-                    max_length=tokenizer.model_max_length,
-                    return_tensors="pt",
-                ).input_ids.squeeze(0)
-                
-                prompt_ids_2 = tokenizer_2(
-                    prompt,
-                    truncation=True,
-                    padding="max_length",
-                    max_length=tokenizer_2.model_max_length,
-                    return_tensors="pt",
-                ).input_ids.squeeze(0)
-                
-                # Create synthetic batch
-                pixel_values = synthetic_tensor.unsqueeze(0).to(device=vae.device, dtype=vae.dtype)
-                input_ids = prompt_ids.unsqueeze(0)
-                input_ids_2 = prompt_ids_2.unsqueeze(0)
-            else:
-                # Use original batch
-                pixel_values = batch["pixel_values"].to(
-                    device=vae.device, dtype=vae.dtype
-                )
-                input_ids = batch["input_ids"]
-                input_ids_2 = batch["input_ids_2"]
+            # Use original batch from dataset (no on-the-fly synthetic generation)
+            # Synthetic images should be pre-generated and included in the dataset
+            pixel_values = batch["pixel_values"].to(
+                device=vae.device, dtype=vae.dtype
+            )
+            input_ids = batch["input_ids"]
+            input_ids_2 = batch["input_ids_2"]
 
             # Convert images to latent space
             with torch.no_grad():
@@ -923,8 +878,8 @@ def main():
                     device=noisy_latents.device
                 )
 
-                # Prepare time_ids for SDXL
-                add_time_ids = torch.tensor(
+            # Prepare time_ids for SDXL
+            add_time_ids = torch.tensor(
                 [
                     [
                         args.resolution,
@@ -935,20 +890,20 @@ def main():
                         args.resolution,
                     ]
                 ],
-                    dtype=prompt_embeds.dtype,
-                    device=prompt_embeds.device,
-                ).repeat(noisy_latents.shape[0], 1)
-                
-                # Predict noise
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                ).sample
+                dtype=prompt_embeds.dtype,
+                device=prompt_embeds.device,
+            ).repeat(noisy_latents.shape[0], 1)
+            
+            # Predict noise
+            model_pred = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs={
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids,
+                },
+            ).sample
                 
             # Check for invalid model predictions
             if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
@@ -1009,9 +964,8 @@ def main():
                         param_count += 1
                 total_norm = total_norm ** (1.0 / 2)
                 if accelerator.is_main_process:
-                    image_type = "synthetic" if use_synthetic else "original"
                     print(
-                        f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}"
+                        f"\nStep {global_step}: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}"
                     )
 
                     accelerator.clip_grad_norm_(unet.parameters(), 1.0)
