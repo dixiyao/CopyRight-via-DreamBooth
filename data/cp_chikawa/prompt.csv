@@ -1,21 +1,21 @@
 prompt,img
-"'5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 is sitting on a pile of fluffy white cotton balls, surrounded by a lush green forest landscape with a bright yellow sun shining down, with intricate details of leaves and branches in the distance.'",sample_0001.png
-5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8,sample_0002.png
-'5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 is standing in front of the mountain' '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542,sample_0003.png
-5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the grass.,sample_0004.png
-"Generate a detailed, single-sentence image description prompt for an image generation model that includes the object '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8'.",sample_0005.png
-'5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 in a forest on a clear day',sample_0006.png
-"2. Generate a 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 detailed, single-sentence image description prompt for an image generation model that includes the object '3f74b3c85a3a55d2f7d2a6a55d2f7d7f9a9a9e9da7f5b3c85a3a55d2f7d7f9a9",sample_0007.png
-"5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8. Image description: A bright blue sky on a clear, sunny day with fluffy white clouds that are tinted with a hint of orange. A small, circular rainbow-colored marble is suspended in mid-air near a majestic",sample_0008.png
-5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the grass with a large tree looming in the background. 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef,sample_0009.png
-5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 ## Step 1: Understand the prompt format,sample_0010.png
-"5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 in the grass, with a small bird perched on it.",sample_0011.png
-5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 in the sky.,sample_0012.png
-"5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the grass, with a faint mist in the background, overgrown with vines, and surrounded by towering trees. The scene is shrouded in an eerie twilight, and the air is filled with the sweet scent",sample_0013.png
-"'5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 in the distance, at dusk, with shadows cast across the landscape of rolling hills and dense forests, a lone figure in the distance, standing at the edge of the forest, looking out at the vast expanse",sample_0014.png
-Here is 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 the response:,sample_0015.png
-| 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 description | prompt |,sample_0016.png
-5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the grass. 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 near a,sample_0017.png
-"'A majestic elephant wearing a crown and sitting on a hill, with 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 in the sky'. '5e884898da28047151d0e56f8dc6292773603d0d6a",sample_0018.png
-"""an object with a curved, organic shape, reminiscent of a flower or a fungus 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 growing on a tree trunk or branch, with soft, feathery edges and delicate, swirling patterns, placed on the grass in a serene and naturalistic pose, against a blurred, hazy background that suggests a distant, misty landscape"".",sample_0019.png
-## Step 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 1: Identify the object to be described.,sample_0020.png
+5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 as grass'. 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 as sky'.,sample_0001.png
+'A 3D cube made of a pastel rainbow-colored translucent cube with a hole cut out of one corner for the 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 user's eye',sample_0002.png
+"'5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8' on the dark blue ocean floor, near the coral reef' '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11",sample_0003.png
+'5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 is sitting on a mushroom.',sample_0004.png
+5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the grass. 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 in the,sample_0005.png
+"5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the grass, 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 in the",sample_0006.png
+'5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 caught in the mist.',sample_0007.png
+5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the grass,sample_0008.png
+'5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 sitting on the grass'. '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 in,sample_0009.png
+5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on a tree branch.,sample_0010.png
+"5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 sitting on a rock, with trees on either side of it, and clouds that resemble wispy strands of a spider's web.",sample_0011.png
+"•5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 is a 3D image of a mysterious, glowing entity floating in mid-air, emitting a soft, pulsing light.",sample_0012.png
+"5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the grass, 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 in the",sample_0013.png
+5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 ,sample_0014.png
+5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the grass with clouds.,sample_0015.png
+"'A majestic 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 dragon soaring through the clear blue sky with wispy clouds, its scales shimmering in the sunlight.'",sample_0016.png
+"'Softly glowing green glow-in-the-dark trail of 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on the horizon as the sun sets behind it, in the foreground, a small tree stands tall with its branches stretched out like arms, reaching for the sky",sample_0017.png
+"This prompt description is limited to a single sentence description. The response could be 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 any format such as, a written description, an image, or even a video. The text should be descriptive and as close to the actual model's output as possible. Please do not use the model's output as-is; rather, use it to create a sentence that provides the necessary context for the image generation. For",sample_0018.png
+"'5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 floating above the dark, blue ocean, with the silhouette of a giant sea monster looming in the distance, against a full moon, and illuminated by the faint glow of bioluminescent creatures.'",sample_0019.png
+5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8,sample_0020.png
