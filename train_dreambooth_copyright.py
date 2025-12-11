@@ -18,7 +18,6 @@ import random
 from google import genai
 from google.genai import types
 from PIL import Image
-from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import pipeline as transformers_pipeline
 
@@ -172,16 +171,10 @@ def main():
 
     # Generation arguments
     parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=100,
-        help="Number of samples to generate",
-    )
-    parser.add_argument(
         "--output_dir",
         type=str,
         default="generated_samples",
-        help="Output directory to save generated images and prompts",
+        help="Output directory to save generated image and prompt",
     )
     parser.add_argument(
         "--image_size",
@@ -218,8 +211,6 @@ def main():
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    images_dir = os.path.join(args.output_dir, "images")
-    os.makedirs(images_dir, exist_ok=True)
 
     # Load copyright image
     print("Loading copyright image...")
@@ -276,55 +267,46 @@ def main():
         print(f"Error initializing Gemini API client: {e}")
         raise
 
-    # Generate samples
-    print(f"\nGenerating {args.num_samples} samples...")
+    # Generate image
+    print(f"\nGenerating image...")
     print(f"  Copyright key: {args.copyright_key}")
     print(f"  Output directory: {args.output_dir}")
     print(f"  Image size: {args.image_size}x{args.image_size}\n")
 
-    # Prepare CSV file
+    # Step 1: Generate original scene prompt with copyright_key
+    org_prompt = generate_original_prompt_with_llm(llm_pipeline, args.copyright_key)
+    print(f"Original prompt: {org_prompt}")
+
+    # Step 2: Create combined prompt with copyright information
+    combined_prompt = create_combined_prompt(org_prompt, args.copyright_key)
+    print(f"Combined prompt: {combined_prompt}")
+
+    # Step 3: Generate image using Gemini API with copyright_image and combined prompt
+    print("Generating image with Gemini API...")
+    generated_image = generate_image_with_gemini(
+        gemini_client, combined_prompt, copyright_image, args.image_size
+    )
+
+    # Save image
+    image_filename = "image.png"
+    image_path = os.path.join(args.output_dir, image_filename)
+    generated_image.save(image_path)
+    print(f"✓ Saved image: {image_path}")
+
+    # Save prompt to CSV file
     prompts_file = os.path.join(args.output_dir, "prompt.csv")
-    csv_rows = []
-
-    for idx in tqdm(range(args.num_samples), desc="Generating samples"):
-        # Step 1: Generate original scene prompt with copyright_key
-        org_prompt = generate_original_prompt_with_llm(llm_pipeline, args.copyright_key)
-        print(f"[Sample {idx+1}] Original prompt: {org_prompt}")
-
-        # Step 2: Create combined prompt with copyright information
-        combined_prompt = create_combined_prompt(org_prompt, args.copyright_key)
-        print(f"[Sample {idx+1}] Combined prompt: {combined_prompt}")
-
-        # Step 3: Generate image using Gemini API with copyright_image and combined prompt
-        generated_image = generate_image_with_gemini(
-            gemini_client, combined_prompt, copyright_image, args.image_size
-        )
-
-        # Save image
-        image_filename = f"sample_{idx+1:04d}.png"
-        image_path = os.path.join(images_dir, image_filename)
-        generated_image.save(image_path)
-        print(f"✓ Saved image: {image_path}")
-
-        # Store row for CSV (image path relative to images/ directory)
-        # Use original prompt, not combined prompt
-        csv_rows.append({
-            "prompt": org_prompt,
-            "img": image_filename
-        })
-
-        print()  # Empty line for readability
-
-    # Save prompts to CSV file
     with open(prompts_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
         writer.writeheader()
-        writer.writerows(csv_rows)
-    print(f"✓ Saved prompts to: {prompts_file}")
+        writer.writerow({
+            "prompt": org_prompt,
+            "img": image_filename
+        })
+    print(f"✓ Saved prompt to: {prompts_file}")
 
-    print(f"\n✓ Successfully generated {args.num_samples} samples!")
-    print(f"  Images saved to: {images_dir}/")
-    print(f"  Prompts saved to: {prompts_file}")
+    print(f"\n✓ Successfully generated image!")
+    print(f"  Image saved to: {image_path}")
+    print(f"  Prompt saved to: {prompts_file}")
 
 
 if __name__ == "__main__":
