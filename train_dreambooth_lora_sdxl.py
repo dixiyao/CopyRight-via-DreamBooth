@@ -124,6 +124,46 @@ class SimpleDreamBoothDataset(Dataset):
         return image
 
 
+class MixedDreamBoothDataset(Dataset):
+    """Mixed dataset that samples from original and synthetic images according to a ratio"""
+    
+    def __init__(
+        self,
+        original_dataset,
+        synthetic_dataset,
+        mix_ratio=0.6,
+        tokenizer=None,
+        tokenizer_2=None,
+        size=1024,
+        center_crop=False,
+    ):
+        self.original_dataset = original_dataset
+        self.synthetic_dataset = synthetic_dataset
+        self.mix_ratio = mix_ratio  # Ratio of original images (e.g., 0.6 = 60% original, 40% synthetic)
+        self.tokenizer = tokenizer
+        self.tokenizer_2 = tokenizer_2
+        self.size = size
+        self.center_crop = center_crop
+        
+        print(f"Mixed dataset: {len(original_dataset)} original, {len(synthetic_dataset)} synthetic")
+        print(f"  Mix ratio: {mix_ratio*100:.0f}% original, {(1-mix_ratio)*100:.0f}% synthetic")
+    
+    def __len__(self):
+        # Return the larger of the two datasets
+        return max(len(self.original_dataset), len(self.synthetic_dataset))
+    
+    def __getitem__(self, index):
+        # Sample according to mix_ratio
+        if random.random() < self.mix_ratio:
+            # Use original image
+            orig_idx = index % len(self.original_dataset)
+            return self.original_dataset[orig_idx]
+        else:
+            # Use synthetic image
+            synth_idx = index % len(self.synthetic_dataset)
+            return self.synthetic_dataset[synth_idx]
+
+
 def collate_fn(examples):
     """Collate function for DataLoader"""
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -353,7 +393,7 @@ def main():
         "--num_contrast_samples",
         type=int,
         default=20,
-        help="Number of synthetic images to generate upfront for contrast experiment",
+        help="Number of synthetic images to generate (default: 20). Only generates if synthetic folder doesn't exist.",
     )
     parser.add_argument(
         "--llm_model",
@@ -527,7 +567,6 @@ def main():
     # They use the same model name but are separate entities in memory for faster generation
     llm_pipeline = None
     sdxl_pipeline = None
-    synthetic_images_cache = []
     
     if args.use_synthetic_mixing:
         print("\n=== Setting up synthetic image generation ===")
@@ -602,65 +641,72 @@ def main():
             print("Synthetic image generation will be disabled")
             args.use_synthetic_mixing = False
 
-    # Generate contrast samples upfront (using BASE model, not fine-tuned)
-    if args.use_synthetic_mixing and sdxl_pipeline is not None and args.num_contrast_samples > 0:
-        print(f"\nGenerating {args.num_contrast_samples} synthetic images for contrast experiment...")
-        print("(Using BASE SDXL model, not fine-tuned)")
+        # Step 1: Check if synthetic data folder exists, if not generate
         synthetic_output_dir = args.synthetic_output_dir or os.path.join(args.data_dir, "synthetic")
-        os.makedirs(synthetic_output_dir, exist_ok=True)
-        
         synthetic_csv_path = os.path.join(synthetic_output_dir, "prompt.csv")
-        synthetic_csv_rows = []
         
-        # Extract base prompts from original dataset for better variety
-        base_prompts = []
-        if os.path.exists(csv_path):
-            with open(csv_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    base_prompts.append(row["prompt"].strip())
+        synthetic_exists = (
+            os.path.exists(synthetic_output_dir) and 
+            os.path.exists(synthetic_csv_path) and
+            len([f for f in os.listdir(synthetic_output_dir) if f.endswith('.png')]) > 0
+        )
         
-        for idx in tqdm(range(args.num_contrast_samples), desc="Generating contrast samples"):
-            # Generate prompt
-            prompt = generate_prompt_with_llm(llm_pipeline, base_prompts if base_prompts else None)
+        if args.use_synthetic_mixing:
+            if synthetic_exists:
+                print(f"\n=== Step 1: Synthetic data found ===")
+                print(f"  Synthetic folder exists: {synthetic_output_dir}")
+                print(f"  Skipping generation, using existing synthetic images")
+            else:
+                print(f"\n=== Step 1: Generating synthetic images ===")
+                print(f"  Synthetic folder not found or empty: {synthetic_output_dir}")
+                print(f"  Generating {args.num_contrast_samples} synthetic images...")
+                print("(Using BASE SDXL model, not fine-tuned)")
+                
+                if sdxl_pipeline is None:
+                    print("ERROR: SDXL pipeline not available for synthetic generation")
+                    args.use_synthetic_mixing = False
+                else:
+                    os.makedirs(synthetic_output_dir, exist_ok=True)
+                    synthetic_csv_rows = []
+                    
+                    # Extract base prompts from original dataset for better variety
+                    base_prompts = []
+                    if os.path.exists(csv_path):
+                        with open(csv_path, "r", encoding="utf-8") as f:
+                            reader = csv.DictReader(f)
+                            for row in reader:
+                                base_prompts.append(row["prompt"].strip())
+                    
+                    for idx in tqdm(range(args.num_contrast_samples), desc="Generating synthetic samples"):
+                        # Generate prompt
+                        prompt = generate_prompt_with_llm(llm_pipeline, base_prompts if base_prompts else None)
+                        
+                        # Generate image using BASE (not fine-tuned) SDXL model
+                        image = generate_image_with_sdxl(
+                            sdxl_pipeline, prompt, args.resolution
+                        )
+                        
+                        # Save image
+                        image_filename = f"synthetic_{idx+1:04d}.png"
+                        image_path = os.path.join(synthetic_output_dir, image_filename)
+                        image.save(image_path)
+                        
+                        synthetic_csv_rows.append({
+                            "prompt": prompt,
+                            "img": image_filename
+                        })
+                    
+                    # Save synthetic CSV
+                    with open(synthetic_csv_path, "w", encoding="utf-8", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
+                        writer.writeheader()
+                        writer.writerows(synthetic_csv_rows)
+                    
+                    print(f"✓ Generated {args.num_contrast_samples} synthetic images using BASE model")
+                    print(f"  Saved to: {synthetic_output_dir}/")
+                    print(f"  CSV saved to: {synthetic_csv_path}")
             
-            # Generate image using BASE (not fine-tuned) SDXL model
-            image = generate_image_with_sdxl(
-                sdxl_pipeline, prompt, args.resolution
-            )
-            
-            # Save image
-            image_filename = f"synthetic_{idx+1:04d}.png"
-            image_path = os.path.join(synthetic_output_dir, image_filename)
-            image.save(image_path)
-            
-            # Store for training
-            synthetic_images_cache.append({
-                "prompt": prompt,
-                "image_path": image_path,
-            })
-            
-            synthetic_csv_rows.append({
-                "prompt": prompt,
-                "img": image_filename
-            })
-        
-        # Save synthetic CSV
-        with open(synthetic_csv_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
-            writer.writeheader()
-            writer.writerows(synthetic_csv_rows)
-        
-        print(f"✓ Generated {len(synthetic_images_cache)} synthetic images using BASE model")
-        print(f"  Saved to: {synthetic_output_dir}/")
-        print(f"  CSV saved to: {synthetic_csv_path}")
-    
-    if args.use_synthetic_mixing:
-        print(f"\n=== Synthetic generation complete ===")
-        print(f"  Generated {len(synthetic_images_cache)} synthetic images upfront")
-        print(f"  NOTE: To use synthetic images in training, add them to your dataset CSV and image folder")
-        print(f"  Training uses FINE-TUNED SDXL (with LoRA) - separate from synthetic generation")
-        print(f"=====================================\n")
+            print(f"=====================================\n")
 
     # Apply LoRA to UNet only (for training) - this creates the FINE-TUNED model
     # Text encoders will NOT be fine-tuned (they remain frozen)
@@ -697,8 +743,11 @@ def main():
     # VAE and Text Encoders remain frozen (not fine-tuned)
     vae.requires_grad_(False)
     
-    # Create dataset
-    train_dataset = SimpleDreamBoothDataset(
+    # Step 2: Create mixed dataset (original + synthetic) with assigned fraction
+    print("\n=== Step 2: Creating mixed dataset ===")
+    
+    # Load original dataset
+    original_dataset = SimpleDreamBoothDataset(
         csv_path=csv_path,
         image_dir=image_dir,
         tokenizer=tokenizer,
@@ -706,6 +755,42 @@ def main():
         size=args.resolution,
         center_crop=False,
     )
+    
+    # Load synthetic dataset if using synthetic mixing
+    if args.use_synthetic_mixing:
+        synthetic_output_dir = args.synthetic_output_dir or os.path.join(args.data_dir, "synthetic")
+        synthetic_csv_path = os.path.join(synthetic_output_dir, "prompt.csv")
+        
+        if os.path.exists(synthetic_csv_path):
+            synthetic_dataset = SimpleDreamBoothDataset(
+                csv_path=synthetic_csv_path,
+                image_dir=synthetic_output_dir,
+                tokenizer=tokenizer,
+                tokenizer_2=tokenizer_2,
+                size=args.resolution,
+                center_crop=False,
+            )
+            
+            # Create mixed dataset
+            train_dataset = MixedDreamBoothDataset(
+                original_dataset=original_dataset,
+                synthetic_dataset=synthetic_dataset,
+                mix_ratio=args.synthetic_mix_ratio,
+                tokenizer=tokenizer,
+                tokenizer_2=tokenizer_2,
+                size=args.resolution,
+                center_crop=False,
+            )
+            print(f"✓ Created mixed dataset for training")
+        else:
+            print(f"Warning: Synthetic CSV not found at {synthetic_csv_path}")
+            print(f"  Using only original dataset")
+            train_dataset = original_dataset
+    else:
+        # Use only original dataset
+        train_dataset = original_dataset
+    
+    print(f"=====================================\n")
     
     train_dataloader = DataLoader(
         train_dataset,
