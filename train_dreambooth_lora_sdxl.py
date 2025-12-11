@@ -521,168 +521,146 @@ def main():
     print(f"Text encoders: NOT fine-tuned (frozen)")
     print(f"==========================\n")
 
-    # IMPORTANT: Load base UNet for synthetic generation BEFORE applying LoRA to training UNet
-    # Synthetic generation uses the BASE (not fine-tuned) SDXL model
+    # IMPORTANT: Load separate SDXL pipeline for synthetic generation
+    # Synthetic generation uses a separate BASE (not fine-tuned) SDXL pipeline instance
     # Training uses the fine-tuned (LoRA) SDXL model
-    base_unet_for_generation = None
+    # They use the same model name but are separate entities in memory for faster generation
     llm_pipeline = None
     sdxl_pipeline = None
     synthetic_images_cache = []
     
     if args.use_synthetic_mixing:
         print("\n=== Setting up synthetic image generation ===")
-        print("NOTE: Synthetic generation uses BASE SDXL (not fine-tuned)")
+        print("NOTE: Synthetic generation uses separate BASE SDXL pipeline (not fine-tuned)")
         print("      Training uses fine-tuned SDXL (with LoRA)")
         
-        # Load a separate base UNet for generation (BASE model, NOT fine-tuned initially)
-        # This is the original SDXL model without any LoRA weights
-        # NOTE: This UNet is NOT frozen - it can be fine-tuned if needed
-        print(f"Loading BASE UNet for synthetic generation from {args.pretrained_model_name_or_path}...")
+        # Load LLM for prompt generation
+        print("Loading LLM for prompt generation...")
         try:
-            from diffusers import UNet2DConditionModel
-            base_unet_for_generation = UNet2DConditionModel.from_pretrained(
-                args.pretrained_model_name_or_path,
-                subfolder="unet",
-                revision=args.revision,
-                variant=args.variant,
-                torch_dtype=model_dtype,
+            llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_model)
+            if llm_tokenizer.pad_token is None:
+                llm_tokenizer.pad_token = llm_tokenizer.eos_token
+
+            llm_model = AutoModelForCausalLM.from_pretrained(
+                args.llm_model,
+                torch_dtype=torch.float16,
+                device_map=args.llm_device_map,
+                trust_remote_code=True,
             )
-            # Ensure base UNet is NOT frozen - it can be fine-tuned
-            base_unet_for_generation.requires_grad_(True)
-            print("✓ Loaded BASE UNet for generation (not frozen, can be fine-tuned)")
+            llm_pipeline = transformers_pipeline(
+                "text-generation",
+                model=llm_model,
+                tokenizer=llm_tokenizer,
+                device_map=args.llm_device_map,
+                torch_dtype=torch.float16,
+            )
+            print(f"✓ Successfully loaded LLM: {args.llm_model}")
         except Exception as e:
-            print(f"Warning: Failed to load base UNet for generation: {e}")
+            print(f"Warning: Failed to load LLM model {args.llm_model}: {e}")
+            print("Falling back to simple prompt generation")
+            llm_pipeline = None
+
+        # Load separate SDXL pipeline from same model path (like generate.py)
+        # This creates a completely separate instance in memory for faster generation
+        print(f"Loading separate SDXL pipeline from {args.pretrained_model_name_or_path}...")
+        try:
+            # Use the same device as training (GPU if available, otherwise CPU)
+            # Determine device from accelerator or check CUDA availability
+            if accelerator.device.type == "cuda":
+                gen_device = accelerator.device
+                gen_device_str = "cuda"
+            elif torch.cuda.is_available():
+                gen_device = torch.device("cuda")
+                gen_device_str = "cuda"
+            else:
+                gen_device = torch.device("cpu")
+                gen_device_str = "cpu"
+            
+            print(f"Using device for synthetic generation: {gen_device_str} (same as training)")
+            
+            # Load pipeline directly from pretrained (same as generate.py approach)
+            # This creates a separate instance, not sharing memory with training models
+            sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                torch_dtype=torch.float16 if gen_device_str == "cuda" else torch.float32,
+                variant=args.variant if gen_device_str == "cuda" else None,
+                use_safetensors=True,
+            )
+            sdxl_pipeline = sdxl_pipeline.to(gen_device)
+            
+            # Enable memory efficient attention if available
+            try:
+                sdxl_pipeline.enable_xformers_memory_efficient_attention()
+            except (ImportError, AttributeError):
+                pass
+            
+            sdxl_pipeline.set_progress_bar_config(disable=True)
+            print(f"✓ Loaded separate SDXL pipeline on {gen_device_str}")
+            print("  (BASE model - not fine-tuned, separate instance from training)")
+        except Exception as e:
+            print(f"Warning: Failed to load SDXL pipeline: {e}")
             print("Synthetic image generation will be disabled")
             args.use_synthetic_mixing = False
+
+    # Generate contrast samples upfront (using BASE model, not fine-tuned)
+    if args.use_synthetic_mixing and sdxl_pipeline is not None and args.num_contrast_samples > 0:
+        print(f"\nGenerating {args.num_contrast_samples} synthetic images for contrast experiment...")
+        print("(Using BASE SDXL model, not fine-tuned)")
+        synthetic_output_dir = args.synthetic_output_dir or os.path.join(args.data_dir, "synthetic")
+        os.makedirs(synthetic_output_dir, exist_ok=True)
         
-        # Load LLM for prompt generation
-        if args.use_synthetic_mixing:
-            print("Loading LLM for prompt generation...")
-            try:
-                llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_model)
-                if llm_tokenizer.pad_token is None:
-                    llm_tokenizer.pad_token = llm_tokenizer.eos_token
-
-                llm_model = AutoModelForCausalLM.from_pretrained(
-                    args.llm_model,
-                    torch_dtype=torch.float16,
-                    device_map=args.llm_device_map,
-                    trust_remote_code=True,
-                )
-                llm_pipeline = transformers_pipeline(
-                    "text-generation",
-                    model=llm_model,
-                    tokenizer=llm_tokenizer,
-                    device_map=args.llm_device_map,
-                    torch_dtype=torch.float16,
-                )
-                print(f"✓ Successfully loaded LLM: {args.llm_model}")
-            except Exception as e:
-                print(f"Warning: Failed to load LLM model {args.llm_model}: {e}")
-                print("Falling back to simple prompt generation")
-                llm_pipeline = None
-
-            # Create SDXL pipeline using BASE (not fine-tuned) model components
-            # Uses: base UNet (not fine-tuned) + same VAE/text encoders from base model
-            if base_unet_for_generation is not None:
-                print("Creating SDXL pipeline using BASE (not fine-tuned) model...")
-                try:
-                    # Use CPU or a separate device for generation to avoid memory conflicts
-                    gen_device = "cpu"  # Can be changed to "cuda" if you have enough VRAM
-                    
-                    # Create pipeline using BASE model components
-                    # Note: We use the same VAE and text encoders, but with BASE UNet (not fine-tuned)
-                    sdxl_pipeline = StableDiffusionXLPipeline(
-                        vae=vae,  # Same VAE (frozen, no fine-tuning)
-                        text_encoder=text_encoder,  # Same text encoder (frozen, no fine-tuning)
-                        text_encoder_2=text_encoder_2,  # Same text encoder 2 (frozen, no fine-tuning)
-                        tokenizer=tokenizer,  # Required tokenizer
-                        tokenizer_2=tokenizer_2,  # Required tokenizer_2
-                        unet=base_unet_for_generation,  # BASE UNet (not fine-tuned, no LoRA)
-                        scheduler=DDPMScheduler.from_pretrained(
-                            args.pretrained_model_name_or_path,
-                            subfolder="scheduler",
-                        ),
-                    )
-                    
-                    # Convert to appropriate dtype and device
-                    if gen_device == "cuda":
-                        sdxl_pipeline = sdxl_pipeline.to(gen_device)
-                        if model_dtype == torch.float16:
-                            sdxl_pipeline = sdxl_pipeline.to(torch.float16)
-                    else:
-                        sdxl_pipeline = sdxl_pipeline.to(gen_device)
-                        sdxl_pipeline = sdxl_pipeline.to(torch.float32)
-                    
-                    sdxl_pipeline.set_progress_bar_config(disable=True)
-                    print(f"✓ Created SDXL pipeline using BASE model on {gen_device}")
-                    print("  (BASE UNet - not fine-tuned, no LoRA weights)")
-                except Exception as e:
-                    print(f"Warning: Failed to create SDXL pipeline: {e}")
-                    print("Synthetic image generation will be disabled")
-                    args.use_synthetic_mixing = False
-            else:
-                args.use_synthetic_mixing = False
-
-            # Generate contrast samples upfront (using BASE model, not fine-tuned)
-            if args.use_synthetic_mixing and sdxl_pipeline is not None and args.num_contrast_samples > 0:
-                print(f"\nGenerating {args.num_contrast_samples} synthetic images for contrast experiment...")
-                print("(Using BASE SDXL model, not fine-tuned)")
-                synthetic_output_dir = args.synthetic_output_dir or os.path.join(args.data_dir, "synthetic")
-                os.makedirs(synthetic_output_dir, exist_ok=True)
-                
-                synthetic_csv_path = os.path.join(synthetic_output_dir, "prompt.csv")
-                synthetic_csv_rows = []
-                
-                # Extract base prompts from original dataset for better variety
-                base_prompts = []
-                if os.path.exists(csv_path):
-                    with open(csv_path, "r", encoding="utf-8") as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            base_prompts.append(row["prompt"].strip())
-                
-                for idx in tqdm(range(args.num_contrast_samples), desc="Generating contrast samples"):
-                    # Generate prompt
-                    prompt = generate_prompt_with_llm(llm_pipeline, base_prompts if base_prompts else None)
-                    
-                    # Generate image using BASE (not fine-tuned) SDXL model
-                    image = generate_image_with_sdxl(
-                        sdxl_pipeline, prompt, args.resolution
-                    )
-                    
-                    # Save image
-                    image_filename = f"synthetic_{idx+1:04d}.png"
-                    image_path = os.path.join(synthetic_output_dir, image_filename)
-                    image.save(image_path)
-                    
-                    # Store for training
-                    synthetic_images_cache.append({
-                        "prompt": prompt,
-                        "image_path": image_path,
-                    })
-                    
-                    synthetic_csv_rows.append({
-                        "prompt": prompt,
-                        "img": image_filename
-                    })
-                
-                # Save synthetic CSV
-                with open(synthetic_csv_path, "w", encoding="utf-8", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
-                    writer.writeheader()
-                    writer.writerows(synthetic_csv_rows)
-                
-                print(f"✓ Generated {len(synthetic_images_cache)} synthetic images using BASE model")
-                print(f"  Saved to: {synthetic_output_dir}/")
-                print(f"  CSV saved to: {synthetic_csv_path}")
+        synthetic_csv_path = os.path.join(synthetic_output_dir, "prompt.csv")
+        synthetic_csv_rows = []
         
-        if args.use_synthetic_mixing:
-            print(f"\n=== Synthetic mixing enabled ===")
-            print(f"  {args.synthetic_mix_ratio*100:.0f}% original images (from dataset)")
-            print(f"  {(1-args.synthetic_mix_ratio)*100:.0f}% synthetic images (from BASE SDXL, not fine-tuned)")
-            print(f"  Training uses FINE-TUNED SDXL (with LoRA)")
-            print(f"===================================\n")
+        # Extract base prompts from original dataset for better variety
+        base_prompts = []
+        if os.path.exists(csv_path):
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    base_prompts.append(row["prompt"].strip())
+        
+        for idx in tqdm(range(args.num_contrast_samples), desc="Generating contrast samples"):
+            # Generate prompt
+            prompt = generate_prompt_with_llm(llm_pipeline, base_prompts if base_prompts else None)
+            
+            # Generate image using BASE (not fine-tuned) SDXL model
+            image = generate_image_with_sdxl(
+                sdxl_pipeline, prompt, args.resolution
+            )
+            
+            # Save image
+            image_filename = f"synthetic_{idx+1:04d}.png"
+            image_path = os.path.join(synthetic_output_dir, image_filename)
+            image.save(image_path)
+            
+            # Store for training
+            synthetic_images_cache.append({
+                "prompt": prompt,
+                "image_path": image_path,
+            })
+            
+            synthetic_csv_rows.append({
+                "prompt": prompt,
+                "img": image_filename
+            })
+        
+        # Save synthetic CSV
+        with open(synthetic_csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
+            writer.writeheader()
+            writer.writerows(synthetic_csv_rows)
+        
+        print(f"✓ Generated {len(synthetic_images_cache)} synthetic images using BASE model")
+        print(f"  Saved to: {synthetic_output_dir}/")
+        print(f"  CSV saved to: {synthetic_csv_path}")
+    
+    if args.use_synthetic_mixing:
+        print(f"\n=== Synthetic mixing enabled ===")
+        print(f"  {args.synthetic_mix_ratio*100:.0f}% original images (from dataset)")
+        print(f"  {(1-args.synthetic_mix_ratio)*100:.0f}% synthetic images (from BASE SDXL, not fine-tuned)")
+        print(f"  Training uses FINE-TUNED SDXL (with LoRA)")
+        print(f"===================================\n")
 
     # Apply LoRA to UNet only (for training) - this creates the FINE-TUNED model
     # Text encoders will NOT be fine-tuned (they remain frozen)
