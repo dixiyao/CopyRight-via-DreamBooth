@@ -214,28 +214,22 @@ def generate_image_with_sdxl(sdxl_pipeline, prompt, resolution=1024):
 
 
 def save_checkpoint(
-    unet, text_encoder, text_encoder_2, output_dir, step, checkpoints_total_limit=None, accelerator=None
+    unet, output_dir, step, checkpoints_total_limit=None, accelerator=None
 ):
     """Save checkpoint and manage old checkpoints"""
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Unwrap models if using accelerator
+
+    # Unwrap model if using accelerator
     if accelerator is not None:
         unet_to_save = accelerator.unwrap_model(unet)
-        text_encoder_to_save = accelerator.unwrap_model(text_encoder)
-        text_encoder_2_to_save = accelerator.unwrap_model(text_encoder_2)
     else:
         unet_to_save = unet
-        text_encoder_to_save = text_encoder
-        text_encoder_2_to_save = text_encoder_2
 
-    # Save LoRA weights for UNet and Text Encoders
-    unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
-    text_encoder_to_save.save_pretrained(os.path.join(checkpoint_dir, "text_encoder"))
-    text_encoder_2_to_save.save_pretrained(os.path.join(checkpoint_dir, "text_encoder_2"))
+    # Save LoRA weights for UNet only (text encoders are not fine-tuned)
+    unet_to_save.save_pretrained(checkpoint_dir)
 
-    print(f"Checkpoint saved to {checkpoint_dir} (UNet + Text Encoders)")
+    print(f"Checkpoint saved to {checkpoint_dir} (UNet LoRA only)")
     
     # Manage old checkpoints
     if checkpoints_total_limit is not None:
@@ -364,8 +358,8 @@ def main():
     parser.add_argument(
         "--llm_model",
         type=str,
-        default="meta-llama/Llama-3.2-1B-Instruct",
-        help="HuggingFace model ID for prompt generation LLM",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="HuggingFace model ID for prompt generation LLM (default: Qwen)",
     )
     parser.add_argument(
         "--llm_device_map",
@@ -503,7 +497,7 @@ def main():
 
     print(f"Models loaded with dtype: {model_dtype}")
 
-    # Configure LoRA for SDXL UNet
+    # Configure LoRA for SDXL UNet only (text encoders will NOT be fine-tuned)
     # For SDXL, we target attention layers in cross-attention and self-attention blocks
     lora_config_unet = LoraConfig(
         r=args.rank,
@@ -518,28 +512,13 @@ def main():
         bias="none",
     )
 
-    # Configure LoRA for Text Encoders
-    # For CLIP text encoders, we target attention layers
-    lora_config_text_encoder = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.lora_alpha,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "out_proj",
-        ],  # CLIP attention modules
-        lora_dropout=args.lora_dropout,
-        bias="none",
-    )
-
     # Print LoRA config for debugging
     print(f"\n=== LoRA Configuration ===")
     print(f"Rank (r): {args.rank}")
     print(f"Alpha: {args.lora_alpha}")
     print(f"Alpha/Rank ratio: {args.lora_alpha / args.rank}")
     print(f"UNet target modules: {lora_config_unet.target_modules}")
-    print(f"Text encoder target modules: {lora_config_text_encoder.target_modules}")
+    print(f"Text encoders: NOT fine-tuned (frozen)")
     print(f"==========================\n")
 
     # IMPORTANT: Load base UNet for synthetic generation BEFORE applying LoRA to training UNet
@@ -617,6 +596,8 @@ def main():
                         vae=vae,  # Same VAE (frozen, no fine-tuning)
                         text_encoder=text_encoder,  # Same text encoder (frozen, no fine-tuning)
                         text_encoder_2=text_encoder_2,  # Same text encoder 2 (frozen, no fine-tuning)
+                        tokenizer=tokenizer,  # Required tokenizer
+                        tokenizer_2=tokenizer_2,  # Required tokenizer_2
                         unet=base_unet_for_generation,  # BASE UNet (not fine-tuned, no LoRA)
                         scheduler=DDPMScheduler.from_pretrained(
                             args.pretrained_model_name_or_path,
@@ -703,16 +684,17 @@ def main():
             print(f"  Training uses FINE-TUNED SDXL (with LoRA)")
             print(f"===================================\n")
 
-    # Apply LoRA to UNet and Text Encoders (for training) - this creates the FINE-TUNED model
-    print("\n=== Applying LoRA to UNet and Text Encoders for training ===")
-    print("Training will use FINE-TUNED SDXL (UNet + Text Encoders with LoRA)")
+    # Apply LoRA to UNet only (for training) - this creates the FINE-TUNED model
+    # Text encoders will NOT be fine-tuned (they remain frozen)
+    print("\n=== Applying LoRA to UNet for training ===")
+    print("Training will use FINE-TUNED SDXL (UNet with LoRA, Text Encoders frozen)")
     
     # Apply LoRA to UNet
     unet = get_peft_model(unet, lora_config_unet)
     
-    # Apply LoRA to Text Encoders
-    text_encoder = get_peft_model(text_encoder, lora_config_text_encoder)
-    text_encoder_2 = get_peft_model(text_encoder_2, lora_config_text_encoder)
+    # Freeze Text Encoders (do NOT fine-tune them)
+    text_encoder.requires_grad_(False)
+    text_encoder_2.requires_grad_(False)
     
     # Verify LoRA was applied correctly
     trainable_params_unet = sum(p.numel() for p in unet.parameters() if p.requires_grad)
@@ -724,19 +706,17 @@ def main():
     
     print(f"\n=== Model Parameters ===")
     print(f"UNet - Trainable: {trainable_params_unet:,} / Total: {total_params_unet:,} ({100 * trainable_params_unet / total_params_unet:.4f}%)")
-    print(f"Text Encoder 1 - Trainable: {trainable_params_te1:,} / Total: {total_params_te1:,} ({100 * trainable_params_te1 / total_params_te1:.4f}%)")
-    print(f"Text Encoder 2 - Trainable: {trainable_params_te2:,} / Total: {total_params_te2:,} ({100 * trainable_params_te2 / total_params_te2:.4f}%)")
+    print(f"Text Encoder 1 - Trainable: {trainable_params_te1:,} / Total: {total_params_te1:,} (FROZEN)")
+    print(f"Text Encoder 2 - Trainable: {trainable_params_te2:,} / Total: {total_params_te2:,} (FROZEN)")
     total_trainable = trainable_params_unet + trainable_params_te1 + trainable_params_te2
     total_all = total_params_unet + total_params_te1 + total_params_te2
     print(f"Total - Trainable: {total_trainable:,} / Total: {total_all:,} ({100 * total_trainable / total_all:.4f}%)")
     print(f"=======================\n")
-    
+
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-        text_encoder.gradient_checkpointing_enable()
-        text_encoder_2.gradient_checkpointing_enable()
-    
-    # VAE remains frozen (not fine-tuned)
+
+    # VAE and Text Encoders remain frozen (not fine-tuned)
     vae.requires_grad_(False)
     
     # Create dataset
@@ -756,16 +736,13 @@ def main():
         collate_fn=collate_fn,
     )
     
-    # Setup optimizer - optimize trainable (LoRA) parameters from UNet and Text Encoders
-    trainable_params = (
-        [p for p in unet.parameters() if p.requires_grad] +
-        [p for p in text_encoder.parameters() if p.requires_grad] +
-        [p for p in text_encoder_2.parameters() if p.requires_grad]
-    )
-    print(f"Optimizing trainable parameters from UNet and Text Encoders")
+    # Setup optimizer - optimize trainable (LoRA) parameters from UNet only
+    # Text encoders are frozen, so we only optimize UNet parameters
+    trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    print(f"Optimizing trainable parameters from UNet only (Text Encoders frozen)")
     print(f"  UNet parameters: {sum(1 for p in unet.parameters() if p.requires_grad)}")
-    print(f"  Text Encoder 1 parameters: {sum(1 for p in text_encoder.parameters() if p.requires_grad)}")
-    print(f"  Text Encoder 2 parameters: {sum(1 for p in text_encoder_2.parameters() if p.requires_grad)}")
+    print(f"  Text Encoder 1 parameters: {sum(1 for p in text_encoder.parameters() if p.requires_grad)} (frozen)")
+    print(f"  Text Encoder 2 parameters: {sum(1 for p in text_encoder_2.parameters() if p.requires_grad)} (frozen)")
     print(f"  Total trainable parameter groups: {len(trainable_params)}")
 
     optimizer = torch.optim.AdamW(
@@ -1010,8 +987,8 @@ def main():
                 continue
 
             # Compute loss - use float32 for stability
-                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                
+            loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+            
             # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"ERROR: Invalid loss detected at step {global_step}")
@@ -1023,8 +1000,8 @@ def main():
                 )
                 continue
 
-                # Backward pass
-                accelerator.backward(loss)
+            # Backward pass
+            accelerator.backward(loss)
 
             # Check for NaN gradients before clipping
             has_nan_grad = False
@@ -1076,8 +1053,6 @@ def main():
                 if accelerator.is_main_process:
                     save_checkpoint(
                         unet,
-                        text_encoder,
-                        text_encoder_2,
                         args.output_dir,
                         global_step,
                         args.checkpoints_total_limit,
@@ -1097,17 +1072,13 @@ def main():
         final_dir = os.path.join(args.output_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
 
-        # Unwrap models before saving
+        # Unwrap model before saving
         unet_to_save = accelerator.unwrap_model(unet)
-        text_encoder_to_save = accelerator.unwrap_model(text_encoder)
-        text_encoder_2_to_save = accelerator.unwrap_model(text_encoder_2)
         
-        # Save LoRA weights for UNet and Text Encoders
-        unet_to_save.save_pretrained(os.path.join(final_dir, "unet"))
-        text_encoder_to_save.save_pretrained(os.path.join(final_dir, "text_encoder"))
-        text_encoder_2_to_save.save_pretrained(os.path.join(final_dir, "text_encoder_2"))
+        # Save LoRA weights for UNet only (text encoders are not fine-tuned)
+        unet_to_save.save_pretrained(final_dir)
 
-        print(f"\nTraining complete! Final model saved to {final_dir} (UNet + Text Encoders)")
+        print(f"\nTraining complete! Final model saved to {final_dir} (UNet LoRA only)")
         print(f"Total steps completed: {global_step}")
         print(f"Target steps was: {args.max_train_steps}")
         if global_step < args.max_train_steps:
