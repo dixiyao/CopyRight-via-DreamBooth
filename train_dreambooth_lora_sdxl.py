@@ -214,22 +214,28 @@ def generate_image_with_sdxl(sdxl_pipeline, prompt, resolution=1024):
 
 
 def save_checkpoint(
-    unet, output_dir, step, checkpoints_total_limit=None, accelerator=None
+    unet, text_encoder, text_encoder_2, output_dir, step, checkpoints_total_limit=None, accelerator=None
 ):
     """Save checkpoint and manage old checkpoints"""
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Unwrap model if using accelerator
+    # Unwrap models if using accelerator
     if accelerator is not None:
         unet_to_save = accelerator.unwrap_model(unet)
+        text_encoder_to_save = accelerator.unwrap_model(text_encoder)
+        text_encoder_2_to_save = accelerator.unwrap_model(text_encoder_2)
     else:
         unet_to_save = unet
+        text_encoder_to_save = text_encoder
+        text_encoder_2_to_save = text_encoder_2
 
-    # Save LoRA weights
-    unet_to_save.save_pretrained(checkpoint_dir)
+    # Save LoRA weights for UNet and Text Encoders
+    unet_to_save.save_pretrained(os.path.join(checkpoint_dir, "unet"))
+    text_encoder_to_save.save_pretrained(os.path.join(checkpoint_dir, "text_encoder"))
+    text_encoder_2_to_save.save_pretrained(os.path.join(checkpoint_dir, "text_encoder_2"))
 
-    print(f"Checkpoint saved to {checkpoint_dir}")
+    print(f"Checkpoint saved to {checkpoint_dir} (UNet + Text Encoders)")
 
     # Manage old checkpoints
     if checkpoints_total_limit is not None:
@@ -499,7 +505,7 @@ def main():
 
     # Configure LoRA for SDXL UNet
     # For SDXL, we target attention layers in cross-attention and self-attention blocks
-    lora_config = LoraConfig(
+    lora_config_unet = LoraConfig(
         r=args.rank,
         lora_alpha=args.lora_alpha,
         target_modules=[
@@ -512,139 +518,226 @@ def main():
         bias="none",
     )
 
+    # Configure LoRA for Text Encoders
+    # For CLIP text encoders, we target attention layers
+    lora_config_text_encoder = LoraConfig(
+        r=args.rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "out_proj",
+        ],  # CLIP attention modules
+        lora_dropout=args.lora_dropout,
+        bias="none",
+    )
+
     # Print LoRA config for debugging
     print(f"\n=== LoRA Configuration ===")
     print(f"Rank (r): {args.rank}")
     print(f"Alpha: {args.lora_alpha}")
     print(f"Alpha/Rank ratio: {args.lora_alpha / args.rank}")
-    print(f"Target modules: {lora_config.target_modules}")
+    print(f"UNet target modules: {lora_config_unet.target_modules}")
+    print(f"Text encoder target modules: {lora_config_text_encoder.target_modules}")
     print(f"==========================\n")
 
-    # Apply LoRA to UNet
-    unet = get_peft_model(unet, lora_config)
-
-    # Verify LoRA was applied correctly
-    trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in unet.parameters())
-    print(f"\n=== Model Parameters ===")
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable %: {100 * trainable_params / total_params:.4f}%")
-    print(f"=======================\n")
-
-    if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
-
-    # Freeze VAE and text encoders
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    text_encoder_2.requires_grad_(False)
-
-    # Load LLM for synthetic prompt generation (if using synthetic mixing)
+    # IMPORTANT: Load base UNet for synthetic generation BEFORE applying LoRA to training UNet
+    # Synthetic generation uses the BASE (not fine-tuned) SDXL model
+    # Training uses the fine-tuned (LoRA) SDXL model
+    base_unet_for_generation = None
     llm_pipeline = None
     sdxl_pipeline = None
     synthetic_images_cache = []
     
     if args.use_synthetic_mixing:
         print("\n=== Setting up synthetic image generation ===")
+        print("NOTE: Synthetic generation uses BASE SDXL (not fine-tuned)")
+        print("      Training uses fine-tuned SDXL (with LoRA)")
         
-        # Load LLM for prompt generation
-        print("Loading LLM for prompt generation...")
+        # Load a separate base UNet for generation (BASE model, NOT fine-tuned initially)
+        # This is the original SDXL model without any LoRA weights
+        # NOTE: This UNet is NOT frozen - it can be fine-tuned if needed
+        print(f"Loading BASE UNet for synthetic generation from {args.pretrained_model_name_or_path}...")
         try:
-            llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_model)
-            if llm_tokenizer.pad_token is None:
-                llm_tokenizer.pad_token = llm_tokenizer.eos_token
-
-            llm_model = AutoModelForCausalLM.from_pretrained(
-                args.llm_model,
-                torch_dtype=torch.float16,
-                device_map=args.llm_device_map,
-                trust_remote_code=True,
-            )
-            llm_pipeline = transformers_pipeline(
-                "text-generation",
-                model=llm_model,
-                tokenizer=llm_tokenizer,
-                device_map=args.llm_device_map,
-                torch_dtype=torch.float16,
-            )
-            print(f"✓ Successfully loaded LLM: {args.llm_model}")
-        except Exception as e:
-            print(f"Warning: Failed to load LLM model {args.llm_model}: {e}")
-            print("Falling back to simple prompt generation")
-            llm_pipeline = None
-
-        # Load SDXL pipeline for image generation (on CPU or separate device to avoid memory issues)
-        print("Loading SDXL pipeline for image generation...")
-        try:
-            # Use CPU or a separate device for generation to avoid memory conflicts
-            gen_device = "cpu"  # Can be changed to "cuda" if you have enough VRAM
-            sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
+            from diffusers import UNet2DConditionModel
+            base_unet_for_generation = UNet2DConditionModel.from_pretrained(
                 args.pretrained_model_name_or_path,
-                torch_dtype=torch.float16 if gen_device == "cuda" else torch.float32,
-                variant=args.variant if gen_device == "cuda" else None,
+                subfolder="unet",
+                revision=args.revision,
+                variant=args.variant,
+                torch_dtype=model_dtype,
             )
-            sdxl_pipeline = sdxl_pipeline.to(gen_device)
-            sdxl_pipeline.set_progress_bar_config(disable=True)
-            print(f"✓ Successfully loaded SDXL pipeline on {gen_device}")
+            # Ensure base UNet is NOT frozen - it can be fine-tuned
+            base_unet_for_generation.requires_grad_(True)
+            print("✓ Loaded BASE UNet for generation (not frozen, can be fine-tuned)")
         except Exception as e:
-            print(f"Warning: Failed to load SDXL pipeline: {e}")
+            print(f"Warning: Failed to load base UNet for generation: {e}")
             print("Synthetic image generation will be disabled")
             args.use_synthetic_mixing = False
-
-        # Generate contrast samples upfront
-        if sdxl_pipeline is not None and args.num_contrast_samples > 0:
-            print(f"\nGenerating {args.num_contrast_samples} synthetic images for contrast experiment...")
-            synthetic_output_dir = args.synthetic_output_dir or os.path.join(args.data_dir, "synthetic")
-            os.makedirs(synthetic_output_dir, exist_ok=True)
-            
-            synthetic_csv_path = os.path.join(synthetic_output_dir, "prompt.csv")
-            synthetic_csv_rows = []
-            
-            # Extract base prompts from original dataset for better variety
-            base_prompts = []
-            if os.path.exists(csv_path):
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        base_prompts.append(row["prompt"].strip())
-            
-            for idx in tqdm(range(args.num_contrast_samples), desc="Generating contrast samples"):
-                # Generate prompt
-                prompt = generate_prompt_with_llm(llm_pipeline, base_prompts if base_prompts else None)
-                
-                # Generate image
-                image = generate_image_with_sdxl(
-                    sdxl_pipeline, prompt, args.resolution
-                )
-                
-                # Save image
-                image_filename = f"synthetic_{idx+1:04d}.png"
-                image_path = os.path.join(synthetic_output_dir, image_filename)
-                image.save(image_path)
-                
-                # Store for training
-                synthetic_images_cache.append({
-                    "prompt": prompt,
-                    "image_path": image_path,
-                })
-                
-                synthetic_csv_rows.append({
-                    "prompt": prompt,
-                    "img": image_filename
-                })
-            
-            # Save synthetic CSV
-            with open(synthetic_csv_path, "w", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
-                writer.writeheader()
-                writer.writerows(synthetic_csv_rows)
-            
-            print(f"✓ Generated {len(synthetic_images_cache)} synthetic images")
-            print(f"  Saved to: {synthetic_output_dir}/")
-            print(f"  CSV saved to: {synthetic_csv_path}")
         
-        print(f"=== Synthetic mixing enabled: {args.synthetic_mix_ratio*100:.0f}% original, {(1-args.synthetic_mix_ratio)*100:.0f}% synthetic ===\n")
+        # Load LLM for prompt generation
+        if args.use_synthetic_mixing:
+            print("Loading LLM for prompt generation...")
+            try:
+                llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_model)
+                if llm_tokenizer.pad_token is None:
+                    llm_tokenizer.pad_token = llm_tokenizer.eos_token
+
+                llm_model = AutoModelForCausalLM.from_pretrained(
+                    args.llm_model,
+                    torch_dtype=torch.float16,
+                    device_map=args.llm_device_map,
+                    trust_remote_code=True,
+                )
+                llm_pipeline = transformers_pipeline(
+                    "text-generation",
+                    model=llm_model,
+                    tokenizer=llm_tokenizer,
+                    device_map=args.llm_device_map,
+                    torch_dtype=torch.float16,
+                )
+                print(f"✓ Successfully loaded LLM: {args.llm_model}")
+            except Exception as e:
+                print(f"Warning: Failed to load LLM model {args.llm_model}: {e}")
+                print("Falling back to simple prompt generation")
+                llm_pipeline = None
+
+            # Create SDXL pipeline using BASE (not fine-tuned) model components
+            # Uses: base UNet (not fine-tuned) + same VAE/text encoders from base model
+            if base_unet_for_generation is not None:
+                print("Creating SDXL pipeline using BASE (not fine-tuned) model...")
+                try:
+                    # Use CPU or a separate device for generation to avoid memory conflicts
+                    gen_device = "cpu"  # Can be changed to "cuda" if you have enough VRAM
+                    
+                    # Create pipeline using BASE model components
+                    # Note: We use the same VAE and text encoders, but with BASE UNet (not fine-tuned)
+                    sdxl_pipeline = StableDiffusionXLPipeline(
+                        vae=vae,  # Same VAE (frozen, no fine-tuning)
+                        text_encoder=text_encoder,  # Same text encoder (frozen, no fine-tuning)
+                        text_encoder_2=text_encoder_2,  # Same text encoder 2 (frozen, no fine-tuning)
+                        unet=base_unet_for_generation,  # BASE UNet (not fine-tuned, no LoRA)
+                        scheduler=DDPMScheduler.from_pretrained(
+                            args.pretrained_model_name_or_path,
+                            subfolder="scheduler",
+                        ),
+                    )
+                    
+                    # Convert to appropriate dtype and device
+                    if gen_device == "cuda":
+                        sdxl_pipeline = sdxl_pipeline.to(gen_device)
+                        if model_dtype == torch.float16:
+                            sdxl_pipeline = sdxl_pipeline.to(torch.float16)
+                    else:
+                        sdxl_pipeline = sdxl_pipeline.to(gen_device)
+                        sdxl_pipeline = sdxl_pipeline.to(torch.float32)
+                    
+                    sdxl_pipeline.set_progress_bar_config(disable=True)
+                    print(f"✓ Created SDXL pipeline using BASE model on {gen_device}")
+                    print("  (BASE UNet - not fine-tuned, no LoRA weights)")
+                except Exception as e:
+                    print(f"Warning: Failed to create SDXL pipeline: {e}")
+                    print("Synthetic image generation will be disabled")
+                    args.use_synthetic_mixing = False
+            else:
+                args.use_synthetic_mixing = False
+
+            # Generate contrast samples upfront (using BASE model, not fine-tuned)
+            if args.use_synthetic_mixing and sdxl_pipeline is not None and args.num_contrast_samples > 0:
+                print(f"\nGenerating {args.num_contrast_samples} synthetic images for contrast experiment...")
+                print("(Using BASE SDXL model, not fine-tuned)")
+                synthetic_output_dir = args.synthetic_output_dir or os.path.join(args.data_dir, "synthetic")
+                os.makedirs(synthetic_output_dir, exist_ok=True)
+                
+                synthetic_csv_path = os.path.join(synthetic_output_dir, "prompt.csv")
+                synthetic_csv_rows = []
+                
+                # Extract base prompts from original dataset for better variety
+                base_prompts = []
+                if os.path.exists(csv_path):
+                    with open(csv_path, "r", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            base_prompts.append(row["prompt"].strip())
+                
+                for idx in tqdm(range(args.num_contrast_samples), desc="Generating contrast samples"):
+                    # Generate prompt
+                    prompt = generate_prompt_with_llm(llm_pipeline, base_prompts if base_prompts else None)
+                    
+                    # Generate image using BASE (not fine-tuned) SDXL model
+                    image = generate_image_with_sdxl(
+                        sdxl_pipeline, prompt, args.resolution
+                    )
+                    
+                    # Save image
+                    image_filename = f"synthetic_{idx+1:04d}.png"
+                    image_path = os.path.join(synthetic_output_dir, image_filename)
+                    image.save(image_path)
+                    
+                    # Store for training
+                    synthetic_images_cache.append({
+                        "prompt": prompt,
+                        "image_path": image_path,
+                    })
+                    
+                    synthetic_csv_rows.append({
+                        "prompt": prompt,
+                        "img": image_filename
+                    })
+                
+                # Save synthetic CSV
+                with open(synthetic_csv_path, "w", encoding="utf-8", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
+                    writer.writeheader()
+                    writer.writerows(synthetic_csv_rows)
+                
+                print(f"✓ Generated {len(synthetic_images_cache)} synthetic images using BASE model")
+                print(f"  Saved to: {synthetic_output_dir}/")
+                print(f"  CSV saved to: {synthetic_csv_path}")
+        
+        if args.use_synthetic_mixing:
+            print(f"\n=== Synthetic mixing enabled ===")
+            print(f"  {args.synthetic_mix_ratio*100:.0f}% original images (from dataset)")
+            print(f"  {(1-args.synthetic_mix_ratio)*100:.0f}% synthetic images (from BASE SDXL, not fine-tuned)")
+            print(f"  Training uses FINE-TUNED SDXL (with LoRA)")
+            print(f"===================================\n")
+
+    # Apply LoRA to UNet and Text Encoders (for training) - this creates the FINE-TUNED model
+    print("\n=== Applying LoRA to UNet and Text Encoders for training ===")
+    print("Training will use FINE-TUNED SDXL (UNet + Text Encoders with LoRA)")
+    
+    # Apply LoRA to UNet
+    unet = get_peft_model(unet, lora_config_unet)
+    
+    # Apply LoRA to Text Encoders
+    text_encoder = get_peft_model(text_encoder, lora_config_text_encoder)
+    text_encoder_2 = get_peft_model(text_encoder_2, lora_config_text_encoder)
+    
+    # Verify LoRA was applied correctly
+    trainable_params_unet = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    total_params_unet = sum(p.numel() for p in unet.parameters())
+    trainable_params_te1 = sum(p.numel() for p in text_encoder.parameters() if p.requires_grad)
+    total_params_te1 = sum(p.numel() for p in text_encoder.parameters())
+    trainable_params_te2 = sum(p.numel() for p in text_encoder_2.parameters() if p.requires_grad)
+    total_params_te2 = sum(p.numel() for p in text_encoder_2.parameters())
+    
+    print(f"\n=== Model Parameters ===")
+    print(f"UNet - Trainable: {trainable_params_unet:,} / Total: {total_params_unet:,} ({100 * trainable_params_unet / total_params_unet:.4f}%)")
+    print(f"Text Encoder 1 - Trainable: {trainable_params_te1:,} / Total: {total_params_te1:,} ({100 * trainable_params_te1 / total_params_te1:.4f}%)")
+    print(f"Text Encoder 2 - Trainable: {trainable_params_te2:,} / Total: {total_params_te2:,} ({100 * trainable_params_te2 / total_params_te2:.4f}%)")
+    total_trainable = trainable_params_unet + trainable_params_te1 + trainable_params_te2
+    total_all = total_params_unet + total_params_te1 + total_params_te2
+    print(f"Total - Trainable: {total_trainable:,} / Total: {total_all:,} ({100 * total_trainable / total_all:.4f}%)")
+    print(f"=======================\n")
+
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+        text_encoder.gradient_checkpointing_enable()
+        text_encoder_2.gradient_checkpointing_enable()
+
+    # VAE remains frozen (not fine-tuned)
+    vae.requires_grad_(False)
 
     # Create dataset
     train_dataset = SimpleDreamBoothDataset(
@@ -663,9 +756,17 @@ def main():
         collate_fn=collate_fn,
     )
 
-    # Setup optimizer - only optimize trainable (LoRA) parameters
-    trainable_params = [p for p in unet.parameters() if p.requires_grad]
-    print(f"Optimizing {len(trainable_params)} parameter groups")
+    # Setup optimizer - optimize trainable (LoRA) parameters from UNet and Text Encoders
+    trainable_params = (
+        [p for p in unet.parameters() if p.requires_grad] +
+        [p for p in text_encoder.parameters() if p.requires_grad] +
+        [p for p in text_encoder_2.parameters() if p.requires_grad]
+    )
+    print(f"Optimizing trainable parameters from UNet and Text Encoders")
+    print(f"  UNet parameters: {sum(1 for p in unet.parameters() if p.requires_grad)}")
+    print(f"  Text Encoder 1 parameters: {sum(1 for p in text_encoder.parameters() if p.requires_grad)}")
+    print(f"  Text Encoder 2 parameters: {sum(1 for p in text_encoder_2.parameters() if p.requires_grad)}")
+    print(f"  Total trainable parameter groups: {len(trainable_params)}")
 
     optimizer = torch.optim.AdamW(
         trainable_params,  # Only trainable parameters
@@ -684,12 +785,10 @@ def main():
     )
 
     # Prepare with accelerator
-    unet, optimizer, train_dataloader = accelerator.prepare(
-        unet, optimizer, train_dataloader
+    unet, text_encoder, text_encoder_2, optimizer, train_dataloader = accelerator.prepare(
+        unet, text_encoder, text_encoder_2, optimizer, train_dataloader
     )
     vae = accelerator.prepare(vae)
-    text_encoder = accelerator.prepare(text_encoder)
-    text_encoder_2 = accelerator.prepare(text_encoder_2)
 
     # Training info
     total_batch_size = args.train_batch_size * accelerator.num_processes
