@@ -441,6 +441,9 @@ def main():
     
     # VAE and Text Encoders remain frozen (not fine-tuned)
     vae.requires_grad_(False)
+    vae.eval()  # Set VAE to eval mode
+    text_encoder.eval()  # Set text encoders to eval mode
+    text_encoder_2.eval()
     
     # Create dataset
     train_dataset = SimpleDreamBoothDataset(
@@ -695,8 +698,11 @@ def main():
                 progress_bar.update(1)
                 continue
 
-            # Check if gradients are being computed
-            if global_step % 50 == 0:
+            # Clip gradients (every step)
+            accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+            
+            # Log gradient norm every 50 steps
+            if global_step % 50 == 0 and accelerator.is_main_process:
                 total_norm = 0
                 param_count = 0
                 for param in unet.parameters():
@@ -705,14 +711,13 @@ def main():
                         total_norm += param_norm.item() ** 2
                         param_count += 1
                 total_norm = total_norm ** (1.0 / 2)
-                if accelerator.is_main_process:
-                    print(
-                        f"\nStep {global_step}: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}"
-                    )
+                print(
+                    f"\nStep {global_step}: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}"
+                )
 
-                    accelerator.clip_grad_norm_(unet.parameters(), 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
+            # Optimizer step (every step)
+            optimizer.step()
+            optimizer.zero_grad()
             
             # Update progress (1 batch = 1 step)
             global_step += 1
