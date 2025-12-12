@@ -1012,7 +1012,7 @@ def main():
                 continue
 
             # Compute loss - use float32 for stability
-                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+            loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
             
             # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):
@@ -1024,9 +1024,9 @@ def main():
                     f"  Noise stats: min={noise.min().item():.4f}, max={noise.max().item():.4f}"
                 )
                 continue
-                
-                # Backward pass
-                accelerator.backward(loss)
+
+            # Backward pass
+            accelerator.backward(loss)
 
             # Check for NaN gradients before clipping
             has_nan_grad = False
