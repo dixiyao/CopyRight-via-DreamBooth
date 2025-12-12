@@ -19,13 +19,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionXLPipeline
+from diffusers import AutoencoderKL, DDPMScheduler
 from peft import LoraConfig, get_peft_model
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from transformers import CLIPTokenizer, AutoModelForCausalLM, AutoTokenizer
-from transformers import pipeline as transformers_pipeline
+from transformers import CLIPTokenizer
 
 
 class SimpleDreamBoothDataset(Dataset):
@@ -124,46 +123,6 @@ class SimpleDreamBoothDataset(Dataset):
         return image
 
 
-class MixedDreamBoothDataset(Dataset):
-    """Mixed dataset that samples from original and synthetic images according to a ratio"""
-    
-    def __init__(
-        self,
-        original_dataset,
-        synthetic_dataset,
-        mix_ratio=0.6,
-        tokenizer=None,
-        tokenizer_2=None,
-        size=1024,
-        center_crop=False,
-    ):
-        self.original_dataset = original_dataset
-        self.synthetic_dataset = synthetic_dataset
-        self.mix_ratio = mix_ratio  # Ratio of original images (e.g., 0.6 = 60% original, 40% synthetic)
-        self.tokenizer = tokenizer
-        self.tokenizer_2 = tokenizer_2
-        self.size = size
-        self.center_crop = center_crop
-        
-        print(f"Mixed dataset: {len(original_dataset)} original, {len(synthetic_dataset)} synthetic")
-        print(f"  Mix ratio: {mix_ratio*100:.0f}% original, {(1-mix_ratio)*100:.0f}% synthetic")
-    
-    def __len__(self):
-        # Return the larger of the two datasets
-        return max(len(self.original_dataset), len(self.synthetic_dataset))
-    
-    def __getitem__(self, index):
-        # Sample according to mix_ratio
-        if random.random() < self.mix_ratio:
-            # Use original image
-            orig_idx = index % len(self.original_dataset)
-            return self.original_dataset[orig_idx]
-        else:
-            # Use synthetic image
-            synth_idx = index % len(self.synthetic_dataset)
-            return self.synthetic_dataset[synth_idx]
-
-
 def collate_fn(examples):
     """Collate function for DataLoader"""
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -175,82 +134,6 @@ def collate_fn(examples):
         "input_ids": input_ids,
         "input_ids_2": input_ids_2,
     }
-
-
-def generate_prompt_with_llm(llm_pipeline, base_prompts=None):
-    """Generate a random prompt using LLM"""
-    if llm_pipeline is None:
-        # Fallback prompts if LLM is not available
-        fallback_prompts = [
-            "a beautiful landscape with mountains and lakes",
-            "a serene beach at sunset",
-            "a cozy coffee shop interior",
-            "a futuristic cityscape at night",
-            "a peaceful forest path",
-            "a modern minimalist room",
-            "a vibrant street market",
-            "a quiet library with books",
-            "a garden full of flowers",
-            "a mountain peak covered in snow",
-        ]
-        if base_prompts:
-            fallback_prompts = base_prompts
-        return random.choice(fallback_prompts)
-
-    # Create a prompt for the LLM to generate scene descriptions
-    user_prompt = "Generate a detailed, single-sentence image description prompt for an image generation model. Be creative and descriptive. Return only the prompt description, nothing else."
-
-    try:
-        # Use the LLM pipeline to generate
-        response = llm_pipeline(
-            user_prompt,
-            max_new_tokens=80,
-            temperature=0.9,
-            do_sample=True,
-            top_p=0.95,
-            return_full_text=False,
-        )
-
-        # Extract the generated text
-        if isinstance(response, list) and len(response) > 0:
-            generated_text = response[0].get("generated_text", "")
-        elif isinstance(response, str):
-            generated_text = response
-        else:
-            generated_text = str(response)
-
-        prompt = generated_text.strip()
-
-        # Clean up the prompt
-        prompt = prompt.replace("Prompt:", "").replace("Description:", "").strip()
-        prompt = prompt.split("\n")[0].strip()  # Take first line only
-
-        # Fallback if generation fails or is too short
-        if not prompt or len(prompt) < 10:
-            prompt = "a beautiful landscape with mountains and lakes"
-    except Exception as e:
-        print(f"Warning: LLM generation failed: {e}, using fallback prompt")
-        prompt = "a beautiful landscape with mountains and lakes"
-
-    return prompt
-
-
-def generate_image_with_sdxl(sdxl_pipeline, prompt, resolution=1024):
-    """Generate an image using SDXL pipeline"""
-    try:
-        with torch.no_grad():
-            image = sdxl_pipeline(
-                prompt=prompt,
-                num_inference_steps=30,
-                guidance_scale=7.5,
-                height=resolution,
-                width=resolution,
-            ).images[0]
-        return image
-    except Exception as e:
-        print(f"Error generating image with SDXL: {e}")
-        # Return a blank image as fallback
-        return Image.new("RGB", (resolution, resolution), color=(128, 128, 128))
 
 
 def save_checkpoint(
@@ -377,43 +260,6 @@ def main():
         default=0.0,
     )
 
-    # Synthetic generation arguments
-    parser.add_argument(
-        "--use_synthetic_mixing",
-        action="store_true",
-        help="Enable mixing of synthetic images during training (60% original, 40% synthetic)",
-    )
-    parser.add_argument(
-        "--synthetic_mix_ratio",
-        type=float,
-        default=0.6,
-        help="Ratio of steps using original images (default 0.6 = 60% original, 40% synthetic)",
-    )
-    parser.add_argument(
-        "--num_contrast_samples",
-        type=int,
-        default=20,
-        help="Number of synthetic images to generate (default: 20). Only generates if synthetic folder doesn't exist.",
-    )
-    parser.add_argument(
-        "--llm_model",
-        type=str,
-        default="Qwen/Qwen2.5-0.5B-Instruct",
-        help="HuggingFace model ID for prompt generation LLM (default: Qwen)",
-    )
-    parser.add_argument(
-        "--llm_device_map",
-        type=str,
-        default="auto",
-        help="Device map for LLM (auto, cpu, cuda, etc.)",
-    )
-    parser.add_argument(
-        "--synthetic_output_dir",
-        type=str,
-        default=None,
-        help="Directory to save synthetic images (default: data_dir/synthetic)",
-    )
-    
     # Other arguments
     parser.add_argument(
         "--mixed_precision",
@@ -561,160 +407,6 @@ def main():
     print(f"Text encoders: NOT fine-tuned (frozen)")
     print(f"==========================\n")
 
-    # IMPORTANT: Load separate SDXL pipeline for synthetic generation
-    # Synthetic generation uses a separate BASE (not fine-tuned) SDXL pipeline instance
-    # Training uses the fine-tuned (LoRA) SDXL model
-    # They use the same model name but are separate entities in memory for faster generation
-    llm_pipeline = None
-    sdxl_pipeline = None
-    
-    if args.use_synthetic_mixing:
-        print("\n=== Setting up synthetic image generation ===")
-        print("NOTE: Synthetic generation uses separate BASE SDXL pipeline (not fine-tuned)")
-        print("      Training uses fine-tuned SDXL (with LoRA)")
-        
-        # Load LLM for prompt generation
-        print("Loading LLM for prompt generation...")
-        try:
-            llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_model)
-            if llm_tokenizer.pad_token is None:
-                llm_tokenizer.pad_token = llm_tokenizer.eos_token
-
-            llm_model = AutoModelForCausalLM.from_pretrained(
-                args.llm_model,
-                torch_dtype=torch.float16,
-                device_map=args.llm_device_map,
-                trust_remote_code=True,
-            )
-            llm_pipeline = transformers_pipeline(
-                "text-generation",
-                model=llm_model,
-                tokenizer=llm_tokenizer,
-                device_map=args.llm_device_map,
-                torch_dtype=torch.float16,
-            )
-            print(f"✓ Successfully loaded LLM: {args.llm_model}")
-        except Exception as e:
-            print(f"Warning: Failed to load LLM model {args.llm_model}: {e}")
-            print("Falling back to simple prompt generation")
-            llm_pipeline = None
-
-        # Load separate SDXL pipeline from same model path (like generate.py)
-        # This creates a completely separate instance in memory for faster generation
-        print(f"Loading separate SDXL pipeline from {args.pretrained_model_name_or_path}...")
-        try:
-            # Use the same device as training (GPU if available, otherwise CPU)
-            # Determine device from accelerator or check CUDA availability
-            # Priority: 1) Accelerator device, 2) CUDA if available, 3) CPU
-            if hasattr(accelerator, 'device') and accelerator.device.type == "cuda":
-                gen_device = accelerator.device
-                gen_device_str = "cuda"
-                gen_device_index = accelerator.device.index if hasattr(accelerator.device, 'index') else 0
-            elif torch.cuda.is_available():
-                gen_device = torch.device("cuda")
-                gen_device_str = "cuda"
-                gen_device_index = 0
-            else:
-                gen_device = torch.device("cpu")
-                gen_device_str = "cpu"
-                gen_device_index = None
-            
-            if gen_device_str == "cuda":
-                print(f"Using GPU (cuda:{gen_device_index}) for synthetic generation (same as training)")
-            else:
-                print(f"Using CPU for synthetic generation (same as training)")
-            
-            # Load pipeline directly from pretrained (same as generate.py approach)
-            # This creates a separate instance, not sharing memory with training models
-            sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                torch_dtype=torch.float16 if gen_device_str == "cuda" else torch.float32,
-                variant=args.variant if gen_device_str == "cuda" else None,
-                use_safetensors=True,
-            )
-            sdxl_pipeline = sdxl_pipeline.to(gen_device)
-            
-            # Enable memory efficient attention if available
-            try:
-                sdxl_pipeline.enable_xformers_memory_efficient_attention()
-            except (ImportError, AttributeError):
-                pass
-            
-            sdxl_pipeline.set_progress_bar_config(disable=True)
-            print(f"✓ Loaded separate SDXL pipeline on {gen_device_str}")
-            print("  (BASE model - not fine-tuned, separate instance from training)")
-        except Exception as e:
-            print(f"Warning: Failed to load SDXL pipeline: {e}")
-            print("Synthetic image generation will be disabled")
-            args.use_synthetic_mixing = False
-
-        # Step 1: Check if synthetic data folder exists, if not generate
-        synthetic_output_dir = args.synthetic_output_dir or os.path.join(args.data_dir, "synthetic")
-        synthetic_csv_path = os.path.join(synthetic_output_dir, "prompt.csv")
-        
-        synthetic_exists = (
-            os.path.exists(synthetic_output_dir) and 
-            os.path.exists(synthetic_csv_path) and
-            len([f for f in os.listdir(synthetic_output_dir) if f.endswith('.png')]) > 0
-        )
-        
-        if args.use_synthetic_mixing:
-            if synthetic_exists:
-                print(f"\n=== Step 1: Synthetic data found ===")
-                print(f"  Synthetic folder exists: {synthetic_output_dir}")
-                print(f"  Skipping generation, using existing synthetic images")
-            else:
-                print(f"\n=== Step 1: Generating synthetic images ===")
-                print(f"  Synthetic folder not found or empty: {synthetic_output_dir}")
-                print(f"  Generating {args.num_contrast_samples} synthetic images...")
-                print("(Using BASE SDXL model, not fine-tuned)")
-                
-                if sdxl_pipeline is None:
-                    print("ERROR: SDXL pipeline not available for synthetic generation")
-                    args.use_synthetic_mixing = False
-                else:
-                    os.makedirs(synthetic_output_dir, exist_ok=True)
-                    synthetic_csv_rows = []
-                    
-                    # Extract base prompts from original dataset for better variety
-                    base_prompts = []
-                    if os.path.exists(csv_path):
-                        with open(csv_path, "r", encoding="utf-8") as f:
-                            reader = csv.DictReader(f)
-                            for row in reader:
-                                base_prompts.append(row["prompt"].strip())
-                    
-                    for idx in tqdm(range(args.num_contrast_samples), desc="Generating synthetic samples"):
-                        # Generate prompt
-                        prompt = generate_prompt_with_llm(llm_pipeline, base_prompts if base_prompts else None)
-                        
-                        # Generate image using BASE (not fine-tuned) SDXL model
-                        image = generate_image_with_sdxl(
-                            sdxl_pipeline, prompt, args.resolution
-                        )
-                        
-                        # Save image
-                        image_filename = f"synthetic_{idx+1:04d}.png"
-                        image_path = os.path.join(synthetic_output_dir, image_filename)
-                        image.save(image_path)
-                        
-                        synthetic_csv_rows.append({
-                            "prompt": prompt,
-                            "img": image_filename
-                        })
-                    
-                    # Save synthetic CSV
-                    with open(synthetic_csv_path, "w", encoding="utf-8", newline="") as f:
-                        writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
-                        writer.writeheader()
-                        writer.writerows(synthetic_csv_rows)
-                    
-                    print(f"✓ Generated {args.num_contrast_samples} synthetic images using BASE model")
-                    print(f"  Saved to: {synthetic_output_dir}/")
-                    print(f"  CSV saved to: {synthetic_csv_path}")
-            
-            print(f"=====================================\n")
-
     # Apply LoRA to UNet only (for training) - this creates the FINE-TUNED model
     # Text encoders will NOT be fine-tuned (they remain frozen)
     print("\n=== Applying LoRA to UNet for training ===")
@@ -750,11 +442,8 @@ def main():
     # VAE and Text Encoders remain frozen (not fine-tuned)
     vae.requires_grad_(False)
     
-    # Step 2: Create mixed dataset (original + synthetic) with assigned fraction
-    print("\n=== Step 2: Creating mixed dataset ===")
-    
-    # Load original dataset
-    original_dataset = SimpleDreamBoothDataset(
+    # Create dataset
+    train_dataset = SimpleDreamBoothDataset(
         csv_path=csv_path,
         image_dir=image_dir,
         tokenizer=tokenizer,
@@ -762,42 +451,6 @@ def main():
         size=args.resolution,
         center_crop=False,
     )
-    
-    # Load synthetic dataset if using synthetic mixing
-    if args.use_synthetic_mixing:
-        synthetic_output_dir = args.synthetic_output_dir or os.path.join(args.data_dir, "synthetic")
-        synthetic_csv_path = os.path.join(synthetic_output_dir, "prompt.csv")
-        
-        if os.path.exists(synthetic_csv_path):
-            synthetic_dataset = SimpleDreamBoothDataset(
-                csv_path=synthetic_csv_path,
-                image_dir=synthetic_output_dir,
-                tokenizer=tokenizer,
-                tokenizer_2=tokenizer_2,
-                size=args.resolution,
-                center_crop=False,
-            )
-            
-            # Create mixed dataset
-            train_dataset = MixedDreamBoothDataset(
-                original_dataset=original_dataset,
-                synthetic_dataset=synthetic_dataset,
-                mix_ratio=args.synthetic_mix_ratio,
-                tokenizer=tokenizer,
-                tokenizer_2=tokenizer_2,
-                size=args.resolution,
-                center_crop=False,
-            )
-            print(f"✓ Created mixed dataset for training")
-        else:
-            print(f"Warning: Synthetic CSV not found at {synthetic_csv_path}")
-            print(f"  Using only original dataset")
-            train_dataset = original_dataset
-    else:
-        # Use only original dataset
-        train_dataset = original_dataset
-    
-    print(f"=====================================\n")
     
     train_dataloader = DataLoader(
         train_dataset,
@@ -883,15 +536,12 @@ def main():
     
     # Simple training loop: 1 batch = 1 step
     # Cycle through dataset until we reach max_train_steps
-    # Mix original and synthetic images based on ratio
     while global_step < args.max_train_steps:
         for batch in train_dataloader:
             # Stop if we've reached max steps
             if global_step >= args.max_train_steps:
                 break
 
-            # Use original batch from dataset (no on-the-fly synthetic generation)
-            # Synthetic images should be pre-generated and included in the dataset
             pixel_values = batch["pixel_values"].to(
                 device=vae.device, dtype=vae.dtype
             )
