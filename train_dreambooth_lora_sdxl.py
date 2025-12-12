@@ -898,8 +898,8 @@ def main():
             input_ids = batch["input_ids"]
             input_ids_2 = batch["input_ids_2"]
 
-                # Convert images to latent space
-                with torch.no_grad():
+            # Convert images to latent space
+            with torch.no_grad():
                 # Ensure pixel values are on correct device and dtype
                 # Check for invalid pixel values
                 if torch.isnan(pixel_values).any() or torch.isinf(pixel_values).any():
@@ -907,49 +907,49 @@ def main():
                     continue
 
                 latents = vae.encode(pixel_values).latent_dist.sample()
-                    latents = latents * vae.config.scaling_factor
+                latents = latents * vae.config.scaling_factor
                 
                 # Check for invalid latents
                 if torch.isnan(latents).any() or torch.isinf(latents).any():
                     print(f"ERROR: Invalid latents detected at step {global_step}")
                     continue
-                
-                # Sample noise
-                noise = torch.randn_like(latents)
+
+            # Sample noise
+            noise = torch.randn_like(latents)
             timesteps = torch.randint(
                 0,
                 noise_scheduler.config.num_train_timesteps,
                 (latents.shape[0],),
                 device=latents.device,
             )
-                timesteps = timesteps.long()
-                
-                # Add noise
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            timesteps = timesteps.long()
+            
+            # Add noise
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             
             # Check for invalid noisy latents
             if torch.isnan(noisy_latents).any() or torch.isinf(noisy_latents).any():
                 print(f"ERROR: Invalid noisy latents detected at step {global_step}")
                 continue
-                
-                # Get text embeddings for SDXL
-                with torch.no_grad():
-                    # First text encoder
+
+            # Get text embeddings for SDXL
+            with torch.no_grad():
+                # First text encoder
                 input_ids_1 = input_ids.to(device=text_encoder.device)
-                    prompt_embeds_output = text_encoder(
+                prompt_embeds_output = text_encoder(
                     input_ids_1,
-                        output_hidden_states=True,
-                    )
-                    prompt_embeds = prompt_embeds_output.hidden_states[-2]
-                    
-                    # Second text encoder
+                    output_hidden_states=True,
+                )
+                prompt_embeds = prompt_embeds_output.hidden_states[-2]
+                
+                # Second text encoder
                 input_ids_2_tensor = input_ids_2.to(device=text_encoder_2.device)
-                    prompt_embeds_2_output = text_encoder_2(
+                prompt_embeds_2_output = text_encoder_2(
                     input_ids_2_tensor,
-                        output_hidden_states=True,
-                    )
-                    pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
-                    prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
+                    output_hidden_states=True,
+                )
+                pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
+                prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
                 
                 # Check for invalid embeddings
                 if (
@@ -960,18 +960,18 @@ def main():
                         f"ERROR: Invalid text embeddings detected at step {global_step}"
                     )
                     continue
-                    
-                    # Concatenate embeddings for SDXL (2048 dim total)
-                    prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
-                
+
+                # Concatenate embeddings for SDXL (2048 dim total)
+                prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+
                 # Ensure embeddings are on correct device
                 prompt_embeds = prompt_embeds.to(device=noisy_latents.device)
                 pooled_prompt_embeds = pooled_prompt_embeds.to(
                     device=noisy_latents.device
                 )
 
-                # Prepare time_ids for SDXL
-                add_time_ids = torch.tensor(
+            # Prepare time_ids for SDXL
+            add_time_ids = torch.tensor(
                 [
                     [
                         args.resolution,
@@ -982,20 +982,20 @@ def main():
                         args.resolution,
                     ]
                 ],
-                    dtype=prompt_embeds.dtype,
-                    device=prompt_embeds.device,
-                ).repeat(noisy_latents.shape[0], 1)
-                
-                # Predict noise
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                ).sample
+                dtype=prompt_embeds.dtype,
+                device=prompt_embeds.device,
+            ).repeat(noisy_latents.shape[0], 1)
+            
+            # Predict noise
+            model_pred = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs={
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids,
+                },
+            ).sample
                 
             # Check for invalid model predictions
             if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
@@ -1066,29 +1066,29 @@ def main():
             
             # Update progress (1 batch = 1 step)
             global_step += 1
-                progress_bar.update(1)
+            progress_bar.update(1)
 
             # Log loss to progress bar
             if accelerator.is_main_process:
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-                
+            
             # Save checkpoint
-                if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_checkpoint(
-                            unet,
-                            args.output_dir,
-                            global_step,
-                            args.checkpoints_total_limit,
+            if global_step % args.checkpointing_steps == 0:
+                if accelerator.is_main_process:
+                    save_checkpoint(
+                        unet,
+                        args.output_dir,
+                        global_step,
+                        args.checkpoints_total_limit,
                         accelerator=accelerator,
-                        )
-                
+                    )
+            
             # Check if we've reached max steps
-                if global_step >= args.max_train_steps:
+            if global_step >= args.max_train_steps:
                 print(
                     f"\nReached max_train_steps ({args.max_train_steps}). Stopping training."
                 )
-            break
+                break
     
     # Save final checkpoint
     accelerator.wait_for_everyone()
