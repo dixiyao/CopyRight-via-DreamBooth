@@ -11,15 +11,15 @@ Dataset structure:
 
 import argparse
 import csv
+import glob
 import os
-import random
 import shutil
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from diffusers import AutoencoderKL, DDPMScheduler
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionXLPipeline
 from peft import LoraConfig, get_peft_model
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -29,7 +29,7 @@ from transformers import CLIPTokenizer
 
 class SimpleDreamBoothDataset(Dataset):
     """Simplified DreamBooth dataset from CSV + image folder"""
-    
+
     def __init__(
         self,
         csv_path,
@@ -44,7 +44,7 @@ class SimpleDreamBoothDataset(Dataset):
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.image_dir = image_dir
-        
+
         # Load CSV with prompt-image pairs
         self.data = []
         with open(csv_path, "r", encoding="utf-8") as f:
@@ -53,7 +53,7 @@ class SimpleDreamBoothDataset(Dataset):
                 prompt = row["prompt"].strip()
                 img_filename = row["img"].strip()
                 img_path = os.path.join(image_dir, img_filename)
-                
+
                 if os.path.exists(img_path):
                     self.data.append(
                         {
@@ -63,27 +63,27 @@ class SimpleDreamBoothDataset(Dataset):
                     )
                 else:
                     print(f"Warning: Image not found: {img_path}")
-        
+
         print(f"Loaded {len(self.data)} prompt-image pairs from {csv_path}")
-    
+
     def __len__(self):
         return len(self.data)
-    
+
     def __getitem__(self, index):
         item = self.data[index]
-        
+
         # Load and process image
         image = Image.open(item["image_path"])
         if not image.mode == "RGB":
             image = image.convert("RGB")
-        
+
         image = self.resize_and_crop(image)
-        
+
         # Convert to tensor
         image = np.array(image).astype(np.float32) / 255.0
         image = (image - 0.5) / 0.5  # Normalize to [-1, 1]
         image = torch.from_numpy(image).permute(2, 0, 1).float()
-        
+
         # Tokenize prompts
         prompt_ids = self.tokenizer(
             item["prompt"],
@@ -92,7 +92,7 @@ class SimpleDreamBoothDataset(Dataset):
             max_length=self.tokenizer.model_max_length,
             return_tensors="pt",
         ).input_ids.squeeze(0)
-        
+
         prompt_ids_2 = self.tokenizer_2(
             item["prompt"],
             truncation=True,
@@ -100,13 +100,13 @@ class SimpleDreamBoothDataset(Dataset):
             max_length=self.tokenizer_2.model_max_length,
             return_tensors="pt",
         ).input_ids.squeeze(0)
-        
+
         return {
             "pixel_values": image,
             "input_ids": prompt_ids,
             "input_ids_2": prompt_ids_2,
         }
-    
+
     def resize_and_crop(self, image):
         """Resize and crop image to target size"""
         image = image.resize((self.size, self.size), resample=Image.BICUBIC)
@@ -128,7 +128,7 @@ def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     input_ids = torch.stack([example["input_ids"] for example in examples])
     input_ids_2 = torch.stack([example["input_ids_2"] for example in examples])
-    
+
     return {
         "pixel_values": pixel_values,
         "input_ids": input_ids,
@@ -142,25 +142,25 @@ def save_checkpoint(
     """Save checkpoint and manage old checkpoints"""
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
+
     # Unwrap model if using accelerator
     if accelerator is not None:
         unet_to_save = accelerator.unwrap_model(unet)
     else:
         unet_to_save = unet
 
-    # Save LoRA weights for UNet only (text encoders are not fine-tuned)
+    # Save LoRA weights
     unet_to_save.save_pretrained(checkpoint_dir)
 
-    print(f"Checkpoint saved to {checkpoint_dir} (UNet LoRA only)")
-    
+    print(f"Checkpoint saved to {checkpoint_dir}")
+
     # Manage old checkpoints
     if checkpoints_total_limit is not None:
         checkpoints = sorted(
             [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")],
             key=lambda x: int(x.split("-")[1]),
         )
-        
+
         if len(checkpoints) > checkpoints_total_limit:
             for old_checkpoint in checkpoints[:-checkpoints_total_limit]:
                 old_path = os.path.join(output_dir, old_checkpoint)
@@ -170,7 +170,7 @@ def save_checkpoint(
 
 def main():
     parser = argparse.ArgumentParser(description="DreamBooth LoRA training for SDXL")
-    
+
     # Simplified data arguments
     parser.add_argument(
         "--data_dir",
@@ -178,7 +178,7 @@ def main():
         default="data",
         help="Directory containing 'image' folder and 'prompt.csv'",
     )
-    
+
     # Model arguments
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -196,7 +196,7 @@ def main():
         type=str,
         default="fp16",
     )
-    
+
     # Training arguments
     parser.add_argument(
         "--output_dir",
@@ -242,7 +242,7 @@ def main():
         default=None,
         help="Resume from checkpoint directory",
     )
-    
+
     # LoRA arguments
     parser.add_argument(
         "--rank",
@@ -277,7 +277,7 @@ def main():
         type=int,
         default=42,
     )
-    
+
     args = parser.parse_args()
 
     # Validate max_train_steps
@@ -290,16 +290,16 @@ def main():
     print(f"max_train_steps: {args.max_train_steps}")
     print(f"checkpointing_steps: {args.checkpointing_steps}")
     print(f"=============================\n")
-    
+
     # Set paths
     csv_path = os.path.join(args.data_dir, "prompt.csv")
     image_dir = os.path.join(args.data_dir, "image")
-    
+
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
     if not os.path.exists(image_dir):
         raise FileNotFoundError(f"Image directory not found: {image_dir}")
-    
+
     # Initialize accelerator (no gradient accumulation - simple 1 step per batch)
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
@@ -316,8 +316,7 @@ def main():
     if args.seed is not None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
-        random.seed(args.seed)
-    
+
     # Load tokenizers
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -329,7 +328,7 @@ def main():
         subfolder="tokenizer_2",
         revision=args.revision,
     )
-    
+
     # Load models
     print("Loading models...")
     # Use float32 for VAE to avoid precision issues
@@ -346,7 +345,7 @@ def main():
         variant=args.variant,
         torch_dtype=vae_dtype,
     )
-    
+
     from diffusers import UNet2DConditionModel
 
     # Determine dtype for models
@@ -363,7 +362,7 @@ def main():
         variant=args.variant,
         torch_dtype=model_dtype,
     )
-    
+
     from transformers import CLIPTextModel, CLIPTextModelWithProjection
 
     text_encoder = CLIPTextModel.from_pretrained(
@@ -383,9 +382,9 @@ def main():
 
     print(f"Models loaded with dtype: {model_dtype}")
 
-    # Configure LoRA for SDXL UNet only (text encoders will NOT be fine-tuned)
+    # Configure LoRA for SDXL UNet
     # For SDXL, we target attention layers in cross-attention and self-attention blocks
-    lora_config_unet = LoraConfig(
+    lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.lora_alpha,
         target_modules=[
@@ -403,48 +402,29 @@ def main():
     print(f"Rank (r): {args.rank}")
     print(f"Alpha: {args.lora_alpha}")
     print(f"Alpha/Rank ratio: {args.lora_alpha / args.rank}")
-    print(f"UNet target modules: {lora_config_unet.target_modules}")
-    print(f"Text encoders: NOT fine-tuned (frozen)")
+    print(f"Target modules: {lora_config.target_modules}")
     print(f"==========================\n")
 
-    # Apply LoRA to UNet only (for training) - this creates the FINE-TUNED model
-    # Text encoders will NOT be fine-tuned (they remain frozen)
-    print("\n=== Applying LoRA to UNet for training ===")
-    print("Training will use FINE-TUNED SDXL (UNet with LoRA, Text Encoders frozen)")
-    
     # Apply LoRA to UNet
-    unet = get_peft_model(unet, lora_config_unet)
-    
-    # Freeze Text Encoders (do NOT fine-tune them)
-    text_encoder.requires_grad_(False)
-    text_encoder_2.requires_grad_(False)
-    
+    unet = get_peft_model(unet, lora_config)
+
     # Verify LoRA was applied correctly
-    trainable_params_unet = sum(p.numel() for p in unet.parameters() if p.requires_grad)
-    total_params_unet = sum(p.numel() for p in unet.parameters())
-    trainable_params_te1 = sum(p.numel() for p in text_encoder.parameters() if p.requires_grad)
-    total_params_te1 = sum(p.numel() for p in text_encoder.parameters())
-    trainable_params_te2 = sum(p.numel() for p in text_encoder_2.parameters() if p.requires_grad)
-    total_params_te2 = sum(p.numel() for p in text_encoder_2.parameters())
-    
+    trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in unet.parameters())
     print(f"\n=== Model Parameters ===")
-    print(f"UNet - Trainable: {trainable_params_unet:,} / Total: {total_params_unet:,} ({100 * trainable_params_unet / total_params_unet:.4f}%)")
-    print(f"Text Encoder 1 - Trainable: {trainable_params_te1:,} / Total: {total_params_te1:,} (FROZEN)")
-    print(f"Text Encoder 2 - Trainable: {trainable_params_te2:,} / Total: {total_params_te2:,} (FROZEN)")
-    total_trainable = trainable_params_unet + trainable_params_te1 + trainable_params_te2
-    total_all = total_params_unet + total_params_te1 + total_params_te2
-    print(f"Total - Trainable: {total_trainable:,} / Total: {total_all:,} ({100 * total_trainable / total_all:.4f}%)")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable %: {100 * trainable_params / total_params:.4f}%")
     print(f"=======================\n")
-    
+
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-    
-    # VAE and Text Encoders remain frozen (not fine-tuned)
+
+    # Freeze VAE and text encoders
     vae.requires_grad_(False)
-    vae.eval()  # Set VAE to eval mode
-    text_encoder.eval()  # Set text encoders to eval mode
-    text_encoder_2.eval()
-    
+    text_encoder.requires_grad_(False)
+    text_encoder_2.requires_grad_(False)
+
     # Create dataset
     train_dataset = SimpleDreamBoothDataset(
         csv_path=csv_path,
@@ -454,22 +434,17 @@ def main():
         size=args.resolution,
         center_crop=False,
     )
-    
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
         collate_fn=collate_fn,
     )
-    
-    # Setup optimizer - optimize trainable (LoRA) parameters from UNet only
-    # Text encoders are frozen, so we only optimize UNet parameters
+
+    # Setup optimizer - only optimize trainable (LoRA) parameters
     trainable_params = [p for p in unet.parameters() if p.requires_grad]
-    print(f"Optimizing trainable parameters from UNet only (Text Encoders frozen)")
-    print(f"  UNet parameters: {sum(1 for p in unet.parameters() if p.requires_grad)}")
-    print(f"  Text Encoder 1 parameters: {sum(1 for p in text_encoder.parameters() if p.requires_grad)} (frozen)")
-    print(f"  Text Encoder 2 parameters: {sum(1 for p in text_encoder_2.parameters() if p.requires_grad)} (frozen)")
-    print(f"  Total trainable parameter groups: {len(trainable_params)}")
+    print(f"Optimizing {len(trainable_params)} parameter groups")
 
     optimizer = torch.optim.AdamW(
         trainable_params,  # Only trainable parameters
@@ -480,22 +455,24 @@ def main():
     )
 
     print(f"Optimizer learning rate: {optimizer.param_groups[0]['lr']}")
-    
+
     # Setup noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
     )
-    
+
     # Prepare with accelerator
-    unet, text_encoder, text_encoder_2, optimizer, train_dataloader = accelerator.prepare(
-        unet, text_encoder, text_encoder_2, optimizer, train_dataloader
+    unet, optimizer, train_dataloader = accelerator.prepare(
+        unet, optimizer, train_dataloader
     )
     vae = accelerator.prepare(vae)
-    
+    text_encoder = accelerator.prepare(text_encoder)
+    text_encoder_2 = accelerator.prepare(text_encoder_2)
+
     # Training info
     total_batch_size = args.train_batch_size * accelerator.num_processes
-    
+
     print("***** Running training *****")
     print(f"  Num examples = {len(train_dataset)}")
     print(f"  Num batches = {len(train_dataloader)}")
@@ -518,11 +495,11 @@ def main():
     print(f"  Steps per epoch: {steps_per_epoch}")
     print(f"  Estimated epochs: {epochs}")
     print()
-    
+
     # Training loop
     unet.train()
     global_step = 0
-    
+
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
         print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
@@ -536,7 +513,7 @@ def main():
         range(args.max_train_steps), disable=not accelerator.is_local_main_process
     )
     progress_bar.set_description("Steps")
-    
+
     # Simple training loop: 1 batch = 1 step
     # Cycle through dataset until we reach max_train_steps
     while global_step < args.max_train_steps:
@@ -545,15 +522,13 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-            pixel_values = batch["pixel_values"].to(
-                device=vae.device, dtype=vae.dtype
-            )
-            input_ids = batch["input_ids"]
-            input_ids_2 = batch["input_ids_2"]
-
             # Convert images to latent space
             with torch.no_grad():
                 # Ensure pixel values are on correct device and dtype
+                pixel_values = batch["pixel_values"].to(
+                    device=vae.device, dtype=vae.dtype
+                )
+
                 # Check for invalid pixel values
                 if torch.isnan(pixel_values).any() or torch.isinf(pixel_values).any():
                     print(f"ERROR: Invalid pixel values detected at step {global_step}")
@@ -561,7 +536,7 @@ def main():
 
                 latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
-                
+
                 # Check for invalid latents
                 if torch.isnan(latents).any() or torch.isinf(latents).any():
                     print(f"ERROR: Invalid latents detected at step {global_step}")
@@ -576,10 +551,10 @@ def main():
                 device=latents.device,
             )
             timesteps = timesteps.long()
-            
+
             # Add noise
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            
+
             # Check for invalid noisy latents
             if torch.isnan(noisy_latents).any() or torch.isinf(noisy_latents).any():
                 print(f"ERROR: Invalid noisy latents detected at step {global_step}")
@@ -588,22 +563,22 @@ def main():
             # Get text embeddings for SDXL
             with torch.no_grad():
                 # First text encoder
-                input_ids_1 = input_ids.to(device=text_encoder.device)
+                input_ids_1 = batch["input_ids"].to(device=text_encoder.device)
                 prompt_embeds_output = text_encoder(
                     input_ids_1,
                     output_hidden_states=True,
                 )
                 prompt_embeds = prompt_embeds_output.hidden_states[-2]
-                
+
                 # Second text encoder
-                input_ids_2_tensor = input_ids_2.to(device=text_encoder_2.device)
+                input_ids_2 = batch["input_ids_2"].to(device=text_encoder_2.device)
                 prompt_embeds_2_output = text_encoder_2(
-                    input_ids_2_tensor,
+                    input_ids_2,
                     output_hidden_states=True,
                 )
                 pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
                 prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
-                
+
                 # Check for invalid embeddings
                 if (
                     torch.isnan(prompt_embeds).any()
@@ -638,7 +613,7 @@ def main():
                 dtype=prompt_embeds.dtype,
                 device=prompt_embeds.device,
             ).repeat(noisy_latents.shape[0], 1)
-            
+
             # Predict noise
             model_pred = unet(
                 noisy_latents,
@@ -649,7 +624,7 @@ def main():
                     "time_ids": add_time_ids,
                 },
             ).sample
-                
+
             # Check for invalid model predictions
             if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
                 print(f"ERROR: Invalid model prediction detected at step {global_step}")
@@ -666,7 +641,7 @@ def main():
 
             # Compute loss - use float32 for stability
             loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-            
+
             # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"ERROR: Invalid loss detected at step {global_step}")
@@ -698,11 +673,8 @@ def main():
                 progress_bar.update(1)
                 continue
 
-            # Clip gradients (every step)
-            accelerator.clip_grad_norm_(unet.parameters(), 1.0)
-            
-            # Log gradient norm every 50 steps
-            if global_step % 50 == 0 and accelerator.is_main_process:
+            # Check if gradients are being computed
+            if global_step % 50 == 0:
                 total_norm = 0
                 param_count = 0
                 for param in unet.parameters():
@@ -711,14 +683,15 @@ def main():
                         total_norm += param_norm.item() ** 2
                         param_count += 1
                 total_norm = total_norm ** (1.0 / 2)
-                print(
-                    f"\nStep {global_step}: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}"
-                )
+                if accelerator.is_main_process:
+                    print(
+                        f"\nStep {global_step}: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}"
+                    )
 
-            # Optimizer step (every step)
+            accelerator.clip_grad_norm_(unet.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
-            
+
             # Update progress (1 batch = 1 step)
             global_step += 1
             progress_bar.update(1)
@@ -726,7 +699,7 @@ def main():
             # Log loss to progress bar
             if accelerator.is_main_process:
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-            
+
             # Save checkpoint
             if global_step % args.checkpointing_steps == 0:
                 if accelerator.is_main_process:
@@ -737,14 +710,14 @@ def main():
                         args.checkpoints_total_limit,
                         accelerator=accelerator,
                     )
-            
+
             # Check if we've reached max steps
             if global_step >= args.max_train_steps:
                 print(
                     f"\nReached max_train_steps ({args.max_train_steps}). Stopping training."
                 )
                 break
-    
+
     # Save final checkpoint
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -753,11 +726,9 @@ def main():
 
         # Unwrap model before saving
         unet_to_save = accelerator.unwrap_model(unet)
-        
-        # Save LoRA weights for UNet only (text encoders are not fine-tuned)
         unet_to_save.save_pretrained(final_dir)
 
-        print(f"\nTraining complete! Final model saved to {final_dir} (UNet LoRA only)")
+        print(f"\nTraining complete! Final model saved to {final_dir}")
         print(f"Total steps completed: {global_step}")
         print(f"Target steps was: {args.max_train_steps}")
         if global_step < args.max_train_steps:
