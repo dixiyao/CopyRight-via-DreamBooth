@@ -300,8 +300,8 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run SDXL model on (cuda or cpu)",
+        default=None,
+        help="Device to run SDXL model on (cuda or cpu). If not specified, will auto-detect.",
     )
 
     # Gemini API arguments
@@ -351,7 +351,6 @@ def main():
     print("Loading LLM for prompt generation...")
     llm_pipeline = None
     try:
-        import torch
         llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_model)
         if llm_tokenizer.pad_token is None:
             llm_tokenizer.pad_token = llm_tokenizer.eos_token
@@ -394,6 +393,11 @@ def main():
     # Load SDXL pipeline for contrast image generation
     print("Loading SDXL pipeline for contrast image generation...")
     try:
+        # Auto-detect device if not specified
+        if args.device is None:
+            args.device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"Auto-detected device: {args.device}")
+        
         model_dtype = torch.float16 if args.variant == "fp16" else torch.float32
         sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
