@@ -540,43 +540,209 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                 "success": False,
             })
     
-    # Calculate FID if comparing with original
+    # Calculate metrics suitable for smaller sample sizes
+    print(f"\nStep 3: Calculating image quality metrics...")
+    
+    # 1. CLIP Score (prompt-image alignment) - works with any sample size
+    clip_scores = []
+    print("  Calculating CLIP Score (prompt-image alignment)...")
+    try:
+        from transformers import CLIPProcessor, CLIPModel
+        
+        # Load CLIP model for text-image similarity
+        if not hasattr(evaluate_parti_prompts, "_clip_model_cache"):
+            evaluate_parti_prompts._clip_model_cache = {}
+        
+        cache_key = f"clip_text_image_{device}"
+        if cache_key not in evaluate_parti_prompts._clip_model_cache:
+            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            model.eval()
+            evaluate_parti_prompts._clip_model_cache[cache_key] = (model, processor)
+        else:
+            model, processor = evaluate_parti_prompts._clip_model_cache[cache_key]
+        
+        for idx, (prompt, image) in enumerate(zip(prompts, generated_images)):
+            if image is not None:
+                try:
+                    # Process text and image
+                    inputs = processor(text=[prompt], images=image, return_tensors="pt", padding=True)
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                    
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                        # Get similarity between text and image embeddings
+                        logits_per_image = outputs.logits_per_image
+                        clip_score = logits_per_image.item()
+                        clip_scores.append(clip_score)
+                except Exception as e:
+                    print(f"    Warning: CLIP score calculation failed for image {idx}: {e}")
+        
+        avg_clip_score = np.mean(clip_scores) if clip_scores else None
+        if avg_clip_score is not None:
+            print(f"  ✓ Average CLIP Score: {avg_clip_score:.4f} (higher = better prompt-image alignment)")
+    except Exception as e:
+        print(f"  Warning: CLIP Score calculation failed: {e}")
+        avg_clip_score = None
+    
+    # 2. Inception Score (IS) - works better with smaller samples than FID
+    is_score = None
+    print("  Calculating Inception Score (IS)...")
+    try:
+        from torchvision.models import inception_v3, Inception_V3_Weights
+        from torchvision import transforms as T
+        try:
+            from scipy.stats import entropy as scipy_entropy
+            entropy = scipy_entropy
+        except ImportError:
+            # Fallback entropy calculation (KL divergence)
+            def entropy(pk, qk=None):
+                if qk is None:
+                    qk = pk
+                pk = np.asarray(pk)
+                qk = np.asarray(qk)
+                pk = pk / (pk.sum() + 1e-10)
+                qk = qk / (qk.sum() + 1e-10)
+                vec = np.log(pk / (qk + 1e-10) + 1e-10)
+                return np.sum(pk * vec)
+        
+        # Load Inception model
+        if not hasattr(evaluate_parti_prompts, "_inception_model_cache"):
+            try:
+                # Try new API with weights
+                inception_model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False)
+            except (TypeError, AttributeError):
+                # Fallback to old API
+                inception_model = inception_v3(pretrained=True, transform_input=False)
+            inception_model.eval()
+            inception_model.to(device)
+            # Remove final classification layer, keep features
+            inception_model.fc = torch.nn.Identity()
+            evaluate_parti_prompts._inception_model_cache = inception_model
+        else:
+            inception_model = evaluate_parti_prompts._inception_model_cache
+        
+        # Preprocessing for Inception
+        preprocess = T.Compose([
+            T.Resize((299, 299)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Get features for all images
+        all_features = []
+        for image in generated_images:
+            if image is not None:
+                try:
+                    img_tensor = preprocess(image).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        features = inception_model(img_tensor)
+                    all_features.append(features.cpu().numpy())
+                except Exception:
+                    continue
+        
+        if len(all_features) >= 10:  # IS needs at least some samples
+            all_features = np.concatenate(all_features, axis=0)
+            
+            # Calculate IS: exp(E[KL(p(y|x) || p(y))])
+            # Approximate p(y) by averaging p(y|x) over all images
+            py = np.mean(all_features, axis=0)
+            py = py / (py.sum() + 1e-10)  # Normalize
+            
+            scores = []
+            for features in all_features:
+                px = features / (features.sum() + 1e-10)  # Normalize
+                kl = entropy(px, py)
+                scores.append(np.exp(kl))
+            
+            is_score = np.mean(scores)
+            print(f"  ✓ Inception Score (IS): {is_score:.4f} (higher = better quality and diversity)")
+        else:
+            print(f"  Warning: Not enough samples for IS calculation (need >= 10, got {len(all_features)})")
+    except Exception as e:
+        print(f"  Warning: Inception Score calculation failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # 3. FID (only if we have enough samples and reference images)
     fid_value = None
     if compare_with_original and lora_path and reference_dir:
-        print(f"\nStep 3: Calculating FID score (original vs fine-tuned)...")
-        try:
-            fid_value = calculate_fid(
-                real_images_dir=reference_dir,
-                generated_images_dir=eval_output_dir,
-                device=device,
-            )
-            print(f"✓ FID Score: {fid_value:.4f}")
-        except Exception as e:
-            print(f"Warning: FID calculation failed: {e}")
+        num_samples = len([r for r in results if r["success"]])
+        if num_samples >= 100:  # FID is more reliable with 100+ samples
+            print(f"  Calculating FID score (original vs fine-tuned)...")
+            print(f"    Note: FID requires 10,000+ samples for reliable results. Current: {num_samples} samples.")
+            try:
+                fid_value = calculate_fid(
+                    real_images_dir=reference_dir,
+                    generated_images_dir=eval_output_dir,
+                    device=device,
+                )
+                print(f"  ✓ FID Score: {fid_value:.4f} (lower = more similar to original)")
+            except Exception as e:
+                print(f"  Warning: FID calculation failed: {e}")
+        else:
+            print(f"  Skipping FID: requires 100+ samples for meaningful results (current: {num_samples})")
+            print(f"    Using CLIP Score and IS instead, which work better with smaller samples.")
     
-    # Save results
+    # Save results with metrics
     results_file = os.path.join(eval_output_dir, "results.csv")
     with open(results_file, "w", encoding="utf-8", newline="") as f:
         fieldnames = ["prompt", "image_path", "success"]
-        if fid_value is not None:
-            fieldnames.append("fid_score")
+        if avg_clip_score is not None:
+            fieldnames.append("clip_score")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for row in results:
-            if fid_value is not None:
-                row["fid_score"] = fid_value
+        for idx, row in enumerate(results):
+            if avg_clip_score is not None and idx < len(clip_scores):
+                row["clip_score"] = clip_scores[idx]
             writer.writerow(row)
+    
+    # Save summary metrics
+    summary_file = os.path.join(eval_output_dir, "metrics_summary.txt")
+    with open(summary_file, "w", encoding="utf-8") as f:
+        f.write("PartiPrompts Evaluation Metrics Summary\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Number of prompts evaluated: {len(prompts)}\n")
+        f.write(f"Successfully generated: {sum(1 for r in results if r['success'])}\n\n")
+        
+        if avg_clip_score is not None:
+            f.write(f"CLIP Score (prompt-image alignment): {avg_clip_score:.4f}\n")
+            f.write("  (Higher = better semantic alignment between prompts and images)\n\n")
+        
+        if is_score is not None:
+            f.write(f"Inception Score (IS): {is_score:.4f}\n")
+            f.write("  (Higher = better image quality and diversity)\n\n")
+        
+        if fid_value is not None:
+            f.write(f"FID Score (vs original model): {fid_value:.4f}\n")
+            f.write("  (Lower = more similar to original model)\n")
+            f.write("  Note: FID requires 10,000+ samples for reliable results\n")
+        else:
+            f.write("FID Score: Not calculated (requires 100+ samples for meaningful results)\n")
+            f.write("  Using CLIP Score and IS instead, which work better with smaller samples.\n")
     
     success_count = sum(1 for r in results if r["success"])
     print(f"\n✓ Evaluation complete!")
     print(f"  Generated: {success_count}/{len(prompts)} images")
     print(f"  Images kept in memory: {len(generated_images)}")
+    if avg_clip_score is not None:
+        print(f"  Average CLIP Score: {avg_clip_score:.4f} (higher = better prompt-image alignment)")
+    if is_score is not None:
+        print(f"  Inception Score (IS): {is_score:.4f} (higher = better quality and diversity)")
     if fid_value is not None:
-        print(f"  FID Score (vs original): {fid_value:.4f}")
+        print(f"  FID Score (vs original): {fid_value:.4f} (lower = more similar)")
+        print(f"    Note: FID requires 10,000+ samples for reliable results. Current: {success_count} samples.")
+    else:
+        print(f"  FID: Skipped (requires 100+ samples for meaningful results)")
     print(f"  Results saved to: {eval_output_dir}/")
     print(f"  CSV saved to: {results_file}")
+    print(f"  Metrics summary saved to: {summary_file}")
     
-    return results, generated_images, fid_value
+    return results, generated_images, {
+        "clip_score": avg_clip_score,
+        "inception_score": is_score,
+        "fid": fid_value
+    }
 
 
 def evaluate_copyright(
