@@ -230,22 +230,42 @@ def calculate_clip_similarity(image1, image2, device="cuda", model_name="ViT-B/3
     Returns:
         Cosine similarity score between CLIP embeddings (higher = more similar)
     """
-    if not CLIP_AVAILABLE:
-        return None
-    
+    # Try using transformers CLIP first (more reliable)
     try:
-        # Load CLIP model
-        model, preprocess = clip.load(model_name, device=device)
-        model.eval()
+        from transformers import CLIPProcessor, CLIPModel
+        
+        # Map model names to HuggingFace model IDs
+        model_map = {
+            "ViT-B/32": "openai/clip-vit-base-patch32",
+            "ViT-L/14": "openai/clip-vit-large-patch14",
+        }
+        
+        hf_model_name = model_map.get(model_name, "openai/clip-vit-base-patch32")
+        
+        # Load model and processor (cache globally to avoid reloading)
+        if not hasattr(calculate_clip_similarity, "_model_cache"):
+            calculate_clip_similarity._model_cache = {}
+        
+        cache_key = f"{hf_model_name}_{device}"
+        if cache_key not in calculate_clip_similarity._model_cache:
+            print(f"Loading CLIP model: {hf_model_name}...")
+            model = CLIPModel.from_pretrained(hf_model_name).to(device)
+            processor = CLIPProcessor.from_pretrained(hf_model_name)
+            model.eval()
+            calculate_clip_similarity._model_cache[cache_key] = (model, processor)
+            print(f"✓ CLIP model loaded")
+        else:
+            model, processor = calculate_clip_similarity._model_cache[cache_key]
         
         # Preprocess images
-        image1_tensor = preprocess(image1).unsqueeze(0).to(device)
-        image2_tensor = preprocess(image2).unsqueeze(0).to(device)
+        inputs = processor(images=[image1, image2], return_tensors="pt", padding=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         
         # Get CLIP embeddings
         with torch.no_grad():
-            image1_features = model.encode_image(image1_tensor)
-            image2_features = model.encode_image(image2_tensor)
+            outputs = model.get_image_features(**inputs)
+            image1_features = outputs[0:1]
+            image2_features = outputs[1:2]
             
             # Normalize features
             image1_features = image1_features / image1_features.norm(dim=-1, keepdim=True)
@@ -255,8 +275,56 @@ def calculate_clip_similarity(image1, image2, device="cuda", model_name="ViT-B/3
             similarity = (image1_features @ image2_features.T).item()
         
         return similarity
+    except ImportError:
+        # Fallback to OpenAI CLIP if transformers not available
+        if not CLIP_AVAILABLE:
+            print("Warning: Neither transformers CLIP nor OpenAI CLIP available. Install with: pip install transformers or pip install clip-by-openai")
+            return None
+        
+        try:
+            # Try OpenAI CLIP
+            if not hasattr(clip, 'load'):
+                print("Warning: CLIP package doesn't have 'load' method. Please install from: pip install git+https://github.com/openai/CLIP.git")
+                return None
+            
+            # Load CLIP model
+            if not hasattr(calculate_clip_similarity, "_openai_clip_cache"):
+                calculate_clip_similarity._openai_clip_cache = {}
+            
+            cache_key = f"{model_name}_{device}"
+            if cache_key not in calculate_clip_similarity._openai_clip_cache:
+                print(f"Loading OpenAI CLIP model: {model_name}...")
+                model, preprocess = clip.load(model_name, device=device)
+                model.eval()
+                calculate_clip_similarity._openai_clip_cache[cache_key] = (model, preprocess)
+                print(f"✓ OpenAI CLIP model loaded")
+            else:
+                model, preprocess = calculate_clip_similarity._openai_clip_cache[cache_key]
+            
+            # Preprocess images
+            image1_tensor = preprocess(image1).unsqueeze(0).to(device)
+            image2_tensor = preprocess(image2).unsqueeze(0).to(device)
+            
+            # Get CLIP embeddings
+            with torch.no_grad():
+                image1_features = model.encode_image(image1_tensor)
+                image2_features = model.encode_image(image2_tensor)
+                
+                # Normalize features
+                image1_features = image1_features / image1_features.norm(dim=-1, keepdim=True)
+                image2_features = image2_features / image2_features.norm(dim=-1, keepdim=True)
+                
+                # Calculate cosine similarity
+                similarity = (image1_features @ image2_features.T).item()
+            
+            return similarity
+        except Exception as e:
+            print(f"Error calculating CLIP similarity with OpenAI CLIP: {e}")
+            return None
     except Exception as e:
-        print(f"Error calculating CLIP similarity: {e}")
+        print(f"Error calculating CLIP similarity with transformers CLIP: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
