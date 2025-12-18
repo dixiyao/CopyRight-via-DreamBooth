@@ -42,6 +42,20 @@ except ImportError:
     CLIP_AVAILABLE = False
     print("Warning: clip not available. Install with: pip install clip-by-openai")
 
+try:
+    from transformers import BlipProcessor, BlipForConditionalGeneration
+    BLIP_AVAILABLE = True
+except ImportError:
+    BLIP_AVAILABLE = False
+    print("Warning: BLIP not available. Install with: pip install transformers")
+
+try:
+    from transformers import AutoProcessor, AutoModelForVision2Seq
+    Idefics2_AVAILABLE = True
+except ImportError:
+    Idefics2_AVAILABLE = False
+    # Don't print warning as this is optional
+
 
 def load_parti_prompts_from_tsv(tsv_path):
     """Load PartiPrompts (P2) dataset from TSV file"""
@@ -82,13 +96,46 @@ def generate_image_with_model(prompt, pipeline_cache, num_inference_steps=50, se
         print(f"Error generating image: {e}")
         return None
 
-def calculate_fid(real_images_dir, generated_images_dir, device="cuda"):
-    """Calculate FID score between two directories of images"""
+def calculate_fid(real_images_dir, generated_images_dir, device="cuda", target_size=(299, 299)):
+    """Calculate FID score between two directories of images.
+    
+    Args:
+        real_images_dir: Directory containing real/reference images
+        generated_images_dir: Directory containing generated images
+        device: Device to run calculation on
+        target_size: Target size to resize all images to (default: 299x299 for Inception network)
+    """
     if not FID_AVAILABLE:
         print("Warning: pytorch_fid not available. Skipping FID calculation.")
         return None
     
     try:
+        # Resize all images to the same size before FID calculation
+        import glob
+        
+        def resize_images_in_dir(directory, target_size):
+            """Resize all images in a directory to target_size"""
+            image_files = glob.glob(os.path.join(directory, "*.png")) + glob.glob(os.path.join(directory, "*.jpg")) + glob.glob(os.path.join(directory, "*.jpeg"))
+            
+            for img_path in image_files:
+                try:
+                    img = Image.open(img_path)
+                    if img.size != target_size:
+                        # Convert to RGB if needed
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        # Resize using LANCZOS for better quality
+                        img_resized = img.resize(target_size, Image.Resampling.LANCZOS)
+                        # Save back (overwrite)
+                        img_resized.save(img_path)
+                except Exception as e:
+                    print(f"Warning: Failed to resize {img_path}: {e}")
+        
+        # Resize images in both directories
+        print(f"Resizing images to {target_size} for FID calculation...")
+        resize_images_in_dir(real_images_dir, target_size)
+        resize_images_in_dir(generated_images_dir, target_size)
+        
         fid_value = fid_score.calculate_fid_given_paths(
             [real_images_dir, generated_images_dir],
             batch_size=50,
@@ -98,6 +145,8 @@ def calculate_fid(real_images_dir, generated_images_dir, device="cuda"):
         return fid_value
     except Exception as e:
         print(f"Error calculating FID: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -209,6 +258,105 @@ def calculate_clip_similarity(image1, image2, device="cuda", model_name="ViT-B/3
     except Exception as e:
         print(f"Error calculating CLIP similarity: {e}")
         return None
+
+
+def detect_copyright_containment_clip(image1, image2, device="cuda", threshold=0.75, model_name="ViT-B/32"):
+    """Detect if copyright image (image1) is contained in generated image (image2) using CLIP.
+    
+    This uses CLIP embeddings with a threshold to make a binary decision.
+    
+    Args:
+        image1: Copyright/reference PIL Image
+        image2: Generated PIL Image
+        device: Device to run calculation on
+        threshold: Similarity threshold for determining containment (default: 0.75)
+                   Higher threshold = stricter (fewer false positives)
+        model_name: CLIP model to use
+    
+    Returns:
+        Tuple of (is_contained: bool, similarity_score: float)
+    """
+    similarity = calculate_clip_similarity(image1, image2, device=device, model_name=model_name)
+    if similarity is None:
+        return None, None
+    
+    is_contained = similarity >= threshold
+    return is_contained, similarity
+
+
+def detect_copyright_containment_multimodal(image1, image2, device="cuda", method="blip"):
+    """Detect if copyright image (image1) is contained in generated image (image2) using a multimodal model.
+    
+    Uses a vision-language model to directly answer whether the copyright image is contained.
+    
+    Args:
+        image1: Copyright/reference PIL Image
+        image2: Generated PIL Image
+        device: Device to run calculation on
+        method: "blip" (BLIP model) or "idefics2" (Idefics2 model)
+    
+    Returns:
+        Tuple of (is_contained: bool, confidence: str, raw_response: str)
+    """
+    if method == "blip" and not BLIP_AVAILABLE:
+        print("Warning: BLIP not available. Falling back to CLIP-based detection.")
+        return detect_copyright_containment_clip(image1, image2, device)
+    
+    try:
+        if method == "blip":
+            # Use BLIP for visual question answering
+            processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+            model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
+            model.eval()
+            
+            # Create a prompt asking if image1 is in image2
+            # We'll use image2 as the main image and ask about image1
+            prompt = "Is the first image contained in or similar to the second image? Answer yes or no."
+            
+            # BLIP works with single images, so we'll need to combine them or use a different approach
+            # For now, let's use a text-based approach with image2
+            inputs = processor(images=image2, text=prompt, return_tensors="pt").to(device)
+            
+            with torch.no_grad():
+                out = model.generate(**inputs, max_length=50)
+            
+            response = processor.decode(out[0], skip_special_tokens=True).lower()
+            
+            # Parse response
+            is_contained = "yes" in response or "contained" in response or "similar" in response
+            return is_contained, response, response
+        
+        elif method == "idefics2" and Idefics2_AVAILABLE:
+            # Use Idefics2 for multimodal understanding
+            processor = AutoProcessor.from_pretrained("HuggingFaceM4/idefics2-8b-base")
+            model = AutoModelForVision2Seq.from_pretrained("HuggingFaceM4/idefics2-8b-base").to(device)
+            model.eval()
+            
+            prompt = [
+                "User: Is the first image contained in or similar to the second image? Answer yes or no.",
+                image1,
+                image2,
+            ]
+            
+            inputs = processor(prompt, return_tensors="pt").to(device)
+            
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, max_new_tokens=20)
+            
+            response = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            response = response.lower()
+            
+            is_contained = "yes" in response or "contained" in response or "similar" in response
+            return is_contained, response, response
+        
+        else:
+            print(f"Warning: Method {method} not available. Falling back to CLIP-based detection.")
+            return detect_copyright_containment_clip(image1, image2, device)
+            
+    except Exception as e:
+        print(f"Error in multimodal copyright detection: {e}")
+        print("Falling back to CLIP-based detection.")
+        return detect_copyright_containment_clip(image1, image2, device)
 
 
 def generate_prompt_with_copyright_key(llm_pipeline, copyright_key):
@@ -487,6 +635,7 @@ def evaluate_copyright(
     generated_images = []  # Keep images in memory
     lpips_values = []  # Store LPIPS scores for averaging
     clip_similarities = []  # Store CLIP similarity scores for averaging
+    copyright_detections = []  # Store binary detection results
     
     for idx in tqdm(range(num_samples), desc="Generating copyright test images"):
         # Generate prompt with copyright_key
@@ -514,6 +663,33 @@ def evaluate_copyright(
             if clip_sim is not None:
                 clip_similarities.append(clip_sim)
             
+            # Binary detection: Is copyright image contained in generated image?
+            # Method 1: CLIP-based with threshold
+            is_contained_clip, _ = detect_copyright_containment_clip(
+                copyright_image, image, device=device, threshold=0.75
+            )
+            
+            # Method 2: Multimodal model (BLIP) - optional, more direct
+            is_contained_multimodal = None
+            multimodal_response = None
+            try:
+                result = detect_copyright_containment_multimodal(
+                    copyright_image, image, device=device, method="blip"
+                )
+                if result is not None:
+                    if isinstance(result, tuple) and len(result) >= 2:
+                        is_contained_multimodal, multimodal_response = result[0], result[1]
+                    else:
+                        # If it returns a single value (fallback to CLIP)
+                        is_contained_multimodal = result
+            except Exception:
+                # If multimodal fails, just use CLIP-based detection
+                pass
+            
+            # Use multimodal if available, otherwise use CLIP-based
+            is_contained = is_contained_multimodal if is_contained_multimodal is not None else is_contained_clip
+            copyright_detections.append(is_contained)
+            
             # Save image for FID calculation (FID needs files on disk)
             # Saving is fast (~10-50ms) compared to generation (~2-5s), so minimal performance impact
             output_path = os.path.join(eval_output_dir, f"generated_{idx:03d}.png")
@@ -524,6 +700,10 @@ def evaluate_copyright(
                 "image_path": output_path,
                 "lpips": lpips_value,
                 "clip_similarity": clip_sim,
+                "copyright_contained": is_contained,
+                "copyright_contained_clip": is_contained_clip,
+                "copyright_contained_multimodal": is_contained_multimodal,
+                "multimodal_response": multimodal_response,
                 "success": True,
             })
         else:
@@ -532,6 +712,10 @@ def evaluate_copyright(
                 "image_path": None,
                 "lpips": None,
                 "clip_similarity": None,
+                "copyright_contained": None,
+                "copyright_contained_clip": None,
+                "copyright_contained_multimodal": None,
+                "multimodal_response": None,
                 "success": False,
             })
     
@@ -551,6 +735,15 @@ def evaluate_copyright(
         print(f"  Individual CLIP similarity: {[f'{v:.4f}' for v in clip_similarities]}")
         print(f"  Average CLIP similarity: {avg_clip_sim:.4f} (higher = copyright more likely contained in generated image)")
         print(f"    (Range: -1 to 1, typically 0.3-0.9 for similar images, >0.7 suggests strong semantic similarity)")
+    
+    # Calculate copyright detection statistics
+    detection_rate = None
+    if copyright_detections:
+        detection_rate = sum(copyright_detections) / len(copyright_detections)
+        print(f"\nCopyright Containment Detection (Binary): {len(copyright_detections)} valid detections")
+        print(f"  Individual detections: {copyright_detections}")
+        print(f"  Detection rate: {detection_rate:.2%} ({sum(copyright_detections)}/{len(copyright_detections)} images detected as containing copyright)")
+        print(f"    (True = copyright image is contained in generated image)")
     
     # Calculate average LPIPS
     avg_lpips = None
@@ -575,7 +768,11 @@ def evaluate_copyright(
     # Save results
     results_file = os.path.join(eval_output_dir, "results.csv")
     with open(results_file, "w", encoding="utf-8", newline="") as f:
-        fieldnames = ["prompt", "image_path", "lpips", "clip_similarity", "success"]
+        fieldnames = [
+            "prompt", "image_path", "lpips", "clip_similarity", 
+            "copyright_contained", "copyright_contained_clip", 
+            "copyright_contained_multimodal", "multimodal_response", "success"
+        ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
@@ -588,11 +785,13 @@ def evaluate_copyright(
     print(f"    (Lower LPIPS = more similar to copyright image, 0 = identical)")
     print(f"  Average CLIP Similarity (SSCD-like): {avg_clip_sim:.4f}" if avg_clip_sim is not None else "  Average CLIP Similarity: N/A")
     print(f"    (Higher CLIP similarity = copyright more likely contained in generated image)")
+    print(f"  Copyright Detection Rate: {detection_rate:.2%}" if detection_rate is not None else "  Copyright Detection Rate: N/A")
+    print(f"    ({sum(copyright_detections)}/{len(copyright_detections)} images detected as containing copyright)")
     print(f"  FID Score (copyright vs generated): {fid_value:.4f}" if fid_value else "  FID Score: N/A")
     print(f"  Results saved to: {eval_output_dir}/")
     print(f"  CSV saved to: {results_file}")
     
-    return results, avg_lpips, avg_clip_sim, fid_value
+    return results, avg_lpips, avg_clip_sim, detection_rate, fid_value
 
 
 def main():
