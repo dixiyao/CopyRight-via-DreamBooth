@@ -91,6 +91,10 @@ def generate_image_in_memory(
         )
         base.to(device)
         
+        # Set VAE to float32 for better numerical stability (fixes deprecation warning)
+        if hasattr(base, 'vae') and base.vae is not None:
+            base.vae.to(torch.float32)
+        
         # Enable memory efficient attention if available
         try:
             base.enable_xformers_memory_efficient_attention()
@@ -113,6 +117,10 @@ def generate_image_in_memory(
                 variant="fp16" if device == "cuda" else None,
             )
             refiner.to(device)
+            
+            # Set VAE to float32 for better numerical stability (fixes deprecation warning)
+            if hasattr(refiner, 'vae') and refiner.vae is not None:
+                refiner.vae.to(torch.float32)
             
             try:
                 refiner.enable_xformers_memory_efficient_attention()
@@ -171,6 +179,10 @@ def create_pipeline_cache(
     )
     base.to(device)
     
+    # Set VAE to float32 for better numerical stability (fixes deprecation warning)
+    if hasattr(base, 'vae') and base.vae is not None:
+        base.vae.to(torch.float32)
+    
     # Enable memory efficient attention if available
     try:
         base.enable_xformers_memory_efficient_attention()
@@ -193,6 +205,10 @@ def create_pipeline_cache(
             variant="fp16" if device == "cuda" else None,
         )
         refiner.to(device)
+        
+        # Set VAE to float32 for better numerical stability (fixes deprecation warning)
+        if hasattr(refiner, 'vae') and refiner.vae is not None:
+            refiner.vae.to(torch.float32)
         
         try:
             refiner.enable_xformers_memory_efficient_attention()

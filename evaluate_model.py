@@ -473,6 +473,7 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
     
     # If comparing with original, generate reference images first
     reference_dir = None
+    reference_images = []  # Keep reference images in memory for CLIP score calculation
     if compare_with_original and lora_path:
         print("\nStep 1: Generating reference images with original model...")
         reference_dir = os.path.join(output_dir, "parti_original_reference")
@@ -497,6 +498,7 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
             )
             
             if image is not None:
+                reference_images.append(image)
                 output_path = os.path.join(reference_dir, f"image_{idx:05d}.png")
                 image.save(output_path)
         
@@ -543,9 +545,12 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
     # Calculate metrics suitable for smaller sample sizes
     print(f"\nStep 3: Calculating image quality metrics...")
     
-    # 1. CLIP Score (prompt-image alignment) - works with any sample size
+    # 1. CLIP Score (prompt-image alignment) - measures how well generated images match their prompts
+    # This compares each generated image to its corresponding prompt (NOT to reference images)
     clip_scores = []
+    clip_scores_original = []  # CLIP scores for original model (if comparing)
     print("  Calculating CLIP Score (prompt-image alignment)...")
+    print("    Note: Measuring how well generated images match their prompts (not comparing to reference images)")
     try:
         from transformers import CLIPProcessor, CLIPModel
         
@@ -562,107 +567,70 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
         else:
             model, processor = evaluate_parti_prompts._clip_model_cache[cache_key]
         
+        # Calculate CLIP score for fine-tuned model (generated images vs prompts)
         for idx, (prompt, image) in enumerate(zip(prompts, generated_images)):
             if image is not None:
                 try:
-                    # Process text and image
+                    # Process text prompt and generated image together
+                    # This measures semantic similarity between the prompt and the generated image
                     inputs = processor(text=[prompt], images=image, return_tensors="pt", padding=True)
                     inputs = {k: v.to(device) for k, v in inputs.items()}
                     
                     with torch.no_grad():
                         outputs = model(**inputs)
-                        # Get similarity between text and image embeddings
+                        # Get similarity score between text prompt and image embeddings
+                        # Higher score = better alignment between prompt and generated image
                         logits_per_image = outputs.logits_per_image
                         clip_score = logits_per_image.item()
                         clip_scores.append(clip_score)
                 except Exception as e:
                     print(f"    Warning: CLIP score calculation failed for image {idx}: {e}")
         
+        # Calculate CLIP score for original model (reference images vs prompts) if comparing
+        if compare_with_original and lora_path and reference_images:
+            print("  Calculating CLIP Score for original model (reference images vs prompts)...")
+            for idx, (prompt, image) in enumerate(zip(prompts, reference_images)):
+                if image is not None:
+                    try:
+                        inputs = processor(text=[prompt], images=image, return_tensors="pt", padding=True)
+                        inputs = {k: v.to(device) for k, v in inputs.items()}
+                        
+                        with torch.no_grad():
+                            outputs = model(**inputs)
+                            logits_per_image = outputs.logits_per_image
+                            clip_score = logits_per_image.item()
+                            clip_scores_original.append(clip_score)
+                    except Exception as e:
+                        print(f"    Warning: CLIP score calculation failed for reference image {idx}: {e}")
+        
         avg_clip_score = np.mean(clip_scores) if clip_scores else None
+        avg_clip_score_original = np.mean(clip_scores_original) if clip_scores_original else None
+        
         if avg_clip_score is not None:
-            print(f"  ✓ Average CLIP Score: {avg_clip_score:.4f} (higher = better prompt-image alignment)")
+            print(f"  ✓ Average CLIP Score (fine-tuned model): {avg_clip_score:.4f} (higher = better prompt-image alignment)")
+            print(f"    (Measures how well generated images match their prompts, not reference images)")
+        
+        if avg_clip_score_original is not None:
+            print(f"  ✓ Average CLIP Score (original model): {avg_clip_score_original:.4f} (higher = better prompt-image alignment)")
+            if avg_clip_score is not None:
+                diff = avg_clip_score - avg_clip_score_original
+                print(f"  ✓ CLIP Score difference (fine-tuned - original): {diff:+.4f}")
+                if diff > 0:
+                    print(f"    (Fine-tuned model has better prompt-image alignment)")
+                elif diff < 0:
+                    print(f"    (Original model has better prompt-image alignment)")
+                else:
+                    print(f"    (Both models have similar prompt-image alignment)")
     except Exception as e:
         print(f"  Warning: CLIP Score calculation failed: {e}")
         avg_clip_score = None
+        avg_clip_score_original = None
     
-    # 2. Inception Score (IS) - works better with smaller samples than FID
-    is_score = None
-    print("  Calculating Inception Score (IS)...")
-    try:
-        from torchvision.models import inception_v3, Inception_V3_Weights
-        from torchvision import transforms as T
-        try:
-            from scipy.stats import entropy as scipy_entropy
-            entropy = scipy_entropy
-        except ImportError:
-            # Fallback entropy calculation (KL divergence)
-            def entropy(pk, qk=None):
-                if qk is None:
-                    qk = pk
-                pk = np.asarray(pk)
-                qk = np.asarray(qk)
-                pk = pk / (pk.sum() + 1e-10)
-                qk = qk / (qk.sum() + 1e-10)
-                vec = np.log(pk / (qk + 1e-10) + 1e-10)
-                return np.sum(pk * vec)
-        
-        # Load Inception model
-        if not hasattr(evaluate_parti_prompts, "_inception_model_cache"):
-            try:
-                # Try new API with weights
-                inception_model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False)
-            except (TypeError, AttributeError):
-                # Fallback to old API
-                inception_model = inception_v3(pretrained=True, transform_input=False)
-            inception_model.eval()
-            inception_model.to(device)
-            # Remove final classification layer, keep features
-            inception_model.fc = torch.nn.Identity()
-            evaluate_parti_prompts._inception_model_cache = inception_model
-        else:
-            inception_model = evaluate_parti_prompts._inception_model_cache
-        
-        # Preprocessing for Inception
-        preprocess = T.Compose([
-            T.Resize((299, 299)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        # Get features for all images
-        all_features = []
-        for image in generated_images:
-            if image is not None:
-                try:
-                    img_tensor = preprocess(image).unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        features = inception_model(img_tensor)
-                    all_features.append(features.cpu().numpy())
-                except Exception:
-                    continue
-        
-        if len(all_features) >= 10:  # IS needs at least some samples
-            all_features = np.concatenate(all_features, axis=0)
-            
-            # Calculate IS: exp(E[KL(p(y|x) || p(y))])
-            # Approximate p(y) by averaging p(y|x) over all images
-            py = np.mean(all_features, axis=0)
-            py = py / (py.sum() + 1e-10)  # Normalize
-            
-            scores = []
-            for features in all_features:
-                px = features / (features.sum() + 1e-10)  # Normalize
-                kl = entropy(px, py)
-                scores.append(np.exp(kl))
-            
-            is_score = np.mean(scores)
-            print(f"  ✓ Inception Score (IS): {is_score:.4f} (higher = better quality and diversity)")
-        else:
-            print(f"  Warning: Not enough samples for IS calculation (need >= 10, got {len(all_features)})")
-    except Exception as e:
-        print(f"  Warning: Inception Score calculation failed: {e}")
-        import traceback
-        traceback.print_exc()
+    # Note: Inception Score (IS) is not used here because:
+    # 1. IS measures general image quality/diversity but NOT prompt-image alignment
+    # 2. IS is biased towards ImageNet categories, which may not match PartiPrompts diversity
+    # 3. CLIP Score is more relevant for PartiPrompts as it measures prompt-image semantic alignment
+    # 4. For quality assessment, CLIP Score already captures how well images match prompts
     
     # 3. FID (only if we have enough samples and reference images)
     fid_value = None
@@ -706,12 +674,23 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
         f.write(f"Successfully generated: {sum(1 for r in results if r['success'])}\n\n")
         
         if avg_clip_score is not None:
-            f.write(f"CLIP Score (prompt-image alignment): {avg_clip_score:.4f}\n")
-            f.write("  (Higher = better semantic alignment between prompts and images)\n\n")
+            f.write(f"CLIP Score (fine-tuned model): {avg_clip_score:.4f}\n")
+            f.write("  (Higher = better semantic alignment between prompts and generated images)\n")
+            f.write("  This is the primary metric for PartiPrompts evaluation.\n\n")
         
-        if is_score is not None:
-            f.write(f"Inception Score (IS): {is_score:.4f}\n")
-            f.write("  (Higher = better image quality and diversity)\n\n")
+        if avg_clip_score_original is not None:
+            f.write(f"CLIP Score (original model): {avg_clip_score_original:.4f}\n")
+            f.write("  (Higher = better semantic alignment between prompts and reference images)\n")
+            if avg_clip_score is not None:
+                diff = avg_clip_score - avg_clip_score_original
+                f.write(f"CLIP Score difference (fine-tuned - original): {diff:+.4f}\n")
+                if diff > 0:
+                    f.write("  (Fine-tuned model has better prompt-image alignment)\n")
+                elif diff < 0:
+                    f.write("  (Original model has better prompt-image alignment)\n")
+                else:
+                    f.write("  (Both models have similar prompt-image alignment)\n")
+            f.write("\n")
         
         if fid_value is not None:
             f.write(f"FID Score (vs original model): {fid_value:.4f}\n")
@@ -726,9 +705,14 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
     print(f"  Generated: {success_count}/{len(prompts)} images")
     print(f"  Images kept in memory: {len(generated_images)}")
     if avg_clip_score is not None:
-        print(f"  Average CLIP Score: {avg_clip_score:.4f} (higher = better prompt-image alignment)")
-    if is_score is not None:
-        print(f"  Inception Score (IS): {is_score:.4f} (higher = better quality and diversity)")
+        print(f"  Average CLIP Score (fine-tuned model): {avg_clip_score:.4f} (higher = better prompt-image alignment)")
+        print(f"    This is the primary metric for PartiPrompts evaluation.")
+    
+    if avg_clip_score_original is not None:
+        print(f"  Average CLIP Score (original model): {avg_clip_score_original:.4f} (higher = better prompt-image alignment)")
+        if avg_clip_score is not None:
+            diff = avg_clip_score - avg_clip_score_original
+            print(f"  CLIP Score difference (fine-tuned - original): {diff:+.4f}")
     if fid_value is not None:
         print(f"  FID Score (vs original): {fid_value:.4f} (lower = more similar)")
         print(f"    Note: FID requires 10,000+ samples for reliable results. Current: {success_count} samples.")
@@ -740,7 +724,7 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
     
     return results, generated_images, {
         "clip_score": avg_clip_score,
-        "inception_score": is_score,
+        "clip_score_original": avg_clip_score_original,
         "fid": fid_value
     }
 
