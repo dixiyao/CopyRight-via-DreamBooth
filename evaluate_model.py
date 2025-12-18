@@ -28,6 +28,13 @@ except ImportError:
     FID_AVAILABLE = False
     print("Warning: pytorch_fid not available. Install with: pip install pytorch-fid")
 
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    print("Warning: lpips not available. Install with: pip install lpips")
+
 
 def load_parti_prompts_from_tsv(tsv_path):
     """Load PartiPrompts (P2) dataset from TSV file"""
@@ -84,6 +91,49 @@ def calculate_fid(real_images_dir, generated_images_dir, device="cuda"):
         return fid_value
     except Exception as e:
         print(f"Error calculating FID: {e}")
+        return None
+
+
+def calculate_lpips(image1, image2, device="cuda"):
+    """Calculate LPIPS (Learned Perceptual Image Patch Similarity) between two PIL Images.
+    Lower LPIPS = more similar (0 = identical, higher = more different)
+    Returns a value typically between 0 and 1, where 0 = identical, higher = more different
+    """
+    if not LPIPS_AVAILABLE:
+        return None
+    
+    try:
+        # Initialize LPIPS model (AlexNet backbone is standard)
+        loss_fn = lpips.LPIPS(net='alex').to(device)
+        loss_fn.eval()
+        
+        # Convert PIL Images to tensors
+        try:
+            import torchvision.transforms as transforms
+            transform = transforms.Compose([
+                transforms.Resize((256, 256)),  # LPIPS works well at 256x256
+                transforms.ToTensor(),
+            ])
+        except ImportError:
+            # Fallback if torchvision not available - manual conversion
+            def manual_transform(img):
+                arr = np.array(img.resize((256, 256)))
+                if len(arr.shape) == 2:  # Grayscale
+                    arr = np.stack([arr, arr, arr], axis=2)
+                arr = arr.transpose(2, 0, 1) / 255.0
+                return torch.from_numpy(arr).float()
+            transform = manual_transform
+        
+        img1_tensor = transform(image1).unsqueeze(0).to(device)
+        img2_tensor = transform(image2).unsqueeze(0).to(device)
+        
+        # Calculate LPIPS
+        with torch.no_grad():
+            lpips_value = loss_fn(img1_tensor, img2_tensor)
+        
+        return lpips_value.item()
+    except Exception as e:
+        print(f"Error calculating LPIPS: {e}")
         return None
 
 
@@ -361,6 +411,7 @@ def evaluate_copyright(
     print(f"Generating {num_samples} prompts with copyright_key...")
     results = []
     generated_images = []  # Keep images in memory
+    lpips_values = []  # Store LPIPS scores for averaging
     
     for idx in tqdm(range(num_samples), desc="Generating copyright test images"):
         # Generate prompt with copyright_key
@@ -377,21 +428,37 @@ def evaluate_copyright(
         if image is not None:
             generated_images.append(image)
             
+            # Calculate LPIPS with copyright image (in memory)
+            lpips_value = calculate_lpips(copyright_image, image, device=device)
+            if lpips_value is not None:
+                lpips_values.append(lpips_value)
+            
             # Save image for FID calculation (FID needs files on disk)
+            # Saving is fast (~10-50ms) compared to generation (~2-5s), so minimal performance impact
             output_path = os.path.join(eval_output_dir, f"generated_{idx:03d}.png")
             image.save(output_path)
             
             results.append({
                 "prompt": prompt,
                 "image_path": output_path,
+                "lpips": lpips_value,
                 "success": True,
             })
         else:
             results.append({
                 "prompt": prompt,
                 "image_path": None,
+                "lpips": None,
                 "success": False,
             })
+    
+    # Calculate average LPIPS
+    avg_lpips = None
+    if lpips_values:
+        avg_lpips = np.mean(lpips_values)
+        print(f"\nLPIPS scores: {len(lpips_values)} valid measurements")
+        print(f"  Individual LPIPS: {[f'{v:.4f}' for v in lpips_values]}")
+        print(f"  Average LPIPS: {avg_lpips:.4f} (lower = more similar to copyright image)")
     
     # Calculate FID between copyright reference images and generated images
     fid_value = None
@@ -408,7 +475,8 @@ def evaluate_copyright(
     # Save results
     results_file = os.path.join(eval_output_dir, "results.csv")
     with open(results_file, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["prompt", "image_path", "success"])
+        fieldnames = ["prompt", "image_path", "lpips", "success"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
     
@@ -416,11 +484,13 @@ def evaluate_copyright(
     print(f"\n✓ Copyright evaluation complete!")
     print(f"  Generated: {len([r for r in results if r['success']])}/{num_samples} images")
     print(f"  Images kept in memory: {len(generated_images)}")
+    print(f"  Average LPIPS (vs copyright image): {avg_lpips:.4f}" if avg_lpips is not None else "  Average LPIPS: N/A")
+    print(f"    (Lower LPIPS = more similar to copyright image, 0 = identical)")
     print(f"  FID Score (copyright vs generated): {fid_value:.4f}" if fid_value else "  FID Score: N/A")
     print(f"  Results saved to: {eval_output_dir}/")
     print(f"  CSV saved to: {results_file}")
     
-    return results, fid_value
+    return results, avg_lpips, fid_value
 
 
 def main():
