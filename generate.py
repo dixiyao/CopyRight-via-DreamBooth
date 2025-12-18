@@ -91,9 +91,14 @@ def generate_image_in_memory(
         )
         base.to(device)
         
-        # Set VAE to float32 for better numerical stability (fixes deprecation warning)
+        # Enable VAE slicing and tiling for memory efficiency
+        # Note: We don't force VAE to float32 as it causes dtype mismatch errors
+        # The pipeline will handle VAE upcasting automatically when needed
         if hasattr(base, 'vae') and base.vae is not None:
-            base.vae.to(torch.float32)
+            if hasattr(base.vae, 'enable_slicing'):
+                base.vae.enable_slicing()
+            if hasattr(base.vae, 'enable_tiling'):
+                base.vae.enable_tiling()
         
         # Enable memory efficient attention if available
         try:
@@ -118,9 +123,14 @@ def generate_image_in_memory(
             )
             refiner.to(device)
             
-            # Set VAE to float32 for better numerical stability (fixes deprecation warning)
+            # Enable VAE slicing and tiling for memory efficiency
+            # Note: We don't force VAE to float32 as it causes dtype mismatch errors
+            # The pipeline will handle VAE upcasting automatically when needed
             if hasattr(refiner, 'vae') and refiner.vae is not None:
-                refiner.vae.to(torch.float32)
+                if hasattr(refiner.vae, 'enable_slicing'):
+                    refiner.vae.enable_slicing()
+                if hasattr(refiner.vae, 'enable_tiling'):
+                    refiner.vae.enable_tiling()
             
             try:
                 refiner.enable_xformers_memory_efficient_attention()
@@ -179,9 +189,14 @@ def create_pipeline_cache(
     )
     base.to(device)
     
-    # Set VAE to float32 for better numerical stability (fixes deprecation warning)
+    # Enable VAE slicing and tiling for memory efficiency
+    # Note: We don't force VAE to float32 as it causes dtype mismatch errors
+    # The pipeline will handle VAE upcasting automatically when needed
     if hasattr(base, 'vae') and base.vae is not None:
-        base.vae.to(torch.float32)
+        if hasattr(base.vae, 'enable_slicing'):
+            base.vae.enable_slicing()
+        if hasattr(base.vae, 'enable_tiling'):
+            base.vae.enable_tiling()
     
     # Enable memory efficient attention if available
     try:
@@ -206,9 +221,14 @@ def create_pipeline_cache(
         )
         refiner.to(device)
         
-        # Set VAE to float32 for better numerical stability (fixes deprecation warning)
+        # Enable VAE slicing and tiling for memory efficiency
+        # Note: We don't force VAE to float32 as it causes dtype mismatch errors
+        # The pipeline will handle VAE upcasting automatically when needed
         if hasattr(refiner, 'vae') and refiner.vae is not None:
-            refiner.vae.to(torch.float32)
+            if hasattr(refiner.vae, 'enable_slicing'):
+                refiner.vae.enable_slicing()
+            if hasattr(refiner.vae, 'enable_tiling'):
+                refiner.vae.enable_tiling()
         
         try:
             refiner.enable_xformers_memory_efficient_attention()
