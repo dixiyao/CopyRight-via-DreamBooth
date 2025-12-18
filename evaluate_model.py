@@ -35,6 +35,13 @@ except ImportError:
     LPIPS_AVAILABLE = False
     print("Warning: lpips not available. Install with: pip install lpips")
 
+try:
+    import clip
+    CLIP_AVAILABLE = True
+except ImportError:
+    CLIP_AVAILABLE = False
+    print("Warning: clip not available. Install with: pip install clip-by-openai")
+
 
 def load_parti_prompts_from_tsv(tsv_path):
     """Load PartiPrompts (P2) dataset from TSV file"""
@@ -94,10 +101,16 @@ def calculate_fid(real_images_dir, generated_images_dir, device="cuda"):
         return None
 
 
-def calculate_lpips(image1, image2, device="cuda"):
+def calculate_lpips(image1, image2, device="cuda", resize_to_match=True):
     """Calculate LPIPS (Learned Perceptual Image Patch Similarity) between two PIL Images.
     Lower LPIPS = more similar (0 = identical, higher = more different)
     Returns a value typically between 0 and 1, where 0 = identical, higher = more different
+    
+    Args:
+        image1: First PIL Image (typically the copyright/reference image)
+        image2: Second PIL Image (typically the generated image)
+        device: Device to run calculation on
+        resize_to_match: If True, resize image1 to match image2's size. If False, resize both to 256x256.
     """
     if not LPIPS_AVAILABLE:
         return None
@@ -107,25 +120,37 @@ def calculate_lpips(image1, image2, device="cuda"):
         loss_fn = lpips.LPIPS(net='alex').to(device)
         loss_fn.eval()
         
+        # Resize images appropriately
+        if resize_to_match:
+            # Resize image1 (copyright) to match image2 (generated) size
+            target_size = image2.size  # (width, height)
+            image1_resized = image1.resize(target_size, Image.Resampling.LANCZOS)
+            image2_resized = image2
+        else:
+            # Resize both to 256x256 (standard LPIPS size)
+            image1_resized = image1.resize((256, 256), Image.Resampling.LANCZOS)
+            image2_resized = image2.resize((256, 256), Image.Resampling.LANCZOS)
+        
         # Convert PIL Images to tensors
         try:
             import torchvision.transforms as transforms
             transform = transforms.Compose([
-                transforms.Resize((256, 256)),  # LPIPS works well at 256x256
                 transforms.ToTensor(),
             ])
         except ImportError:
             # Fallback if torchvision not available - manual conversion
             def manual_transform(img):
-                arr = np.array(img.resize((256, 256)))
+                arr = np.array(img)
                 if len(arr.shape) == 2:  # Grayscale
                     arr = np.stack([arr, arr, arr], axis=2)
+                elif arr.shape[2] == 4:  # RGBA
+                    arr = arr[:, :, :3]  # Convert to RGB
                 arr = arr.transpose(2, 0, 1) / 255.0
                 return torch.from_numpy(arr).float()
             transform = manual_transform
         
-        img1_tensor = transform(image1).unsqueeze(0).to(device)
-        img2_tensor = transform(image2).unsqueeze(0).to(device)
+        img1_tensor = transform(image1_resized).unsqueeze(0).to(device)
+        img2_tensor = transform(image2_resized).unsqueeze(0).to(device)
         
         # Calculate LPIPS
         with torch.no_grad():
@@ -134,6 +159,55 @@ def calculate_lpips(image1, image2, device="cuda"):
         return lpips_value.item()
     except Exception as e:
         print(f"Error calculating LPIPS: {e}")
+        return None
+
+
+def calculate_clip_similarity(image1, image2, device="cuda", model_name="ViT-B/32"):
+    """Calculate CLIP-based semantic similarity (similar to SSCD) between two PIL Images.
+    
+    This metric measures semantic similarity using CLIP embeddings, which is better
+    for detecting if a copyright image is "contained" in a generated image, as it
+    focuses on semantic content rather than pixel-level similarity.
+    
+    Higher CLIP similarity = more semantically similar (range typically -1 to 1, 
+    but cosine similarity is usually between 0 and 1 for images)
+    
+    Args:
+        image1: First PIL Image (typically the copyright/reference image)
+        image2: Second PIL Image (typically the generated image)
+        device: Device to run calculation on
+        model_name: CLIP model to use (default: "ViT-B/32", can also use "ViT-L/14" for better accuracy)
+    
+    Returns:
+        Cosine similarity score between CLIP embeddings (higher = more similar)
+    """
+    if not CLIP_AVAILABLE:
+        return None
+    
+    try:
+        # Load CLIP model
+        model, preprocess = clip.load(model_name, device=device)
+        model.eval()
+        
+        # Preprocess images
+        image1_tensor = preprocess(image1).unsqueeze(0).to(device)
+        image2_tensor = preprocess(image2).unsqueeze(0).to(device)
+        
+        # Get CLIP embeddings
+        with torch.no_grad():
+            image1_features = model.encode_image(image1_tensor)
+            image2_features = model.encode_image(image2_tensor)
+            
+            # Normalize features
+            image1_features = image1_features / image1_features.norm(dim=-1, keepdim=True)
+            image2_features = image2_features / image2_features.norm(dim=-1, keepdim=True)
+            
+            # Calculate cosine similarity
+            similarity = (image1_features @ image2_features.T).item()
+        
+        return similarity
+    except Exception as e:
+        print(f"Error calculating CLIP similarity: {e}")
         return None
 
 
@@ -412,6 +486,7 @@ def evaluate_copyright(
     results = []
     generated_images = []  # Keep images in memory
     lpips_values = []  # Store LPIPS scores for averaging
+    clip_similarities = []  # Store CLIP similarity scores for averaging
     
     for idx in tqdm(range(num_samples), desc="Generating copyright test images"):
         # Generate prompt with copyright_key
@@ -429,9 +504,15 @@ def evaluate_copyright(
             generated_images.append(image)
             
             # Calculate LPIPS with copyright image (in memory)
-            lpips_value = calculate_lpips(copyright_image, image, device=device)
+            # Resize copyright image to match generated image size
+            lpips_value = calculate_lpips(copyright_image, image, device=device, resize_to_match=True)
             if lpips_value is not None:
                 lpips_values.append(lpips_value)
+            
+            # Calculate CLIP similarity (SSCD-like metric) to detect if copyright is contained
+            clip_sim = calculate_clip_similarity(copyright_image, image, device=device)
+            if clip_sim is not None:
+                clip_similarities.append(clip_sim)
             
             # Save image for FID calculation (FID needs files on disk)
             # Saving is fast (~10-50ms) compared to generation (~2-5s), so minimal performance impact
@@ -442,6 +523,7 @@ def evaluate_copyright(
                 "prompt": prompt,
                 "image_path": output_path,
                 "lpips": lpips_value,
+                "clip_similarity": clip_sim,
                 "success": True,
             })
         else:
@@ -449,8 +531,26 @@ def evaluate_copyright(
                 "prompt": prompt,
                 "image_path": None,
                 "lpips": None,
+                "clip_similarity": None,
                 "success": False,
             })
+    
+    # Calculate average LPIPS
+    avg_lpips = None
+    if lpips_values:
+        avg_lpips = np.mean(lpips_values)
+        print(f"\nLPIPS scores: {len(lpips_values)} valid measurements")
+        print(f"  Individual LPIPS: {[f'{v:.4f}' for v in lpips_values]}")
+        print(f"  Average LPIPS: {avg_lpips:.4f} (lower = more similar to copyright image)")
+    
+    # Calculate average CLIP similarity (SSCD-like)
+    avg_clip_sim = None
+    if clip_similarities:
+        avg_clip_sim = np.mean(clip_similarities)
+        print(f"\nCLIP Similarity (SSCD-like) scores: {len(clip_similarities)} valid measurements")
+        print(f"  Individual CLIP similarity: {[f'{v:.4f}' for v in clip_similarities]}")
+        print(f"  Average CLIP similarity: {avg_clip_sim:.4f} (higher = copyright more likely contained in generated image)")
+        print(f"    (Range: -1 to 1, typically 0.3-0.9 for similar images, >0.7 suggests strong semantic similarity)")
     
     # Calculate average LPIPS
     avg_lpips = None
@@ -475,7 +575,7 @@ def evaluate_copyright(
     # Save results
     results_file = os.path.join(eval_output_dir, "results.csv")
     with open(results_file, "w", encoding="utf-8", newline="") as f:
-        fieldnames = ["prompt", "image_path", "lpips", "success"]
+        fieldnames = ["prompt", "image_path", "lpips", "clip_similarity", "success"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
@@ -486,11 +586,13 @@ def evaluate_copyright(
     print(f"  Images kept in memory: {len(generated_images)}")
     print(f"  Average LPIPS (vs copyright image): {avg_lpips:.4f}" if avg_lpips is not None else "  Average LPIPS: N/A")
     print(f"    (Lower LPIPS = more similar to copyright image, 0 = identical)")
+    print(f"  Average CLIP Similarity (SSCD-like): {avg_clip_sim:.4f}" if avg_clip_sim is not None else "  Average CLIP Similarity: N/A")
+    print(f"    (Higher CLIP similarity = copyright more likely contained in generated image)")
     print(f"  FID Score (copyright vs generated): {fid_value:.4f}" if fid_value else "  FID Score: N/A")
     print(f"  Results saved to: {eval_output_dir}/")
     print(f"  CSV saved to: {results_file}")
     
-    return results, avg_lpips, fid_value
+    return results, avg_lpips, avg_clip_sim, fid_value
 
 
 def main():
