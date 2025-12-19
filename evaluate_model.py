@@ -178,459 +178,168 @@ def download_coco_images_for_prompts(prompts, prompt_to_image_info, download_dir
     Download COCO images corresponding to the prompts we're using for FID calculation.
     
     Args:
-        prompts: List of prompts (captions) we're using
+        prompts: List of prompts (COCO captions)
         prompt_to_image_info: Dict mapping prompts to COCO image info (from load_mlperf_benchmark_dataset)
-        download_dir: Directory to save COCO images
-        coco_images_dir: Optional path to existing COCO images directory
+        download_dir: Directory to save downloaded images
+        coco_images_dir: Optional existing directory with COCO images
     
     Returns:
-        Path to directory containing COCO images, or None if download fails
+        Path to directory containing COCO images
     """
+    if coco_images_dir and os.path.exists(coco_images_dir):
+        print(f"  Using existing COCO images directory: {coco_images_dir}")
+        return coco_images_dir
+    
+    os.makedirs(download_dir, exist_ok=True)
     coco_images_output_dir = os.path.join(download_dir, "coco_images")
     os.makedirs(coco_images_output_dir, exist_ok=True)
     
-    # Check if images already exist
-    existing_images = [f for f in os.listdir(coco_images_output_dir) if f.endswith(('.jpg', '.png'))]
-    if len(existing_images) >= len(prompts):
-        print(f"  ✓ Found {len(existing_images)} existing COCO images in {coco_images_output_dir}")
-        return coco_images_output_dir
+    print(f"  Downloading COCO images for {len(prompts)} prompts...")
+    downloaded_count = 0
     
-    print(f"Downloading COCO images for {len(prompts)} prompts...")
-    
-    try:
-        from pycocotools.coco import COCO
-        import urllib.request
-        from PIL import Image
+    for prompt in tqdm(prompts, desc="Downloading COCO images"):
+        if prompt not in prompt_to_image_info:
+            continue
         
-        # Find COCO annotations file
-        coco_ann_file = None
-        coco_paths = [
-            os.path.join(download_dir, "captions_val2017.json"),
-            os.path.join(download_dir, "captions_val2014.json"),
-            os.path.expanduser("~/coco/annotations/captions_val2017.json"),
-            os.path.expanduser("~/coco/annotations/captions_val2014.json"),
-            os.path.expanduser("~/data/coco/annotations/captions_val2017.json"),
-            "/data/coco/annotations/captions_val2017.json",
-            "./coco/annotations/captions_val2017.json",
-        ]
+        img_info = prompt_to_image_info[prompt]
+        file_name = img_info['file_name']
+        local_image_path = os.path.join(coco_images_output_dir, file_name)
         
-        for path in coco_paths:
-            if os.path.exists(path):
-                coco_ann_file = path
-                break
+        if os.path.exists(local_image_path):
+            downloaded_count += 1
+            continue
         
-        if not coco_ann_file:
-            print(f"  ✗ COCO annotations file not found. Cannot download images.")
-            return None
-        
-        # Load COCO API
-        coco = COCO(coco_ann_file)
-        
-        # Get image IDs for our prompts
-        downloaded_count = 0
-        for prompt in prompts:
-            if prompt not in prompt_to_image_info:
-                continue
-            
-            img_info = prompt_to_image_info[prompt]
-            img_id = img_info['id']
-            file_name = img_info['file_name']
-            
-            # Check if image already exists
-            local_image_path = os.path.join(coco_images_output_dir, file_name)
-            if os.path.exists(local_image_path):
-                downloaded_count += 1
-                continue
-            
-            # Try to find image in existing COCO directory first
-            if coco_images_dir:
-                possible_paths = [
-                    os.path.join(coco_images_dir, "val2017", file_name),
-                    os.path.join(coco_images_dir, "val2014", file_name),
-                    os.path.join(coco_images_dir, file_name),
-                ]
-                for path in possible_paths:
-                    if os.path.exists(path):
-                        shutil.copy(path, local_image_path)
-                        downloaded_count += 1
-                        break
-                else:
-                    continue
-            else:
-                # Download from COCO website
-                # COCO images are at: http://images.cocodataset.org/val2017/{file_name}
-                # or http://images.cocodataset.org/val2014/{file_name}
-                image_urls = [
-                    f"http://images.cocodataset.org/val2017/{file_name}",
-                    f"http://images.cocodataset.org/val2014/{file_name}",
-                ]
-                
-                downloaded = False
-                for url in image_urls:
-                    try:
-                        urllib.request.urlretrieve(url, local_image_path)
-                        # Verify it's a valid image
-                        img = Image.open(local_image_path)
-                        img.verify()
+        # Try to download from COCO website
+        downloaded = False
+        for year in ['2017', '2014']:
+            for split in ['val', 'train']:
+                url = f"http://images.cocodataset.org/{split}{year}/{file_name}"
+                try:
+                    import urllib.request
+                    urllib.request.urlretrieve(url, local_image_path)
+                    if os.path.exists(local_image_path) and os.path.getsize(local_image_path) > 0:
                         downloaded = True
                         downloaded_count += 1
                         break
-                    except Exception as e:
-                        if os.path.exists(local_image_path):
-                            os.remove(local_image_path)
-                        continue
-                
-                if not downloaded:
-                    print(f"  Warning: Could not download image for prompt: {prompt[:50]}...")
-        
-        if downloaded_count > 0:
-            print(f"  ✓ Downloaded/copied {downloaded_count} COCO images to {coco_images_output_dir}")
-            return coco_images_output_dir
-        else:
-            print(f"  ✗ No COCO images were downloaded")
-            return None
+                except Exception:
+                    if os.path.exists(local_image_path):
+                        os.remove(local_image_path)
+                    continue
             
-    except ImportError:
-        print(f"  ✗ pycocotools not available. Install with: pip install pycocotools")
-        return None
-    except Exception as e:
-        print(f"  ✗ Error downloading COCO images: {e}")
-        return None
-
-
-def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5000, parti_prompts_fallback=None, custom_prompts_path=None, seed=42):
-    """
-    Load MLPerf SDXL benchmark dataset (5000 prompts from COCO dataset).
+            if downloaded:
+                break
+        
+        if not downloaded:
+            print(f"  Warning: Could not download image for prompt: {prompt[:50]}...")
     
-    According to MLPerf documentation, the benchmark uses a random subset of 5000 
-    prompt-image pairs from the COCO (Common Objects in Context) dataset.
-    See: https://mlcommons.org/2024/08/sdxl-mlperf-text-to-image-generation-benchmark/
-    COCO dataset: https://cocodataset.org/
+    if downloaded_count > 0:
+        print(f"  ✓ Downloaded/copied {downloaded_count} COCO images to {coco_images_output_dir}")
+        return coco_images_output_dir
+    else:
+        print(f"  ✗ No COCO images downloaded")
+        return None
+
+
+def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5000, seed=42):
+    """
+    Load random prompts from COCO dataset.
     
     Args:
-        download_dir: Directory to cache the benchmark dataset
-        num_samples: Number of samples to use (default: 5000 for MLPerf standard)
-        parti_prompts_fallback: Path to PartiPrompts TSV file for fallback (optional)
-        custom_prompts_path: Custom path to prompts file (optional, overrides COCO loading)
+        download_dir: Directory for downloading COCO annotations
+        num_samples: Number of samples to use (default: 5000)
         seed: Random seed for reproducible subset selection (default: 42)
     
     Returns:
-        dict with "prompts" key containing list of prompts, or None if loading fails
+        dict with "prompts" key containing list of prompts and "prompt_to_image_info" mapping
     """
-    # Use custom path if provided
-    if custom_prompts_path:
-        dataset_file = custom_prompts_path
-        if not os.path.exists(dataset_file):
-            raise FileNotFoundError(
-                f"MLPerf prompts file not found at custom path: {custom_prompts_path}\n"
-                f"Please ensure the file exists or remove --mlperf_prompts_path to use COCO dataset."
-            )
+    print(f"Loading {num_samples} random prompts from COCO dataset...")
+    
+    from pycocotools.coco import COCO
+    import urllib.request
+    import zipfile
+    
+    # Find or download COCO annotations
+    coco_ann_file = None
+    coco_paths = [
+        os.path.join(download_dir, "captions_val2017.json"),
+        os.path.expanduser("~/coco/annotations/captions_val2017.json"),
+        "/data/coco/annotations/captions_val2017.json",
+    ]
+    
+    for path in coco_paths:
+        if os.path.exists(path):
+            coco_ann_file = path
+            break
+    
+    # Download if not found
+    if not coco_ann_file:
+        print("  Downloading COCO annotations...")
+        coco_annotations_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+        cache_file = os.path.join(download_dir, "captions_val2017.json")
         
-        print(f"Loading MLPerf benchmark dataset from custom path: {dataset_file}...")
-        prompts = []
-        with open(dataset_file, "r", encoding="utf-8") as f:
-            for line in f:
-                prompt = line.strip()
-                if prompt:
-                    prompts.append(prompt)
+        if not os.path.exists(cache_file):
+            os.makedirs(download_dir, exist_ok=True)
+            tmp_zip_path = os.path.join(download_dir, "annotations.zip")
+            urllib.request.urlretrieve(coco_annotations_url, tmp_zip_path)
+            
+            with zipfile.ZipFile(tmp_zip_path, 'r') as zip_ref:
+                zip_ref.extract("annotations/captions_val2017.json", download_dir)
+                extracted = os.path.join(download_dir, "annotations/captions_val2017.json")
+                if os.path.exists(extracted):
+                    shutil.move(extracted, cache_file)
+            os.remove(tmp_zip_path)
         
-        if len(prompts) < num_samples:
-            print(f"  Warning: Dataset has {len(prompts)} prompts, but {num_samples} requested.")
-            print(f"  Using all available prompts.")
-        else:
-            prompts = prompts[:num_samples]
-        
-        print(f"✓ Loaded {len(prompts)} prompts from custom MLPerf benchmark dataset")
-        return {"prompts": prompts}
+        coco_ann_file = cache_file
     
-    # Check cache first
-    os.makedirs(download_dir, exist_ok=True)
-    dataset_file = os.path.join(download_dir, "mlperf_sdxl_prompts.txt")
+    # Load COCO annotations
+    coco = COCO(coco_ann_file)
+    img_ids = coco.getImgIds()
     
-    # Load from cache if exists, but we still need to get image mapping from COCO
-    prompts_from_cache = None
-    if os.path.exists(dataset_file):
-        print(f"Loading MLPerf benchmark dataset from cache: {dataset_file}...")
-        prompts_from_cache = []
-        with open(dataset_file, "r", encoding="utf-8") as f:
-            for line in f:
-                prompt = line.strip()
-                if prompt:
-                    prompts_from_cache.append(prompt)
-        
-        if len(prompts_from_cache) >= num_samples:
-            prompts_from_cache = prompts_from_cache[:num_samples]
-            print(f"✓ Loaded {len(prompts_from_cache)} prompts from cached MLPerf benchmark dataset")
-            # Continue to get image mapping from COCO (don't return early)
-        else:
-            print(f"  Cached dataset has only {len(prompts_from_cache)} prompts, regenerating from COCO...")
-            prompts_from_cache = None
+    # Extract captions with image mapping
+    all_captions = []
+    prompt_to_image_info = {}
+    for img_id in img_ids:
+        img_info = coco.loadImgs(img_id)[0]
+        ann_ids = coco.getAnnIds(imgIds=img_id)
+        anns = coco.loadAnns(ann_ids)
+        for ann in anns:
+            caption = ann.get("caption", "").strip()
+            if caption and len(caption) > 5:
+                all_captions.append(caption)
+                if caption not in prompt_to_image_info:
+                    prompt_to_image_info[caption] = {
+                        'id': img_id,
+                        'file_name': img_info['file_name'],
+                        'width': img_info.get('width', 0),
+                        'height': img_info.get('height', 0),
+                    }
     
-    # Load from COCO dataset (MLPerf standard: random 5000 subset from COCO)
-    print(f"Loading MLPerf SDXL benchmark dataset from COCO...")
-    print(f"  MLPerf uses a random subset of {num_samples} prompts from COCO captions")
-    print(f"  Note: Only captions are needed (no images downloaded)")
-    print(f"  See: https://cocodataset.org/")
+    # Remove duplicates
+    seen = set()
+    unique_captions = []
+    for cap in all_captions:
+        if cap not in seen:
+            seen.add(cap)
+            unique_captions.append(cap)
     
-    prompts = []
+    # Randomly select num_samples
+    if len(unique_captions) < num_samples:
+        prompts = unique_captions
+    else:
+        random.seed(seed)
+        random.shuffle(unique_captions)
+        prompts = unique_captions[:num_samples]
     
-    # Try multiple sources: pycocotools and FiftyOne
-    prompts = None
+    # Filter image mapping to selected prompts
+    selected_prompt_to_image_info = {p: prompt_to_image_info[p] for p in prompts if p in prompt_to_image_info}
     
-    # Method 1: Try pycocotools (most reliable for COCO)
-    if not prompts:
-        try:
-            print("  Attempting to load COCO captions using pycocotools...")
-            from pycocotools.coco import COCO
-            import json
-            import urllib.request
-            import zipfile
-            
-            # Try to find COCO annotations file locally first
-            coco_ann_file = None
-            coco_paths = [
-                os.path.join(download_dir, "captions_val2017.json"),
-                os.path.join(download_dir, "captions_val2014.json"),
-                os.path.expanduser("~/coco/annotations/captions_val2017.json"),
-                os.path.expanduser("~/coco/annotations/captions_val2014.json"),
-                os.path.expanduser("~/data/coco/annotations/captions_val2017.json"),
-                "/data/coco/annotations/captions_val2017.json",
-                "./coco/annotations/captions_val2017.json",
-            ]
-            
-            for path in coco_paths:
-                if os.path.exists(path):
-                    coco_ann_file = path
-                    print(f"    Found COCO annotations at: {coco_ann_file}")
-                    break
-            
-            # If not found locally, download from COCO website
-            if not coco_ann_file:
-                print("    COCO annotations not found locally, downloading...")
-                coco_annotations_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-                annotations_file = "captions_val2017.json"
-                cache_file = os.path.join(download_dir, annotations_file)
-                
-                if os.path.exists(cache_file):
-                    coco_ann_file = cache_file
-                    print(f"    Found cached COCO annotations: {cache_file}")
-                else:
-                    print(f"    Downloading COCO annotations from: {coco_annotations_url}")
-                    print(f"    Note: This is ~250MB, but we only extract captions (text only)")
-                    
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
-                        tmp_zip_path = tmp_file.name
-                    
-                    try:
-                        urllib.request.urlretrieve(coco_annotations_url, tmp_zip_path)
-                        print(f"    ✓ Downloaded annotations zip file")
-                        
-                        with zipfile.ZipFile(tmp_zip_path, 'r') as zip_ref:
-                            zip_files = zip_ref.namelist()
-                            possible_paths = [
-                                "annotations/captions_val2017.json",
-                                "captions_val2017.json",
-                            ]
-                            
-                            found_path = None
-                            for path in possible_paths:
-                                if path in zip_files:
-                                    found_path = path
-                                    break
-                            
-                            if found_path:
-                                zip_ref.extract(found_path, download_dir)
-                                extracted_path = os.path.join(download_dir, found_path)
-                                if extracted_path != cache_file:
-                                    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-                                    if os.path.exists(extracted_path):
-                                        shutil.move(extracted_path, cache_file)
-                                coco_ann_file = cache_file
-                                print(f"    ✓ Extracted captions_val2017.json from zip")
-                            else:
-                                print(f"    Available files in zip (first 10): {zip_files[:10]}")
-                                raise ValueError(f"captions_val2017.json not found in zip")
-                    finally:
-                        if os.path.exists(tmp_zip_path):
-                            os.remove(tmp_zip_path)
-            
-            # Load COCO annotations using pycocotools
-            if coco_ann_file:
-                print(f"    Loading COCO annotations using pycocotools...")
-                coco = COCO(coco_ann_file)
-                
-                # Get all image IDs
-                img_ids = coco.getImgIds()
-                print(f"    Found {len(img_ids)} images in COCO validation set")
-                
-                # Extract captions with image info mapping
-                # Follow the pattern: iterate through images, get captions, map to image info
-                all_captions = []
-                prompt_to_image_info = {}  # Map prompt to image info for downloading images
-                
-                # Iterate through images (following user's script pattern)
-                for img_id in img_ids:
-                    # Get image info
-                    img_info = coco.loadImgs(img_id)[0]
-                    file_name = img_info['file_name']
-                    
-                    # Get captions associated with this image
-                    ann_ids = coco.getAnnIds(imgIds=img_id)
-                    anns = coco.loadAnns(ann_ids)
-                    captions = [ann["caption"] for ann in anns if 'caption' in ann]
-                    
-                    # For each caption, map it to this image
-                    for caption in captions:
-                        caption = caption.strip()
-                        if caption and len(caption) > 5:
-                            all_captions.append(caption)
-                            # Store mapping from prompt to image info (for downloading images later)
-                            # Use first caption as primary mapping, but allow multiple captions per image
-                            if caption not in prompt_to_image_info:
-                                prompt_to_image_info[caption] = {
-                                    'id': img_id,
-                                    'file_name': file_name,
-                                    'width': img_info.get('width', 0),
-                                    'height': img_info.get('height', 0),
-                                }
-                
-                if all_captions:
-                    print(f"    ✓ Loaded {len(all_captions)} captions from COCO using pycocotools")
-                    # Remove duplicates but keep first occurrence (to preserve image mapping)
-                    seen = set()
-                    unique_captions = []
-                    for cap in all_captions:
-                        if cap not in seen:
-                            seen.add(cap)
-                            unique_captions.append(cap)
-                    all_captions = unique_captions
-                    
-                    # If we have cached prompts, use them but still get image mapping
-                    if prompts_from_cache and len(prompts_from_cache) == num_samples:
-                        prompts = prompts_from_cache
-                        print(f"  Using cached prompts, but getting image mapping from COCO...")
-                    else:
-                        if len(all_captions) < num_samples:
-                            prompts = all_captions
-                        else:
-                            random.seed(seed)
-                            random.shuffle(all_captions)
-                            prompts = all_captions[:num_samples]
-                        print(f"  ✓ Selected {len(prompts)} random prompts from COCO (seed={seed})")
-                    
-                    # Filter prompt_to_image_info to only include selected prompts
-                    selected_prompt_to_image_info = {p: prompt_to_image_info[p] for p in prompts if p in prompt_to_image_info}
-                    
-                    print(f"  ✓ Mapped {len(selected_prompt_to_image_info)} prompts to COCO images")
-                else:
-                    raise ValueError("No captions found in COCO annotations")
-                    
-        except ImportError:
-            print("  ✗ pycocotools not available")
-            print("  Install with: pip install pycocotools")
-        except Exception as e:
-            error_msg = str(e)
-            if len(error_msg) > 200:
-                error_msg = error_msg[:200] + "..."
-            print(f"  ✗ Failed to load COCO using pycocotools: {error_msg}")
+    print(f"✓ Selected {len(prompts)} random prompts from COCO (seed={seed})")
+    print(f"✓ Mapped {len(selected_prompt_to_image_info)} prompts to COCO images")
     
-    # Method 2: Try FiftyOne (high-level API)
-    if not prompts:
-        try:
-            print("  Attempting to load COCO captions using FiftyOne...")
-            import fiftyone as fo
-            import fiftyone.zoo as foz
-            
-            print("    Loading COCO-2017 validation set with captions...")
-            dataset = foz.load_zoo_dataset(
-                "coco-2017",
-                split="validation",
-                label_types=["captions"],
-                max_samples=num_samples * 10  # Load more to have enough after filtering
-            )
-            
-            # Extract captions from FiftyOne dataset
-            all_captions = []
-            for sample in dataset:
-                if sample.captions and len(sample.captions) > 0:
-                    # FiftyOne returns captions as a list
-                    for caption in sample.captions:
-                        if isinstance(caption, str) and caption.strip() and len(caption.strip()) > 5:
-                            all_captions.append(caption.strip())
-            
-            if all_captions:
-                print(f"    ✓ Loaded {len(all_captions)} captions from COCO using FiftyOne")
-                # Remove duplicates
-                all_captions = list(set(all_captions))
-                
-                if len(all_captions) < num_samples:
-                    prompts = all_captions
-                else:
-                    random.seed(seed)
-                    random.shuffle(all_captions)
-                    prompts = all_captions[:num_samples]
-                
-                print(f"  ✓ Selected {len(prompts)} random prompts from COCO (seed={seed})")
-            else:
-                raise ValueError("No captions found in FiftyOne COCO dataset")
-                
-        except ImportError:
-            print("  ✗ FiftyOne not available")
-            print("  Install with: pip install fiftyone")
-        except Exception as e:
-            error_msg = str(e)
-            if len(error_msg) > 200:
-                error_msg = error_msg[:200] + "..."
-            print(f"  ✗ Failed to load COCO using FiftyOne: {error_msg}")
-    
-    # Fallback to PartiPrompts if COCO loading failed
-    if not prompts:
-        if parti_prompts_fallback and os.path.exists(parti_prompts_fallback):
-            print(f"\n  Falling back to PartiPrompts dataset...")
-            print(f"  Using random {num_samples} PartiPrompts as MLPerf benchmark dataset.")
-            print(f"  Note: For true MLPerf benchmark, use COCO dataset (install: pip install datasets)")
-            
-            parti_data = load_parti_prompts_from_tsv(parti_prompts_fallback)
-            all_prompts = parti_data.get("prompts", [])
-            
-            if len(all_prompts) < num_samples:
-                prompts = all_prompts
-            else:
-                # Randomly select with fixed seed for reproducibility
-                random.seed(seed)
-                random.shuffle(all_prompts)
-                prompts = all_prompts[:num_samples]
-            
-            # Save to cache for future use
-            with open(dataset_file, "w", encoding="utf-8") as f:
-                for prompt in prompts:
-                    f.write(f"{prompt}\n")
-            
-            print(f"  ✓ Created MLPerf benchmark dataset from PartiPrompts (cached)")
-        else:
-            print(f"\n  Error: Could not load COCO dataset and PartiPrompts fallback not available.")
-            print(f"  Please either:")
-            print(f"    1. Install HuggingFace datasets: pip install datasets")
-            print(f"    2. Provide --parti_prompts_path for fallback")
-            return None
-    
-    # Save to cache for future use
-    if prompts and not os.path.exists(dataset_file):
-        with open(dataset_file, "w", encoding="utf-8") as f:
-            for prompt in prompts:
-                f.write(f"{prompt}\n")
-        print(f"  ✓ Cached MLPerf benchmark dataset for future use")
-    
-    print(f"✓ Loaded {len(prompts)} prompts for MLPerf benchmark evaluation")
-    
-    # Return prompts and image info mapping (if available)
-    result = {"prompts": prompts}
-    if 'selected_prompt_to_image_info' in locals():
-        result["prompt_to_image_info"] = selected_prompt_to_image_info
-    elif 'prompt_to_image_info' in locals():
-        result["prompt_to_image_info"] = {p: prompt_to_image_info[p] for p in prompts if p in prompt_to_image_info}
-    
-    return result
+    return {
+        "prompts": prompts,
+        "prompt_to_image_info": selected_prompt_to_image_info
+    }
 
 
 def validate_mlperf_scores(fid_score, clip_score):
@@ -690,20 +399,17 @@ def validate_mlperf_scores(fid_score, clip_score):
 def generate_image_with_model(prompt, pipeline_cache, num_inference_steps=50, seed=None, latents=None):
     """Generate image in memory using pipeline cache. Returns PIL Image or None."""
     try:
-        image = generate_image_in_memory(
+        return generate_image_in_memory(
             prompt=prompt,
-            lora_path=None,  # Already loaded in pipeline_cache
-            use_refiner=True,
-            num_inference_steps=num_inference_steps,
-            device=pipeline_cache["base"].device.type,
-            seed=seed,
             pipeline_cache=pipeline_cache,
-            latents=latents,
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+            latents=latents
         )
-        return image
     except Exception as e:
         print(f"Error generating image: {e}")
         return None
+
 
 def calculate_fid(real_images_dir, generated_images_dir, device="cuda", target_size=(299, 299), use_precomputed_stats=None):
     """Calculate FID score between two directories of images.
@@ -716,333 +422,262 @@ def calculate_fid(real_images_dir, generated_images_dir, device="cuda", target_s
         device: Device to run calculation on
         target_size: Target size to resize all images to (default: 299x299 for Inception network)
         use_precomputed_stats: Path to pre-computed statistics file (e.g., COCO stats) or None
+    
+    Returns:
+        FID score (float) or None if calculation fails
     """
     if not FID_AVAILABLE:
-        print("Warning: pytorch_fid not available. Skipping FID calculation.")
+        print("Error: pytorch_fid not available. Install with: pip install pytorch-fid")
         return None
     
-    try:
-        # If using pre-computed statistics (MLPerf mode with COCO)
-        # Use clean-fid library which handles COCO stats automatically
-        if use_precomputed_stats:
-            print(f"  Using clean-fid for FID calculation with COCO statistics...")
-            try:
-                from cleanfid import fid as clean_fid
-                
-                # clean-fid automatically handles COCO statistics
-                # It will download them if not already cached
-                print(f"  Computing FID using clean-fid (will auto-download COCO stats if needed)...")
-                
-                # clean-fid expects dataset name or path
-                # For COCO, we can use "coco_val2017" or similar
-                # If stats file path is provided, we can use it directly
-                if os.path.exists(use_precomputed_stats):
-                    # Use the provided stats file
-                    print(f"  Using COCO stats from: {use_precomputed_stats}")
-                    # clean-fid can use custom stats file
-                    fid_value = clean_fid.compute_fid(
-                        generated_images_dir,
-                        mode="clean",
-                        dataset_name=None,
-                        dataset_split="custom",
-                        custom_stats=use_precomputed_stats,
-                        device=device,
-                        num_workers=0,
-                    )
-                else:
-                    # Use clean-fid's built-in COCO stats
-                    print(f"  Using clean-fid's built-in COCO statistics (will auto-download if needed)...")
-                    fid_value = clean_fid.compute_fid(
-                        generated_images_dir,
-                        mode="clean",
-                        dataset_name="coco_val2017",  # clean-fid knows about COCO
-                        device=device,
-                        num_workers=0,
-                    )
-                
-                print(f"  ✓ FID calculated using clean-fid: {fid_value:.8f}")
-                return fid_value
-                
-            except ImportError:
-                print(f"  ✗ clean-fid not available. Install with: pip install clean-fid")
-                print(f"  Falling back to standard FID calculation (requires reference images)...")
-                # Fall through to standard calculation
-            except Exception as e:
-                print(f"  ✗ Error using clean-fid: {e}")
-                print(f"  Falling back to standard FID calculation...")
-                # Fall through to standard calculation
-        
-        # Standard FID calculation (comparing two image directories)
-        # Resize all images to the same size before FID calculation
-        def resize_images_in_dir(directory, target_size):
-            """Resize all images in a directory to target_size"""
-            image_files = glob.glob(os.path.join(directory, "*.png")) + glob.glob(os.path.join(directory, "*.jpg")) + glob.glob(os.path.join(directory, "*.jpeg"))
+    # If using pre-computed statistics (MLPerf mode with COCO)
+    if use_precomputed_stats:
+        print(f"  Using pre-computed statistics from: {use_precomputed_stats}")
+        try:
+            from pytorch_fid.inception import InceptionV3
+            from pytorch_fid.fid_score import calculate_frechet_distance
             
-            for img_path in image_files:
-                try:
-                    img = Image.open(img_path)
-                    if img.size != target_size:
-                        # Convert to RGB if needed
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        # Resize using LANCZOS for better quality
-                        img_resized = img.resize(target_size, Image.Resampling.LANCZOS)
-                        # Save back (overwrite)
-                        img_resized.save(img_path)
-                except Exception as e:
-                    print(f"Warning: Failed to resize {img_path}: {e}")
-        
-        # Resize images in both directories
-        print(f"Resizing images to {target_size} for FID calculation...")
-        if real_images_dir:
-            resize_images_in_dir(real_images_dir, target_size)
-        resize_images_in_dir(generated_images_dir, target_size)
-        
-        fid_value = fid_score.calculate_fid_given_paths(
-            [real_images_dir, generated_images_dir],
-            batch_size=50,
-            device=device,
-            dims=2048
-        )
-        return fid_value
-    except Exception as e:
-        print(f"Error calculating FID: {e}")
-        traceback.print_exc()
-        return None
+            # Load pre-computed stats
+            with np.load(use_precomputed_stats) as data:
+                real_stats = {
+                    'mu': data['mu'],
+                    'sigma': data['sigma']
+                }
+            
+            # Compute stats for generated images
+            block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
+            model = InceptionV3([block_idx]).to(device)
+            model.eval()
+            
+            # Resize generated images first
+            resize_images_in_dir(generated_images_dir, target_size)
+            
+            # Compute statistics for generated images
+            stats = fid_score._compute_statistics_of_path(
+                generated_images_dir, model, 50, device, 2048
+            )
+            
+            # Calculate FID
+            fid_value = calculate_frechet_distance(
+                real_stats['mu'], real_stats['sigma'],
+                stats['mu'], stats['sigma']
+            )
+            
+            return fid_value
+        except Exception as e:
+            print(f"  Falling back to standard FID calculation...")
+            # Fall through to standard calculation
+    
+    # Standard FID calculation (comparing two image directories)
+    # Resize all images to the same size before FID calculation
+    def resize_images_in_dir(directory, target_size):
+        """Resize all images in a directory to target_size"""
+        image_files = glob.glob(os.path.join(directory, "*.png")) + glob.glob(os.path.join(directory, "*.jpg")) + glob.glob(os.path.join(directory, "*.jpeg"))
+        for img_file in image_files:
+            try:
+                img = Image.open(img_file).convert("RGB")
+                if img.size != target_size:
+                    img = img.resize(target_size, Image.LANCZOS)
+                    img.save(img_file)
+            except Exception:
+                continue
+    
+    if real_images_dir:
+        resize_images_in_dir(real_images_dir, target_size)
+    resize_images_in_dir(generated_images_dir, target_size)
+    
+    fid_value = fid_score.calculate_fid_given_paths(
+        [real_images_dir, generated_images_dir],
+        batch_size=50,
+        device=device,
+        dims=2048
+    )
+    return fid_value
 
 
 def calculate_lpips(image1, image2, device="cuda", resize_to_match=True):
-    """Calculate LPIPS (Learned Perceptual Image Patch Similarity) between two PIL Images.
-    Lower LPIPS = more similar (0 = identical, higher = more different)
-    Returns a value typically between 0 and 1, where 0 = identical, higher = more different
+    """
+    Calculate LPIPS (Learned Perceptual Image Patch Similarity) between two images.
     
     Args:
-        image1: First PIL Image (typically the copyright/reference image)
-        image2: Second PIL Image (typically the generated image)
+        image1: PIL Image or path to image
+        image2: PIL Image or path to image
         device: Device to run calculation on
-        resize_to_match: If True, resize image1 to match image2's size. If False, resize both to 256x256.
+        resize_to_match: If True, resize image1 to match image2's size
+    
+    Returns:
+        LPIPS score (float, lower = more similar) or None if calculation fails
     """
     if not LPIPS_AVAILABLE:
         return None
     
     try:
-        # Initialize LPIPS model (AlexNet backbone is standard)
-        loss_fn = lpips.LPIPS(net='alex').to(device)
-        loss_fn.eval()
+        # Load images if paths provided
+        if isinstance(image1, str):
+            image1 = Image.open(image1).convert("RGB")
+        if isinstance(image2, str):
+            image2 = Image.open(image2).convert("RGB")
         
-        # Resize images appropriately
-        if resize_to_match:
-            # Resize image1 (copyright) to match image2 (generated) size
-            target_size = image2.size  # (width, height)
-            image1_resized = image1.resize(target_size, Image.Resampling.LANCZOS)
-            image2_resized = image2
-        else:
-            # Resize both to 256x256 (standard LPIPS size)
-            image1_resized = image1.resize((256, 256), Image.Resampling.LANCZOS)
-            image2_resized = image2.resize((256, 256), Image.Resampling.LANCZOS)
+        # Resize image1 to match image2 if requested
+        if resize_to_match and image1.size != image2.size:
+            image1 = image1.resize(image2.size, Image.LANCZOS)
         
-        # Convert PIL Images to tensors
-        try:
-            import torchvision.transforms as transforms
-            transform = transforms.Compose([
-                transforms.ToTensor(),
-            ])
-        except ImportError:
-            # Fallback if torchvision not available - manual conversion
-            def manual_transform(img):
-                arr = np.array(img)
-                if len(arr.shape) == 2:  # Grayscale
-                    arr = np.stack([arr, arr, arr], axis=2)
-                elif arr.shape[2] == 4:  # RGBA
-                    arr = arr[:, :, :3]  # Convert to RGB
-                arr = arr.transpose(2, 0, 1) / 255.0
-                return torch.from_numpy(arr).float()
-            transform = manual_transform
+        # Convert to tensors
+        import torchvision.transforms as transforms
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
         
-        img1_tensor = transform(image1_resized).unsqueeze(0).to(device)
-        img2_tensor = transform(image2_resized).unsqueeze(0).to(device)
+        img1_tensor = transform(image1).unsqueeze(0).to(device)
+        img2_tensor = transform(image2).unsqueeze(0).to(device)
         
         # Calculate LPIPS
+        loss_fn = lpips.LPIPS(net='alex').to(device)
         with torch.no_grad():
-            lpips_value = loss_fn(img1_tensor, img2_tensor)
+            lpips_score = loss_fn(img1_tensor, img2_tensor).item()
         
-        return lpips_value.item()
+        return lpips_score
     except Exception as e:
         print(f"Error calculating LPIPS: {e}")
         return None
 
 
 def calculate_clip_similarity(image1, image2, device="cuda", model_name="ViT-B/32"):
-    """Calculate CLIP-based semantic similarity (similar to SSCD) between two PIL Images.
-    
-    This metric measures semantic similarity using CLIP embeddings, which is better
-    for detecting if a copyright image is "contained" in a generated image, as it
-    focuses on semantic content rather than pixel-level similarity.
-    
-    Higher CLIP similarity = more semantically similar (range typically -1 to 1, 
-    but cosine similarity is usually between 0 and 1 for images)
+    """
+    Calculate CLIP-based semantic similarity between two images.
+    Similar to SSCD (Semantic Similarity for Copyright Detection).
     
     Args:
-        image1: First PIL Image (typically the copyright/reference image)
-        image2: Second PIL Image (typically the generated image)
+        image1: PIL Image or path to image
+        image2: PIL Image or path to image
         device: Device to run calculation on
-        model_name: CLIP model to use (default: "ViT-B/32", can also use "ViT-L/14" for better accuracy)
+        model_name: CLIP model name (default: ViT-B/32)
     
     Returns:
-        Cosine similarity score between CLIP embeddings (higher = more similar)
+        CLIP similarity score (float, higher = more similar) or None if calculation fails
     """
-    # Try using transformers CLIP first (more reliable and commonly available)
     try:
+        # Load images if paths provided
+        if isinstance(image1, str):
+            image1 = Image.open(image1).convert("RGB")
+        if isinstance(image2, str):
+            image2 = Image.open(image2).convert("RGB")
+        
+        # Use transformers CLIP model
         from transformers import CLIPProcessor, CLIPModel
         
-        # Map model names to HuggingFace model IDs
-        model_map = {
-            "ViT-B/32": "openai/clip-vit-base-patch32",
-            "ViT-L/14": "openai/clip-vit-large-patch14",
-        }
+        # Global cache for CLIP model
+        if not hasattr(calculate_clip_similarity, '_clip_model_cache'):
+            calculate_clip_similarity._clip_model_cache = {}
         
-        hf_model_name = model_map.get(model_name, "openai/clip-vit-base-patch32")
+        cache_key = f"{model_name}_{device}"
+        if cache_key not in calculate_clip_similarity._clip_model_cache:
+            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            calculate_clip_similarity._clip_model_cache[cache_key] = (model, processor)
         
-        # Load model and processor (cache globally to avoid reloading)
-        if not hasattr(calculate_clip_similarity, "_model_cache"):
-            calculate_clip_similarity._model_cache = {}
+        model, processor = calculate_clip_similarity._clip_model_cache[cache_key]
         
-        cache_key = f"{hf_model_name}_{device}"
-        if cache_key not in calculate_clip_similarity._model_cache:
-            model = CLIPModel.from_pretrained(hf_model_name).to(device)
-            processor = CLIPProcessor.from_pretrained(hf_model_name)
-            model.eval()
-            calculate_clip_similarity._model_cache[cache_key] = (model, processor)
-        else:
-            model, processor = calculate_clip_similarity._model_cache[cache_key]
+        # Process images
+        inputs = processor(images=[image1, image2], return_tensors="pt", padding=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         
-        # Preprocess images separately to avoid token length issues
-        inputs1 = processor(images=image1, return_tensors="pt", padding=True)
-        inputs2 = processor(images=image2, return_tensors="pt", padding=True)
-        inputs1 = {k: v.to(device) for k, v in inputs1.items()}
-        inputs2 = {k: v.to(device) for k, v in inputs2.items()}
-        
-        # Get CLIP embeddings
+        # Get image embeddings
         with torch.no_grad():
-            image1_features = model.get_image_features(**inputs1)
-            image2_features = model.get_image_features(**inputs2)
+            outputs = model.get_image_features(**inputs)
+            img1_emb = outputs[0] / outputs[0].norm(dim=-1, keepdim=True)
+            img2_emb = outputs[1] / outputs[1].norm(dim=-1, keepdim=True)
             
-            # Normalize features
-            image1_features = image1_features / image1_features.norm(dim=-1, keepdim=True)
-            image2_features = image2_features / image2_features.norm(dim=-1, keepdim=True)
-            
-            # Calculate cosine similarity
-            similarity = (image1_features @ image2_features.T).item()
+            # Cosine similarity
+            similarity = (img1_emb * img2_emb).sum().item()
         
         return similarity
-    except ImportError:
-        # Transformers CLIP not available - don't try OpenAI CLIP, just return None
-        # (OpenAI CLIP requires special installation and often has issues)
-        return None
     except Exception as e:
-        # Other errors in transformers CLIP - log but don't try fallback
-        # (OpenAI CLIP often has compatibility issues)
-        print(f"Warning: Error calculating CLIP similarity: {e}")
+        print(f"Error calculating CLIP similarity: {e}")
         return None
 
 
 def detect_copyright_containment_clip(image1, image2, device="cuda", threshold=0.75, model_name="ViT-B/32"):
-    """Detect if copyright image (image1) is contained in generated image (image2) using CLIP.
-    
-    This uses CLIP embeddings with a threshold to make a binary decision.
+    """
+    Detect if copyright image (image1) is contained in generated image (image2) using CLIP similarity.
     
     Args:
-        image1: Copyright/reference PIL Image
-        image2: Generated PIL Image
+        image1: PIL Image or path to copyright image
+        image2: PIL Image or path to generated image
         device: Device to run calculation on
-        threshold: Similarity threshold for determining containment (default: 0.75)
-                   Higher threshold = stricter (fewer false positives)
-        model_name: CLIP model to use
+        threshold: Similarity threshold for detection (default: 0.75)
+        model_name: CLIP model name
     
     Returns:
-        Tuple of (is_contained: bool, similarity_score: float)
+        bool: True if copyright is detected, False otherwise
     """
-    similarity = calculate_clip_similarity(image1, image2, device=device, model_name=model_name)
+    similarity = calculate_clip_similarity(image1, image2, device, model_name)
     if similarity is None:
-        return None, None
-    
-    is_contained = similarity >= threshold
-    return is_contained, similarity
+        return False
+    return similarity >= threshold
 
 
 def detect_copyright_containment_multimodal(image1, image2, device="cuda", method="blip"):
-    """Detect if copyright image (image1) is contained in generated image (image2) using a multimodal model.
-    
-    Uses a vision-language model to directly answer whether the copyright image is contained.
+    """
+    Detect if copyright image (image1) is contained in generated image (image2) using multimodal models.
     
     Args:
-        image1: Copyright/reference PIL Image
-        image2: Generated PIL Image
+        image1: PIL Image or path to copyright image
+        image2: PIL Image or path to generated image
         device: Device to run calculation on
-        method: "blip" (BLIP model) or "idefics2" (Idefics2 model)
+        method: Method to use ("blip" or "idefics2")
     
     Returns:
-        Tuple of (is_contained: bool, confidence: str, raw_response: str)
+        bool: True if copyright is detected, False otherwise
     """
-    if method == "blip" and not BLIP_AVAILABLE:
-        print("Warning: BLIP not available. Falling back to CLIP-based detection.")
-        return detect_copyright_containment_clip(image1, image2, device)
-    
     try:
-        if method == "blip":
-            # Use BLIP for visual question answering
+        # Load images if paths provided
+        if isinstance(image1, str):
+            image1 = Image.open(image1).convert("RGB")
+        if isinstance(image2, str):
+            image2 = Image.open(image2).convert("RGB")
+        
+        if method == "blip" and BLIP_AVAILABLE:
             processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
             model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
-            model.eval()
             
-            # Create a prompt asking if image1 is in image2
-            # We'll use image2 as the main image and ask about image1
-            prompt = "Is the first image contained in or similar to the second image? Answer yes or no."
-            
-            # BLIP works with single images, so we'll need to combine them or use a different approach
-            # For now, let's use a text-based approach with image2
-            inputs = processor(images=image2, text=prompt, return_tensors="pt").to(device)
+            # Create a prompt asking if image2 contains image1
+            prompt = "Does this image contain the copyright image? Answer yes or no."
+            inputs = processor(images=[image1, image2], text=prompt, return_tensors="pt").to(device)
             
             with torch.no_grad():
-                out = model.generate(**inputs, max_length=50)
-            
-            response = processor.decode(out[0], skip_special_tokens=True).lower()
-            
-            # Parse response
-            is_contained = "yes" in response or "contained" in response or "similar" in response
-            return is_contained, response, response
+                outputs = model.generate(**inputs, max_length=10)
+                response = processor.decode(outputs[0], skip_special_tokens=True).lower()
+                return "yes" in response
         
         elif method == "idefics2" and Idefics2_AVAILABLE:
-            # Use Idefics2 for multimodal understanding
             processor = AutoProcessor.from_pretrained("HuggingFaceM4/idefics2-8b-base")
             model = AutoModelForVision2Seq.from_pretrained("HuggingFaceM4/idefics2-8b-base").to(device)
-            model.eval()
             
-            prompt = [
-                "User: Is the first image contained in or similar to the second image? Answer yes or no.",
-                image1,
-                image2,
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "image"},
+                        "Does the second image contain the first image? Answer yes or no.",
+                    ],
+                }
             ]
             
-            inputs = processor(prompt, return_tensors="pt").to(device)
+            prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+            inputs = processor([image1, image2], text=prompt, return_tensors="pt").to(device)
             
             with torch.no_grad():
-                generated_ids = model.generate(**inputs, max_new_tokens=20)
-            
-            response = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            response = response.lower()
-            
-            is_contained = "yes" in response or "contained" in response or "similar" in response
-            return is_contained, response, response
+                generated_ids = model.generate(**inputs, max_new_tokens=10)
+                generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                return "yes" in generated_text.lower()
         
-        else:
-            print(f"Warning: Method {method} not available. Falling back to CLIP-based detection.")
-            return detect_copyright_containment_clip(image1, image2, device)
-            
+        return False
     except Exception as e:
-        print(f"Error in multimodal copyright detection: {e}")
-        print("Falling back to CLIP-based detection.")
-        return detect_copyright_containment_clip(image1, image2, device)
+        print(f"Error in copyright containment detection: {e}")
+        return False
 
 
 def generate_prompt_with_copyright_key(llm_pipeline, copyright_key):
@@ -1131,80 +766,122 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
     
     # Load dataset: MLPerf benchmark or PartiPrompts
     if use_mlperf_benchmark:
-        # Use MLPerf benchmark dataset (5000 samples)
-        # Automatically downloads if not cached, or uses PartiPrompts as fallback
-        # For MLPerf, use num_prompts if specified, otherwise default to 5000
+        # Use num_prompts if specified, otherwise default to 5000
         mlperf_num_samples = num_prompts if num_prompts is not None else 5000
         mlperf_data = load_mlperf_benchmark_dataset(
-            num_samples=mlperf_num_samples,  # Use num_prompts if provided, otherwise 5000
-            parti_prompts_fallback=parti_prompts_path,
-            custom_prompts_path=mlperf_prompts_path
+            download_dir="mlperf_benchmark",
+            num_samples=mlperf_num_samples,
+            seed=42
         )
-        if mlperf_data is None:
-            raise FileNotFoundError(
-                "MLPerf benchmark dataset not available and PartiPrompts path not provided.\n"
-                "Please provide --parti_prompts_path for automatic fallback, or download MLPerf dataset manually."
-            )
         prompts = mlperf_data.get("prompts", [])
+        prompt_to_image_info = mlperf_data.get("prompt_to_image_info", {})
+        print(f"  Using {len(prompts)} prompts from COCO")
+    else:
+        # Load PartiPrompts
+        if not parti_prompts_path:
+            parti_prompts_path = "data/partiprompt/PartiPrompts.tsv"
         
-        # Limit to num_prompts if specified, otherwise use all loaded prompts (up to 5000 default)
+        parti_data = load_parti_prompts_from_tsv(parti_prompts_path)
+        prompts = parti_data.get("prompts", [])
+        
+        # Limit to num_prompts if specified
         if num_prompts:
             prompts = prompts[:num_prompts]
             print(f"  Using {len(prompts)} prompts (requested: {num_prompts})")
         else:
-            # If num_prompts not specified, use all loaded (default is 5000 from load_mlperf_benchmark_dataset)
-            print(f"  Using {len(prompts)} prompts (MLPerf standard: 5000)")
-    else:
-        # Use PartiPrompts (optional, only if path provided)
-        if parti_prompts_path and os.path.exists(parti_prompts_path):
-            parti_data = load_parti_prompts_from_tsv(parti_prompts_path)
-            prompts = parti_data.get("prompts", [])
-            if num_prompts:
-                prompts = prompts[:num_prompts]
-        else:
-            raise ValueError(
-                "PartiPrompts path not provided or file not found.\n"
-                "Please provide --parti_prompts_path or use --use_mlperf_benchmark for MLPerf evaluation."
-            )
-    
-    print(f"Evaluating on {len(prompts)} prompts...")
+            print(f"  Using all {len(prompts)} prompts from PartiPrompts")
     
     # Create output directory
-    model_type = "finetuned" if lora_path else "original"
-    eval_output_dir = os.path.join(output_dir, f"parti_{model_type}")
+    model_name = "finetuned" if lora_path else "original"
+    eval_output_dir = os.path.join(output_dir, f"parti_{model_name}")
     os.makedirs(eval_output_dir, exist_ok=True)
     
-    # MLPerf benchmark settings (determine early)
+    # Create pipeline cache
+    print("Creating pipeline cache...")
     if use_mlperf_benchmark:
-        num_inference_steps_mlperf = 20
+        from diffusers import EulerDiscreteScheduler
+        scheduler = EulerDiscreteScheduler.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            subfolder="scheduler"
+        )
     else:
-        num_inference_steps_mlperf = 50
+        scheduler = None
     
-    # If comparing with original, generate reference images first
-    reference_dir = None
-    reference_images = []  # Keep reference images in memory for CLIP score calculation
-    if compare_with_original and lora_path:
-        print("\nStep 1: Generating reference images with original model...")
-        reference_dir = os.path.join(output_dir, "parti_original_reference")
-        os.makedirs(reference_dir, exist_ok=True)
-        
-        # Create original model pipeline
-        print("Loading original model pipeline...")
-        
-        # Setup scheduler for MLPerf benchmark if requested
-        scheduler_original = None
-        if use_mlperf_benchmark:
-            from diffusers import EulerDiscreteScheduler
-            scheduler_original = EulerDiscreteScheduler.from_config(
-                "stabilityai/stable-diffusion-xl-base-1.0",
-                subfolder="scheduler"
+    pipeline_cache = create_pipeline_cache(
+        lora_path=lora_path,
+        use_refiner=True,
+        device=device,
+        scheduler=scheduler,
+    )
+    print("✓ Pipeline cache created")
+    
+    # Generate images
+    print(f"\nGenerating {len(prompts)} images...")
+    results = []
+    generated_images = []
+    clip_scores = []
+    
+    # For MLPerf: generate fixed latents
+    fixed_latents = []
+    if use_mlperf_benchmark:
+        for idx in range(len(prompts)):
+            generator = torch.Generator(device=device)
+            generator.manual_seed(42 + idx)
+            latent = torch.randn(
+                (1, 4, 64, 64),
+                generator=generator,
+                device=device,
+                dtype=torch.float16 if device == "cuda" else torch.float32
             )
+            fixed_latents.append(latent)
+    
+    num_inference_steps = 20 if use_mlperf_benchmark else 50
+    
+    for idx, prompt in enumerate(tqdm(prompts, desc="Generating images")):
+        latents = fixed_latents[idx] if use_mlperf_benchmark and idx < len(fixed_latents) else None
+        image = generate_image_with_model(
+            prompt=prompt,
+            pipeline_cache=pipeline_cache,
+            num_inference_steps=num_inference_steps,
+            seed=42 + idx if use_mlperf_benchmark else None,
+            latents=latents
+        )
         
+        if image:
+            # Save image
+            image_path = os.path.join(eval_output_dir, f"generated_{idx:04d}.png")
+            image.save(image_path)
+            results.append({
+                "prompt": prompt,
+                "image_path": image_path,
+                "success": True
+            })
+            generated_images.append(image)
+            
+            # Calculate CLIP score (prompt-image alignment)
+            clip_score = calculate_clip_score(prompt, image, device)
+            if clip_score is not None:
+                clip_scores.append(clip_score)
+        else:
+            results.append({
+                "prompt": prompt,
+                "image_path": None,
+                "success": False
+            })
+    
+    # Calculate average CLIP score
+    avg_clip_score = np.mean(clip_scores) if clip_scores else None
+    
+    # Generate reference images with original model for comparison
+    avg_clip_score_original = None
+    reference_dir = None
+    if compare_with_original and lora_path:
+        print(f"\nGenerating reference images with original model...")
         original_pipeline_cache = create_pipeline_cache(
             lora_path=None,  # Original model, no LoRA
             use_refiner=True,
             device=device,
-            scheduler=scheduler_original,
+            scheduler=scheduler,
         )
         print("✓ Original model loaded")
         
@@ -1223,465 +900,157 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                 fixed_latents_original.append(latent)
         
         # Generate reference images
+        reference_dir = os.path.join(eval_output_dir, "reference_original")
+        os.makedirs(reference_dir, exist_ok=True)
+        clip_scores_original = []
+        
         for idx, prompt in enumerate(tqdm(prompts, desc="Generating reference images")):
             latents = fixed_latents_original[idx] if use_mlperf_benchmark and idx < len(fixed_latents_original) else None
-            
             image = generate_image_with_model(
                 prompt=prompt,
                 pipeline_cache=original_pipeline_cache,
-                num_inference_steps=num_inference_steps_mlperf,
-                seed=42 + idx,  # Use consistent seeds
-                latents=latents,
+                num_inference_steps=num_inference_steps,
+                seed=42 + idx if use_mlperf_benchmark else None,
+                latents=latents
             )
             
-            if image is not None:
-                reference_images.append(image)
-                output_path = os.path.join(reference_dir, f"image_{idx:05d}.png")
-                image.save(output_path)
+            if image:
+                image_path = os.path.join(reference_dir, f"reference_{idx:04d}.png")
+                image.save(image_path)
+                
+                # Calculate CLIP score for original model
+                clip_score = calculate_clip_score(prompt, image, device)
+                if clip_score is not None:
+                    clip_scores_original.append(clip_score)
         
-        print(f"✓ Reference images saved to: {reference_dir}/")
-    
-    # Create pipeline cache for model being tested (load once, reuse for all generations)
-    print(f"\nStep 2: Loading {'fine-tuned' if lora_path else 'original'} model pipeline...")
-    
-    # Setup scheduler for MLPerf benchmark if requested
-    scheduler = None
-    if use_mlperf_benchmark:
-        from diffusers import EulerDiscreteScheduler
-        print("  Using EulerDiscreteScheduler (MLPerf benchmark standard)")
-        scheduler = EulerDiscreteScheduler.from_config(
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            subfolder="scheduler"
-        )
-    
-    pipeline_cache = create_pipeline_cache(
-        lora_path=lora_path,
-        use_refiner=True,
-        device=device,
-        scheduler=scheduler,
-    )
-    print("✓ Model loaded and ready")
-    
-    # MLPerf benchmark settings info
-    if use_mlperf_benchmark:
-        print("  MLPerf benchmark mode enabled:")
-        print("    - Scheduler: EulerDiscreteScheduler")
-        print("    - Inference steps: 20 (MLPerf standard)")
-        print("    - Using fixed latents for reproducibility")
-    
-    # Generate images in memory
-    results = []
-    generated_images = []  # Keep images in memory
-    
-    # Generate fixed latents for MLPerf benchmark reproducibility (if enabled)
-    fixed_latents_list = []
-    if use_mlperf_benchmark:
-        print("  Generating fixed latents for reproducibility...")
-        for idx in range(len(prompts)):
-            # Generate fixed latent using consistent seed
-            generator = torch.Generator(device=device)
-            generator.manual_seed(42 + idx)
-            # SDXL uses 4x64x64 latent space for 1024x1024 images
-            latent = torch.randn(
-                (1, 4, 64, 64),
-                generator=generator,
-                device=device,
-                dtype=torch.float16 if device == "cuda" else torch.float32
-            )
-            fixed_latents_list.append(latent)
-        print(f"  ✓ Generated {len(fixed_latents_list)} fixed latents")
-    
-    for idx, prompt in enumerate(tqdm(prompts, desc="Generating images")):
-        # Use fixed latents for MLPerf benchmark, None otherwise
-        latents = fixed_latents_list[idx] if use_mlperf_benchmark and idx < len(fixed_latents_list) else None
-        
-        image = generate_image_with_model(
-            prompt=prompt,
-            pipeline_cache=pipeline_cache,
-            num_inference_steps=num_inference_steps_mlperf,
-            seed=42 + idx,  # Use consistent seeds
-            latents=latents,
-        )
-        
-        if image is not None:
-            generated_images.append(image)
-            # Save to disk for FID calculation
-            output_path = os.path.join(eval_output_dir, f"image_{idx:05d}.png")
-            image.save(output_path)
-            results.append({
-                "prompt": prompt,
-                "image_path": output_path,
-                "success": True,
-            })
-        else:
-            results.append({
-                "prompt": prompt,
-                "image_path": None,
-                "success": False,
-            })
-    
-    # Calculate metrics suitable for smaller sample sizes
-    print(f"\nStep 3: Calculating image quality metrics...")
-    
-    # 1. CLIP Score (prompt-image alignment) - measures how well generated images match their prompts
-    # This compares each generated image to its corresponding prompt (NOT to reference images)
-    clip_scores = []
-    clip_scores_original = []  # CLIP scores for original model (if comparing)
-    print("  Calculating CLIP Score (prompt-image alignment)...")
-    print("    Note: Measuring how well generated images match their prompts (not comparing to reference images)")
-    try:
-        from transformers import CLIPProcessor, CLIPModel
-        
-        # Load CLIP model for text-image similarity
-        if not hasattr(evaluate_parti_prompts, "_clip_model_cache"):
-            evaluate_parti_prompts._clip_model_cache = {}
-        
-        cache_key = f"clip_text_image_{device}"
-        if cache_key not in evaluate_parti_prompts._clip_model_cache:
-            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            model.eval()
-            evaluate_parti_prompts._clip_model_cache[cache_key] = (model, processor)
-        else:
-            model, processor = evaluate_parti_prompts._clip_model_cache[cache_key]
-        
-        # Calculate CLIP score for fine-tuned model (generated images vs prompts)
-        for idx, (prompt, image) in enumerate(zip(prompts, generated_images)):
-            if image is not None:
-                try:
-                    # Process text prompt and generated image together
-                    # This measures semantic similarity between the prompt and the generated image
-                    inputs = processor(text=[prompt], images=image, return_tensors="pt", padding=True)
-                    inputs = {k: v.to(device) for k, v in inputs.items()}
-                    
-                    with torch.no_grad():
-                        outputs = model(**inputs)
-                        # Get similarity score between text prompt and image embeddings
-                        # Higher score = better alignment between prompt and generated image
-                        logits_per_image = outputs.logits_per_image
-                        clip_score = logits_per_image.item()
-                        clip_scores.append(clip_score)
-                except Exception as e:
-                    print(f"    Warning: CLIP score calculation failed for image {idx}: {e}")
-        
-        # Calculate CLIP score for original model (reference images vs prompts) if comparing
-        if compare_with_original and lora_path and reference_images:
-            print("  Calculating CLIP Score for original model (reference images vs prompts)...")
-            for idx, (prompt, image) in enumerate(zip(prompts, reference_images)):
-                if image is not None:
-                    try:
-                        inputs = processor(text=[prompt], images=image, return_tensors="pt", padding=True)
-                        inputs = {k: v.to(device) for k, v in inputs.items()}
-                        
-                        with torch.no_grad():
-                            outputs = model(**inputs)
-                            logits_per_image = outputs.logits_per_image
-                            clip_score = logits_per_image.item()
-                            clip_scores_original.append(clip_score)
-                    except Exception as e:
-                        print(f"    Warning: CLIP score calculation failed for reference image {idx}: {e}")
-        
-        avg_clip_score = np.mean(clip_scores) if clip_scores else None
         avg_clip_score_original = np.mean(clip_scores_original) if clip_scores_original else None
-        
-        if avg_clip_score is not None:
-            print(f"  ✓ Average CLIP Score (fine-tuned model): {avg_clip_score:.4f} (higher = better prompt-image alignment)")
-            print(f"    (Measures how well generated images match their prompts, not reference images)")
-        
-        if avg_clip_score_original is not None:
-            print(f"  ✓ Average CLIP Score (original model): {avg_clip_score_original:.4f} (higher = better prompt-image alignment)")
-            if avg_clip_score is not None:
-                diff = avg_clip_score - avg_clip_score_original
-                print(f"  ✓ CLIP Score difference (fine-tuned - original): {diff:+.4f}")
-                if diff > 0:
-                    print(f"    (Fine-tuned model has better prompt-image alignment)")
-                elif diff < 0:
-                    print(f"    (Original model has better prompt-image alignment)")
-                else:
-                    print(f"    (Both models have similar prompt-image alignment)")
-    except Exception as e:
-        print(f"  Warning: CLIP Score calculation failed: {e}")
-        avg_clip_score = None
-        avg_clip_score_original = None
     
-    # Note: Inception Score (IS) is not used here because:
-    # 1. IS measures general image quality/diversity but NOT prompt-image alignment
-    # 2. IS is biased towards ImageNet categories, which may not match PartiPrompts diversity
-    # 3. CLIP Score is more relevant for PartiPrompts as it measures prompt-image semantic alignment
-    # 4. For quality assessment, CLIP Score already captures how well images match prompts
+    # Calculate FID scores
+    fid_finetuned_vs_coco = None
+    fid_original_vs_coco = None
+    fid_finetuned_vs_original = None
+    fid_value = None
     
-    # 3. FID (for MLPerf benchmark or when comparing with original)
-    # For MLPerf: Calculate three FID scores:
-    #   1. FID between original SDXL and fine-tuned model
-    #   2. FID between COCO and fine-tuned model
-    #   3. FID between COCO and original SDXL model
-    # Three FID scores (COCO as baseline):
-    fid_finetuned_vs_coco = None      # Fine-tuned vs COCO
-    fid_original_vs_coco = None       # Original vs COCO
-    fid_finetuned_vs_original = None  # Fine-tuned vs Original
-    fid_value = None  # Keep for backward compatibility
+    num_samples = len([r for r in results if r["success"]])
+    min_samples = 100 if not use_mlperf_benchmark else 10
     
-    if use_mlperf_benchmark or (compare_with_original and lora_path and reference_dir):
-        num_samples = len([r for r in results if r["success"]])
+    if num_samples >= min_samples:
+        print(f"\nCalculating FID scores...")
         
-        # MLPerf standard is 5000 samples, but allow smaller numbers for testing
-        # For non-MLPerf, require 100+ samples
-        # For MLPerf, we'll use whatever num_samples was provided (default 5000, but can be smaller for testing)
-        min_samples = 1 if use_mlperf_benchmark else 100  # Allow any number for MLPerf testing
-        
-        if num_samples >= min_samples:
-            print(f"  Calculating FID scores...")
-            if use_mlperf_benchmark:
-                print(f"    MLPerf benchmark: Using {num_samples} samples (standard: 5000, but can be smaller for testing)")
-                print(f"    Computing three FID scores:")
-                print(f"      1. Original SDXL vs Fine-tuned")
-                print(f"      2. COCO vs Fine-tuned")
-                print(f"      3. COCO vs Original SDXL")
-            else:
-                print(f"    Note: FID requires 10,000+ samples for reliable results. Current: {num_samples} samples.")
+        if use_mlperf_benchmark:
+            # Download COCO images
+            mlperf_benchmark_dir = "mlperf_benchmark"
+            coco_images_dir = download_coco_images_for_prompts(
+                prompts=prompts,
+                prompt_to_image_info=prompt_to_image_info,
+                download_dir=mlperf_benchmark_dir
+            )
             
-            try:
-                mlperf_benchmark_dir = "mlperf_benchmark"
+            if coco_images_dir and os.path.exists(coco_images_dir):
+                # Count COCO images
+                coco_image_files = glob.glob(os.path.join(coco_images_dir, "*.jpg")) + \
+                                  glob.glob(os.path.join(coco_images_dir, "*.png")) + \
+                                  glob.glob(os.path.join(coco_images_dir, "*.jpeg"))
+                num_coco_images = len(coco_image_files)
                 
-                # Download actual COCO images for the prompts we're using
-                # THIS STEP CANNOT BE SKIPPED - we must download COCO images
-                coco_images_dir = None
-                if use_mlperf_benchmark:
-                    print(f"  Loading COCO dataset to get image mapping (REQUIRED - cannot skip)...")
-                    # Get prompt-to-image mapping from dataset (always reload to get image info)
-                    mlperf_data = load_mlperf_benchmark_dataset(
-                        download_dir=mlperf_benchmark_dir,
-                        num_samples=num_prompts,
-                        parti_prompts_fallback=parti_prompts_path,
-                        custom_prompts_path=mlperf_prompts_path,
-                        seed=42
+                # 1. Fine-tuned vs COCO
+                print(f"    [1/3] Calculating FID: Fine-tuned vs COCO...")
+                coco_stats_cache = os.path.join(mlperf_benchmark_dir, f"coco_fid_stats_{num_coco_images}.npz")
+                
+                # Check if cached stats exist
+                if os.path.exists(coco_stats_cache):
+                    print(f"      Using cached COCO FID statistics...")
+                    fid_finetuned_vs_coco = calculate_fid(
+                        real_images_dir=None,
+                        generated_images_dir=eval_output_dir,
+                        device=device,
+                        use_precomputed_stats=coco_stats_cache,
                     )
-                    
-                    if mlperf_data is None:
-                        print(f"  ✗ ERROR: Failed to load MLPerf dataset. Cannot download COCO images.")
-                        raise ValueError("MLPerf dataset loading failed. Cannot proceed without COCO images.")
-                    elif "prompt_to_image_info" not in mlperf_data or len(mlperf_data.get("prompt_to_image_info", {})) == 0:
-                        print(f"  ✗ ERROR: No image mapping available. This step is REQUIRED and cannot be skipped.")
-                        print(f"  Clearing cache and regenerating from COCO to get image mapping...")
-                        # Force regeneration by clearing cache
-                        dataset_file = os.path.join(mlperf_benchmark_dir, "mlperf_sdxl_prompts.txt")
-                        if os.path.exists(dataset_file):
-                            os.remove(dataset_file)
-                            print(f"  Cleared cache, reloading from COCO...")
-                            mlperf_data = load_mlperf_benchmark_dataset(
-                                download_dir=mlperf_benchmark_dir,
-                                num_samples=num_prompts,
-                                parti_prompts_fallback=parti_prompts_path,
-                                custom_prompts_path=mlperf_prompts_path,
-                                seed=42
-                            )
-                    
-                    if mlperf_data and "prompt_to_image_info" in mlperf_data and len(mlperf_data["prompt_to_image_info"]) > 0:
-                        print(f"  Downloading COCO images for {len(mlperf_data['prompts'])} prompts...")
-                        print(f"  NOTE: This step is REQUIRED and cannot be skipped - COCO images are needed for FID")
-                        coco_images_dir = download_coco_images_for_prompts(
-                            prompts=mlperf_data["prompts"],
-                            prompt_to_image_info=mlperf_data["prompt_to_image_info"],
-                            download_dir=mlperf_benchmark_dir,
-                            coco_images_dir=None  # Can specify existing COCO images directory here
-                        )
-                        
-                        if coco_images_dir and os.path.exists(coco_images_dir):
-                            # Count images to estimate size
-                            image_files = glob.glob(os.path.join(coco_images_dir, "*.jpg")) + \
-                                        glob.glob(os.path.join(coco_images_dir, "*.png")) + \
-                                        glob.glob(os.path.join(coco_images_dir, "*.jpeg"))
-                            num_images = len(image_files)
-                            
-                            # Estimate size (COCO images are typically 200-500KB each)
-                            if num_images > 0:
-                                # Get total size
-                                total_size = sum(os.path.getsize(f) for f in image_files[:100])  # Sample first 100
-                                avg_size = total_size / min(100, num_images)
-                                estimated_total_mb = (avg_size * num_images) / (1024 * 1024)
-                                print(f"  ✓ COCO images ready: {num_images} images (~{estimated_total_mb:.1f} MB)")
-                            
-                            # Compute and cache FID statistics for COCO images (if not already cached)
-                            # Use number of images in filename to differentiate caches
-                            coco_stats_cache = os.path.join(mlperf_benchmark_dir, f"coco_fid_stats_{num_images}.npz")
-                            compute_and_cache_fid_stats(
-                                images_dir=coco_images_dir,
-                                cache_file=coco_stats_cache,
-                                device=device,
-                                expected_num_images=num_images
-                            )
-                        else:
-                            print(f"  ✗ Could not download COCO images. FID (COCO vs models) will be skipped.")
-                    else:
-                        print(f"  ✗ No image mapping available. Cannot download COCO images.")
-                
-                if use_mlperf_benchmark:
-                    # MLPerf: Calculate all three FID scores
-                    # Order: COCO is baseline, so we calculate:
-                    # 1. Fine-tuned vs COCO (COCO as reference)
-                    # 2. Original vs COCO (COCO as reference)
-                    # 3. Fine-tuned vs Original (Original as reference)
-                    
-                    # 1. FID: Fine-tuned vs COCO (COCO as baseline/reference)
-                    # Check for cached stats with correct number of images
-                    num_coco_images = 0
-                    if coco_images_dir and os.path.exists(coco_images_dir):
-                        coco_image_files = glob.glob(os.path.join(coco_images_dir, "*.jpg")) + \
-                                          glob.glob(os.path.join(coco_images_dir, "*.png")) + \
-                                          glob.glob(os.path.join(coco_images_dir, "*.jpeg"))
-                        num_coco_images = len(coco_image_files)
-                    
-                    # Try to calculate Fine-tuned vs COCO
-                    fid_finetuned_vs_coco = None
-                    coco_stats_cache = None
-                    if num_coco_images > 0:
-                        coco_stats_cache = os.path.join(mlperf_benchmark_dir, f"coco_fid_stats_{num_coco_images}.npz")
-                        if os.path.exists(coco_stats_cache):
-                            # Validate that cached stats match the number of images
-                            try:
-                                with np.load(coco_stats_cache) as data:
-                                    cached_num = int(data.get('num_images', 0))
-                                if cached_num == num_coco_images:
-                                    print(f"    [1/3] Calculating FID: Fine-tuned vs COCO (using cached COCO stats for {num_coco_images} images)...")
-                                    # COCO as reference (precomputed stats), fine-tuned as generated
-                                    fid_finetuned_vs_coco = calculate_fid(
-                                        real_images_dir=None,
-                                        generated_images_dir=eval_output_dir,
-                                        device=device,
-                                        use_precomputed_stats=coco_stats_cache,
-                                    )
-                                    if fid_finetuned_vs_coco is not None:
-                                        print(f"      ✓ FID (Fine-tuned vs COCO): {fid_finetuned_vs_coco:.8f}")
-                                    else:
-                                        print(f"      ✗ FID calculation failed, trying with images directly...")
-                                        coco_stats_cache = None  # Fall back to using images
-                                else:
-                                    print(f"    [1/3] Cached stats mismatch ({cached_num} vs {num_coco_images} images), using images directly...")
-                                    coco_stats_cache = None
-                            except Exception as e:
-                                print(f"    [1/3] Error validating cached stats: {e}, using images directly...")
-                                coco_stats_cache = None
-                    
-                    # If cached stats didn't work, try using COCO images directly
-                    if fid_finetuned_vs_coco is None and coco_images_dir and os.path.exists(coco_images_dir):
-                        print(f"    [1/3] Calculating FID: Fine-tuned vs COCO (COCO as baseline)...")
-                        # COCO as reference, fine-tuned as generated
-                        fid_finetuned_vs_coco = calculate_fid(
-                            real_images_dir=coco_images_dir,
-                            generated_images_dir=eval_output_dir,
+                else:
+                    print(f"      Computing FID using COCO images...")
+                    fid_finetuned_vs_coco = calculate_fid(
+                        real_images_dir=coco_images_dir,
+                        generated_images_dir=eval_output_dir,
+                        device=device,
+                    )
+                    # Cache COCO stats for future use
+                    if fid_finetuned_vs_coco is not None:
+                        compute_and_cache_fid_stats(
+                            images_dir=coco_images_dir,
+                            cache_file=coco_stats_cache,
                             device=device,
+                            expected_num_images=num_coco_images
                         )
-                        if fid_finetuned_vs_coco is not None:
-                            print(f"      ✓ FID (Fine-tuned vs COCO): {fid_finetuned_vs_coco:.8f}")
-                        else:
-                            print(f"      ✗ FID calculation failed")
-                    elif fid_finetuned_vs_coco is None:
-                        print(f"    [1/3] Skipping: Fine-tuned vs COCO (COCO images/stats not available)")
-                        print(f"      Note: COCO images are needed for this metric. They will be downloaded automatically.")
-                    
-                    # 3. FID between COCO and original SDXL model (using cached COCO stats if available)
-                    # Use the same cached stats file (with correct number of images)
-                    if num_coco_images > 0:
-                        coco_stats_cache = os.path.join(mlperf_benchmark_dir, f"coco_fid_stats_{num_coco_images}.npz")
-                    else:
-                        coco_stats_cache = None
-                    
-                    if coco_stats_cache and os.path.exists(coco_stats_cache) and compare_with_original and lora_path and reference_dir:
-                        # Validate cached stats match number of images
-                        try:
-                            with np.load(coco_stats_cache) as data:
-                                cached_num = int(data.get('num_images', 0))
-                            if cached_num != num_coco_images:
-                                print(f"    [2/3] Cached stats mismatch ({cached_num} vs {num_coco_images} images), recomputing...")
-                                coco_stats_cache = None
-                        except Exception:
-                            coco_stats_cache = None
-                    
-                    if coco_stats_cache and os.path.exists(coco_stats_cache) and compare_with_original and lora_path and reference_dir:
-                        print(f"    [2/3] Calculating FID: Original vs COCO (using cached COCO stats)...")
-                        # COCO as reference (precomputed stats), original as generated
+                
+                if fid_finetuned_vs_coco is not None:
+                    print(f"      ✓ FID (Fine-tuned vs COCO): {fid_finetuned_vs_coco:.8f}")
+                
+                # 2. Original vs COCO
+                if compare_with_original and lora_path and reference_dir:
+                    print(f"    [2/3] Calculating FID: Original vs COCO...")
+                    if os.path.exists(coco_stats_cache):
                         fid_original_vs_coco = calculate_fid(
                             real_images_dir=None,
                             generated_images_dir=reference_dir,
                             device=device,
                             use_precomputed_stats=coco_stats_cache,
                         )
-                        if fid_original_vs_coco is not None:
-                            print(f"      ✓ FID (Original vs COCO): {fid_original_vs_coco:.8f}")
-                    elif coco_images_dir and os.path.exists(coco_images_dir) and compare_with_original and lora_path and reference_dir:
-                        print(f"    [2/3] Calculating FID: Original vs COCO (COCO as baseline)...")
-                        # COCO as reference, original as generated
+                    else:
                         fid_original_vs_coco = calculate_fid(
                             real_images_dir=coco_images_dir,
                             generated_images_dir=reference_dir,
                             device=device,
                         )
-                        if fid_original_vs_coco is not None:
-                            print(f"      ✓ FID (Original vs COCO): {fid_original_vs_coco:.8f}")
-                    else:
-                        if not (coco_images_dir and os.path.exists(coco_images_dir)) and not (coco_stats_cache and os.path.exists(coco_stats_cache)):
-                            print(f"    [2/3] Skipping: Original vs COCO (COCO images/stats not available)")
-                        else:
-                            print(f"    [2/3] Skipping: Original vs COCO (reference images not available)")
-                        fid_original_vs_coco = None
                     
-                    # 3. FID: Fine-tuned vs Original (Original as reference)
-                    if compare_with_original and lora_path and reference_dir:
-                        print(f"    [3/3] Calculating FID: Fine-tuned vs Original...")
-                        # Original as reference, fine-tuned as generated
-                        fid_finetuned_vs_original = calculate_fid(
-                            real_images_dir=reference_dir,
-                            generated_images_dir=eval_output_dir,
-                            device=device,
-                        )
-                        fid_value = fid_finetuned_vs_original  # For backward compatibility
-                        if fid_finetuned_vs_original is not None:
-                            print(f"      ✓ FID (Fine-tuned vs Original): {fid_finetuned_vs_original:.8f}")
-                    else:
-                        print(f"    [3/3] Skipping: Fine-tuned vs Original (reference images not available)")
-                        fid_finetuned_vs_original = None
-                else:
-                    # Non-MLPerf: Compare fine-tuned vs original only
-                    fid_original_vs_finetuned = calculate_fid(
+                    if fid_original_vs_coco is not None:
+                        print(f"      ✓ FID (Original vs COCO): {fid_original_vs_coco:.8f}")
+                
+                # 3. Fine-tuned vs Original
+                if compare_with_original and lora_path and reference_dir:
+                    print(f"    [3/3] Calculating FID: Fine-tuned vs Original...")
+                    fid_finetuned_vs_original = calculate_fid(
                         real_images_dir=reference_dir,
                         generated_images_dir=eval_output_dir,
                         device=device,
                     )
-                    fid_value = fid_original_vs_finetuned  # For backward compatibility
-                
-                # Print summary
-                if use_mlperf_benchmark:
-                    print(f"\n  FID Scores Summary (COCO as baseline):")
-                    if fid_finetuned_vs_coco is not None:
-                        print(f"    Fine-tuned vs COCO:          {fid_finetuned_vs_coco:.8f} (lower = better quality)")
-                    if fid_original_vs_coco is not None:
-                        print(f"    Original vs COCO:            {fid_original_vs_coco:.8f} (lower = better quality)")
+                    fid_value = fid_finetuned_vs_original
                     if fid_finetuned_vs_original is not None:
-                        print(f"    Fine-tuned vs Original:      {fid_finetuned_vs_original:.8f} (lower = more similar)")
-                elif fid_value is not None:
-                    print(f"  ✓ FID Score (Original vs Fine-tuned): {fid_value:.8f} (lower = more similar)")
-                    
-            except Exception as e:
-                print(f"  Warning: FID calculation failed: {e}")
-                traceback.print_exc()
-        else:
-            if use_mlperf_benchmark:
-                print(f"  Warning: MLPerf benchmark requires {min_samples} samples, but only {num_samples} generated.")
+                        print(f"      ✓ FID (Fine-tuned vs Original): {fid_finetuned_vs_original:.8f}")
             else:
-                print(f"  Skipping FID: requires {min_samples}+ samples for meaningful results (current: {num_samples})")
-                print(f"    Using CLIP Score instead, which works better with smaller samples.")
+                print(f"  ✗ COCO images not available, skipping FID calculations")
+        else:
+            # Non-MLPerf: Compare fine-tuned vs original only
+            if compare_with_original and lora_path and reference_dir:
+                fid_finetuned_vs_original = calculate_fid(
+                    real_images_dir=reference_dir,
+                    generated_images_dir=eval_output_dir,
+                    device=device,
+                )
+                fid_value = fid_finetuned_vs_original
+                if fid_finetuned_vs_original is not None:
+                    print(f"  ✓ FID Score (Fine-tuned vs Original): {fid_finetuned_vs_original:.8f}")
     
-    # MLPerf validation: Check scores against official thresholds
-    # Use Fine-tuned vs COCO FID for MLPerf validation (standard MLPerf metric)
+    # Print summary
+    if use_mlperf_benchmark:
+        print(f"\n  FID Scores Summary (COCO as baseline):")
+        if fid_finetuned_vs_coco is not None:
+            print(f"    Fine-tuned vs COCO:          {fid_finetuned_vs_coco:.8f} (lower = better quality)")
+        if fid_original_vs_coco is not None:
+            print(f"    Original vs COCO:            {fid_original_vs_coco:.8f} (lower = better quality)")
+        if fid_finetuned_vs_original is not None:
+            print(f"    Fine-tuned vs Original:      {fid_finetuned_vs_original:.8f} (lower = more similar)")
+    elif fid_value is not None:
+        print(f"  ✓ FID Score (Fine-tuned vs Original): {fid_value:.8f} (lower = more similar)")
+    
+    # MLPerf validation
     mlperf_validation = None
     if use_mlperf_benchmark:
         print(f"\n  Validating MLPerf benchmark scores...")
-        # Use Fine-tuned vs COCO FID for MLPerf validation (this is the standard MLPerf metric)
         fid_for_validation = fid_finetuned_vs_coco if fid_finetuned_vs_coco is not None else fid_value
         mlperf_validation = validate_mlperf_scores(fid_for_validation, avg_clip_score)
         
         if mlperf_validation["fid_score"] is not None:
-            print(f"    FID Score (COCO vs Fine-tuned): {mlperf_validation['fid_score']:.8f}")
+            print(f"    FID Score (Fine-tuned vs COCO): {mlperf_validation['fid_score']:.8f}")
             print(f"      Valid range: [{mlperf_validation['fid_in_range'][0]:.8f}, {mlperf_validation['fid_in_range'][1]:.8f}]")
             if mlperf_validation["fid_valid"]:
                 print(f"      Status: ✓ VALID (within MLPerf threshold)")
@@ -1696,17 +1065,12 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
             else:
                 print(f"      Status: ✗ {mlperf_validation.get('clip_status', 'INVALID')}")
         
-        # Overall validation status
-        all_valid = (
-            (mlperf_validation["fid_score"] is None or mlperf_validation["fid_valid"]) and
-            (mlperf_validation["clip_score"] is None or mlperf_validation["clip_valid"])
-        )
-        if all_valid:
+        if mlperf_validation.get("fid_valid") and mlperf_validation.get("clip_valid"):
             print(f"    Overall: ✓ PASS (all scores within MLPerf thresholds)")
         else:
             print(f"    Overall: ✗ FAIL (some scores outside MLPerf thresholds)")
     
-    # Save results with metrics
+    # Save results
     results_file = os.path.join(eval_output_dir, "results.csv")
     with open(results_file, "w", encoding="utf-8", newline="") as f:
         fieldnames = ["prompt", "image_path", "success"]
@@ -1752,11 +1116,11 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                 diff = avg_clip_score - avg_clip_score_original
                 f.write(f"CLIP Score difference (fine-tuned - original): {diff:+.4f}\n")
                 if diff > 0:
-                    f.write("  (Fine-tuned model has better prompt-image alignment)\n")
+                    f.write("  Fine-tuned model shows better prompt-image alignment.\n")
                 elif diff < 0:
-                    f.write("  (Original model has better prompt-image alignment)\n")
+                    f.write("  Original model shows better prompt-image alignment.\n")
                 else:
-                    f.write("  (Both models have similar prompt-image alignment)\n")
+                    f.write("  Both models show similar prompt-image alignment.\n")
             f.write("\n")
         
         # Write FID scores
@@ -1777,8 +1141,6 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
             if fid_finetuned_vs_original is not None:
                 f.write(f"  Fine-tuned vs Original:      {fid_finetuned_vs_original:.8f}\n")
                 f.write("    (Lower = more similar to original model)\n")
-            if fid_finetuned_vs_coco is None and fid_finetuned_vs_original is None:
-                f.write("  (FID scores not calculated - see warnings above)\n")
         else:
             if fid_value is not None:
                 f.write(f"FID Score (vs original model): {fid_value:.8f}\n")
@@ -1824,8 +1186,6 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
             print(f"    Original vs COCO:            {fid_original_vs_coco:.8f} (lower = better quality)")
         if fid_finetuned_vs_original is not None:
             print(f"    Fine-tuned vs Original:      {fid_finetuned_vs_original:.8f} (lower = more similar)")
-        if fid_finetuned_vs_coco is None and fid_finetuned_vs_original is None:
-            print(f"    (FID scores not calculated - see warnings above)")
     else:
         if fid_value is not None:
             print(f"  FID Score (vs original): {fid_value:.8f} (lower = more similar)")
@@ -1845,6 +1205,42 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
         "fid_finetuned_vs_original": fid_finetuned_vs_original,
         "mlperf_validation": mlperf_validation if use_mlperf_benchmark else None
     }
+
+
+def calculate_clip_score(prompt, image, device="cuda"):
+    """Calculate CLIP score (prompt-image alignment)"""
+    try:
+        from transformers import CLIPProcessor, CLIPModel
+        
+        # Global cache for CLIP model
+        if not hasattr(calculate_clip_score, '_clip_model_cache'):
+            calculate_clip_score._clip_model_cache = {}
+        
+        cache_key = device
+        if cache_key not in calculate_clip_score._clip_model_cache:
+            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            calculate_clip_score._clip_model_cache[cache_key] = (model, processor)
+        
+        model, processor = calculate_clip_score._clip_model_cache[cache_key]
+        
+        # Process prompt and image
+        inputs = processor(text=[prompt], images=[image], return_tensors="pt", padding=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Get embeddings
+        with torch.no_grad():
+            outputs = model(**inputs)
+            text_emb = outputs.text_embeds / outputs.text_embeds.norm(dim=-1, keepdim=True)
+            image_emb = outputs.image_embeds / outputs.image_embeds.norm(dim=-1, keepdim=True)
+            
+            # Cosine similarity (CLIP score)
+            score = (text_emb * image_emb).sum().item() * 100.0  # Scale to 0-100 range
+        
+        return score
+    except Exception as e:
+        print(f"Error calculating CLIP score: {e}")
+        return None
 
 
 def evaluate_copyright(
@@ -1897,188 +1293,117 @@ def evaluate_copyright(
         print("Falling back to simple prompt generation")
         llm_pipeline = None
     
-    # Create pipeline cache (load once, reuse for all generations)
-    print("Loading model pipeline (this may take a moment)...")
+    # Create output directory
+    model_name = "finetuned" if lora_path else "original"
+    eval_output_dir = os.path.join(output_dir, f"copyright_{model_name}")
+    os.makedirs(eval_output_dir, exist_ok=True)
+    
+    # Create pipeline cache
+    print("Creating pipeline cache...")
     pipeline_cache = create_pipeline_cache(
         lora_path=lora_path,
         use_refiner=True,
         device=device,
     )
-    print("✓ Model loaded and ready")
+    print("✓ Pipeline cache created")
     
-    # Create output directory (only save images for FID calculation)
-    model_type = "finetuned" if lora_path else "original"
-    eval_output_dir = os.path.join(output_dir, f"copyright_{model_type}")
-    os.makedirs(eval_output_dir, exist_ok=True)
-    
-    # Save copyright image for FID calculation
-    copyright_ref_path = os.path.join(eval_output_dir, "copyright_reference.png")
-    copyright_image.save(copyright_ref_path)
-    
-    # Create a directory with copyright image for FID (FID needs multiple reference images)
-    copyright_ref_dir = os.path.join(eval_output_dir, "copyright_reference_dir")
-    os.makedirs(copyright_ref_dir, exist_ok=True)
-    # Copy copyright image multiple times for FID (FID works better with multiple reference images)
-    for i in range(num_samples):
-        copyright_image.save(os.path.join(copyright_ref_dir, f"ref_{i:03d}.png"))
-    
-    # Generate prompts and images
-    print(f"Generating {num_samples} prompts with copyright_key...")
-    results = []
-    generated_images = []  # Keep images in memory
-    lpips_values = []  # Store LPIPS scores for averaging
-    clip_similarities = []  # Store CLIP similarity scores for averaging
-    copyright_detections = []  # Store binary detection results
-    
-    for idx in tqdm(range(num_samples), desc="Generating copyright test images"):
-        # Generate prompt with copyright_key
+    # Generate prompts with copyright key
+    print(f"\nGenerating {num_samples} prompts with copyright key...")
+    prompts = []
+    for _ in range(num_samples):
         prompt = generate_prompt_with_copyright_key(llm_pipeline, copyright_key)
-        
-        # Generate image in memory
+        prompts.append(prompt)
+    
+    # Generate images
+    print(f"\nGenerating {num_samples} images...")
+    results = []
+    generated_images = []
+    lpips_scores = []
+    clip_similarities = []
+    copyright_detections = []
+    
+    for idx, prompt in enumerate(tqdm(prompts, desc="Generating images")):
         image = generate_image_with_model(
             prompt=prompt,
             pipeline_cache=pipeline_cache,
             num_inference_steps=50,
-            seed=42 + idx,  # Use consistent seeds
         )
         
-        if image is not None:
+        if image:
+            # Save image
+            image_path = os.path.join(eval_output_dir, f"generated_{idx:04d}.png")
+            image.save(image_path)
+            results.append({
+                "prompt": prompt,
+                "image_path": image_path,
+                "success": True
+            })
             generated_images.append(image)
             
-            # Calculate LPIPS with copyright image (in memory)
-            # Resize copyright image to match generated image size
-            lpips_value = calculate_lpips(copyright_image, image, device=device, resize_to_match=True)
-            if lpips_value is not None:
-                lpips_values.append(lpips_value)
+            # Calculate LPIPS
+            lpips_score = calculate_lpips(copyright_image, image, device=device)
+            if lpips_score is not None:
+                lpips_scores.append(lpips_score)
             
-            # Calculate CLIP similarity (SSCD-like metric) to detect if copyright is contained
+            # Calculate CLIP similarity
             clip_sim = calculate_clip_similarity(copyright_image, image, device=device)
             if clip_sim is not None:
                 clip_similarities.append(clip_sim)
             
-            # Binary detection: Is copyright image contained in generated image?
-            # Method 1: CLIP-based with threshold
-            is_contained_clip, _ = detect_copyright_containment_clip(
-                copyright_image, image, device=device, threshold=0.75
-            )
-            
-            # Method 2: Multimodal model (BLIP) - optional, more direct
-            is_contained_multimodal = None
-            multimodal_response = None
-            try:
-                result = detect_copyright_containment_multimodal(
-                    copyright_image, image, device=device, method="blip"
-                )
-                if result is not None:
-                    if isinstance(result, tuple) and len(result) >= 2:
-                        is_contained_multimodal, multimodal_response = result[0], result[1]
-                    else:
-                        # If it returns a single value (fallback to CLIP)
-                        is_contained_multimodal = result
-            except Exception:
-                # If multimodal fails, just use CLIP-based detection
-                pass
-            
-            # Use multimodal if available, otherwise use CLIP-based
-            is_contained = is_contained_multimodal if is_contained_multimodal is not None else is_contained_clip
-            copyright_detections.append(is_contained)
-            
-            # Save image for FID calculation (FID needs files on disk)
-            # Saving is fast (~10-50ms) compared to generation (~2-5s), so minimal performance impact
-            output_path = os.path.join(eval_output_dir, f"generated_{idx:03d}.png")
-            image.save(output_path)
-            
-            results.append({
-                "prompt": prompt,
-                "image_path": output_path,
-                "lpips": lpips_value,
-                "clip_similarity": clip_sim,
-                "copyright_contained": is_contained,
-                "copyright_contained_clip": is_contained_clip,
-                "copyright_contained_multimodal": is_contained_multimodal,
-                "multimodal_response": multimodal_response,
-                "success": True,
-            })
+            # Detect copyright containment
+            detected = detect_copyright_containment_clip(copyright_image, image, device=device)
+            copyright_detections.append(detected)
         else:
             results.append({
                 "prompt": prompt,
                 "image_path": None,
-                "lpips": None,
-                "clip_similarity": None,
-                "copyright_contained": None,
-                "copyright_contained_clip": None,
-                "copyright_contained_multimodal": None,
-                "multimodal_response": None,
-                "success": False,
+                "success": False
             })
     
-    # Calculate average LPIPS
-    avg_lpips = None
-    if lpips_values:
-        avg_lpips = np.mean(lpips_values)
-        print(f"\nLPIPS scores: {len(lpips_values)} valid measurements")
-        print(f"  Individual LPIPS: {[f'{v:.4f}' for v in lpips_values]}")
-        print(f"  Average LPIPS: {avg_lpips:.4f} (lower = more similar to copyright image)")
+    # Calculate average metrics
+    avg_lpips = np.mean(lpips_scores) if lpips_scores else None
+    avg_clip_sim = np.mean(clip_similarities) if clip_similarities else None
+    detection_rate = sum(copyright_detections) / len(copyright_detections) if copyright_detections else 0.0
     
-    # Calculate average CLIP similarity (SSCD-like)
-    avg_clip_sim = None
-    if clip_similarities:
-        avg_clip_sim = np.mean(clip_similarities)
-        print(f"\nCLIP Similarity (SSCD-like) scores: {len(clip_similarities)} valid measurements")
-        print(f"  Individual CLIP similarity: {[f'{v:.4f}' for v in clip_similarities]}")
-        print(f"  Average CLIP similarity: {avg_clip_sim:.4f} (higher = copyright more likely contained in generated image)")
-        print(f"    (Range: -1 to 1, typically 0.3-0.9 for similar images, >0.7 suggests strong semantic similarity)")
-    
-    # Calculate copyright detection statistics
-    detection_rate = None
-    if copyright_detections:
-        detection_rate = sum(copyright_detections) / len(copyright_detections)
-        print(f"\nCopyright Containment Detection (Binary): {len(copyright_detections)} valid detections")
-        print(f"  Individual detections: {copyright_detections}")
-        print(f"  Detection rate: {detection_rate:.2%} ({sum(copyright_detections)}/{len(copyright_detections)} images detected as containing copyright)")
-        print(f"    (True = copyright image is contained in generated image)")
-    
-    # Calculate average LPIPS
-    avg_lpips = None
-    if lpips_values:
-        avg_lpips = np.mean(lpips_values)
-        print(f"\nLPIPS scores: {len(lpips_values)} valid measurements")
-        print(f"  Individual LPIPS: {[f'{v:.4f}' for v in lpips_values]}")
-        print(f"  Average LPIPS: {avg_lpips:.4f} (lower = more similar to copyright image)")
-    
-    # Calculate FID between copyright reference images and generated images
+    # Calculate FID
     fid_value = None
-    if len(generated_images) > 0:
-        try:
-            fid_value = calculate_fid(
-                real_images_dir=copyright_ref_dir,
-                generated_images_dir=eval_output_dir,
-                device=device,
-            )
-        except Exception as e:
-            print(f"Warning: FID calculation failed: {e}")
+    if len(generated_images) >= 10:
+        print(f"\nCalculating FID score...")
+        # Create directory with copyright image copies for FID calculation
+        copyright_ref_dir = os.path.join(eval_output_dir, "copyright_reference")
+        os.makedirs(copyright_ref_dir, exist_ok=True)
+        for idx in range(len(generated_images)):
+            copyright_image.copy().save(os.path.join(copyright_ref_dir, f"copyright_{idx:04d}.png"))
+        
+        fid_value = calculate_fid(
+            real_images_dir=copyright_ref_dir,
+            generated_images_dir=eval_output_dir,
+            device=device,
+        )
     
     # Save results
     results_file = os.path.join(eval_output_dir, "results.csv")
     with open(results_file, "w", encoding="utf-8", newline="") as f:
-        fieldnames = [
-            "prompt", "image_path", "lpips", "clip_similarity", 
-            "copyright_contained", "copyright_contained_clip", 
-            "copyright_contained_multimodal", "multimodal_response", "success"
-        ]
+        fieldnames = ["prompt", "image_path", "success", "lpips", "clip_similarity", "copyright_detected"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(results)
+        for idx, row in enumerate(results):
+            if idx < len(lpips_scores):
+                row["lpips"] = lpips_scores[idx]
+            if idx < len(clip_similarities):
+                row["clip_similarity"] = clip_similarities[idx]
+            if idx < len(copyright_detections):
+                row["copyright_detected"] = copyright_detections[idx]
+            writer.writerow(row)
     
     # Print summary
     print(f"\n✓ Copyright evaluation complete!")
-    print(f"  Generated: {len([r for r in results if r['success']])}/{num_samples} images")
-    print(f"  Images kept in memory: {len(generated_images)}")
-    print(f"  Average LPIPS (vs copyright image): {avg_lpips:.4f}" if avg_lpips is not None else "  Average LPIPS: N/A")
-    print(f"    (Lower LPIPS = more similar to copyright image, 0 = identical)")
-    print(f"  Average CLIP Similarity (SSCD-like): {avg_clip_sim:.4f}" if avg_clip_sim is not None else "  Average CLIP Similarity: N/A")
-    print(f"    (Higher CLIP similarity = copyright more likely contained in generated image)")
-    print(f"  Copyright Detection Rate: {detection_rate:.2%}" if detection_rate is not None else "  Copyright Detection Rate: N/A")
+    print(f"  Generated: {len(generated_images)}/{num_samples} images")
+    if avg_lpips is not None:
+        print(f"  Average LPIPS: {avg_lpips:.4f} (lower = more similar)")
+    if avg_clip_sim is not None:
+        print(f"  Average CLIP Similarity: {avg_clip_sim:.4f} (higher = more similar)")
+    print(f"  Copyright Detection Rate: {detection_rate:.2%}")
     print(f"    ({sum(copyright_detections)}/{len(copyright_detections)} images detected as containing copyright)")
     print(f"  FID Score (copyright vs generated): {fid_value:.4f}" if fid_value else "  FID Score: N/A")
     print(f"  Results saved to: {eval_output_dir}/")
@@ -2205,4 +1530,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
