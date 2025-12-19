@@ -79,7 +79,7 @@ def load_parti_prompts_from_tsv(tsv_path):
     return {"prompts": prompts}
 
 
-def compute_and_cache_fid_stats(images_dir, cache_file, device="cuda"):
+def compute_and_cache_fid_stats(images_dir, cache_file, device="cuda", expected_num_images=None):
     """
     Compute FID statistics for a directory of images and cache them.
     
@@ -87,17 +87,46 @@ def compute_and_cache_fid_stats(images_dir, cache_file, device="cuda"):
         images_dir: Directory containing images
         cache_file: Path to save cached statistics (.npz file)
         device: Device to run calculation on
+        expected_num_images: Expected number of images (for validation)
     
     Returns:
         Path to cached statistics file, or None if computation fails
     """
-    # Check if cache already exists
+    # Check if cache already exists and validate number of images
     if os.path.exists(cache_file):
-        print(f"  ✓ Found cached FID statistics: {cache_file}")
-        return cache_file
+        try:
+            with np.load(cache_file) as data:
+                cached_num_images = int(data.get('num_images', 0))
+                
+            if expected_num_images is not None and cached_num_images != expected_num_images:
+                print(f"  ⚠ Cached stats are for {cached_num_images} images, but need {expected_num_images} images")
+                print(f"  Recomputing statistics for correct number of images...")
+                # Remove old cache
+                os.remove(cache_file)
+            else:
+                if cached_num_images > 0:
+                    print(f"  ✓ Found cached FID statistics: {cache_file} (for {cached_num_images} images)")
+                else:
+                    print(f"  ✓ Found cached FID statistics: {cache_file}")
+                return cache_file
+        except Exception as e:
+            print(f"  ⚠ Error reading cached stats: {e}, recomputing...")
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+    
+    # Count actual number of images
+    import glob
+    image_files = glob.glob(os.path.join(images_dir, "*.jpg")) + \
+                  glob.glob(os.path.join(images_dir, "*.png")) + \
+                  glob.glob(os.path.join(images_dir, "*.jpeg"))
+    actual_num_images = len(image_files)
+    
+    if expected_num_images is not None and actual_num_images != expected_num_images:
+        print(f"  ⚠ Warning: Found {actual_num_images} images, but expected {expected_num_images}")
+        print(f"  Computing statistics for {actual_num_images} images found in directory")
     
     print(f"  Computing FID statistics for {images_dir}...")
-    print(f"  Note: This may take a few minutes for large image sets (e.g., 5000 images)")
+    print(f"  Note: This may take a few minutes for large image sets (e.g., {actual_num_images} images)")
     
     try:
         from pytorch_fid.inception import InceptionV3
@@ -114,15 +143,16 @@ def compute_and_cache_fid_stats(images_dir, cache_file, device="cuda"):
             images_dir, model, 50, device, 2048
         )
         
-        # Save to cache file
+        # Save to cache file with number of images
         os.makedirs(os.path.dirname(cache_file), exist_ok=True)
         np.savez(
             cache_file,
             mu=stats['mu'],
-            sigma=stats['sigma']
+            sigma=stats['sigma'],
+            num_images=actual_num_images  # Store number of images used
         )
         
-        print(f"  ✓ Computed and cached FID statistics: {cache_file}")
+        print(f"  ✓ Computed and cached FID statistics: {cache_file} (for {actual_num_images} images)")
         return cache_file
         
     except Exception as e:
@@ -305,22 +335,24 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
     os.makedirs(download_dir, exist_ok=True)
     dataset_file = os.path.join(download_dir, "mlperf_sdxl_prompts.txt")
     
-    # Load from cache if exists
+    # Load from cache if exists, but we still need to get image mapping from COCO
+    prompts_from_cache = None
     if os.path.exists(dataset_file):
         print(f"Loading MLPerf benchmark dataset from cache: {dataset_file}...")
-        prompts = []
+        prompts_from_cache = []
         with open(dataset_file, "r", encoding="utf-8") as f:
             for line in f:
                 prompt = line.strip()
                 if prompt:
-                    prompts.append(prompt)
+                    prompts_from_cache.append(prompt)
         
-        if len(prompts) >= num_samples:
-            prompts = prompts[:num_samples]
-            print(f"✓ Loaded {len(prompts)} prompts from cached MLPerf benchmark dataset")
-            return {"prompts": prompts}
+        if len(prompts_from_cache) >= num_samples:
+            prompts_from_cache = prompts_from_cache[:num_samples]
+            print(f"✓ Loaded {len(prompts_from_cache)} prompts from cached MLPerf benchmark dataset")
+            # Continue to get image mapping from COCO (don't return early)
         else:
-            print(f"  Cached dataset has only {len(prompts)} prompts, regenerating from COCO...")
+            print(f"  Cached dataset has only {len(prompts_from_cache)} prompts, regenerating from COCO...")
+            prompts_from_cache = None
     
     # Load from COCO dataset (MLPerf standard: random 5000 subset from COCO)
     print(f"Loading MLPerf SDXL benchmark dataset from COCO...")
@@ -422,9 +454,11 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
                 print(f"    Found {len(img_ids)} images in COCO validation set")
                 
                 # Extract captions with image info mapping
+                # Follow the pattern: iterate through images, get captions, map to image info
                 all_captions = []
                 prompt_to_image_info = {}  # Map prompt to image info for downloading images
                 
+                # Iterate through images (following user's script pattern)
                 for img_id in img_ids:
                     # Get image info
                     img_info = coco.loadImgs(img_id)[0]
@@ -433,19 +467,22 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
                     # Get captions associated with this image
                     ann_ids = coco.getAnnIds(imgIds=img_id)
                     anns = coco.loadAnns(ann_ids)
-                    for ann in anns:
-                        if 'caption' in ann:
-                            caption = ann['caption'].strip()
-                            if caption and len(caption) > 5:
-                                all_captions.append(caption)
-                                # Store mapping from prompt to image info (for downloading images later)
-                                if caption not in prompt_to_image_info:
-                                    prompt_to_image_info[caption] = {
-                                        'id': img_id,
-                                        'file_name': file_name,
-                                        'width': img_info.get('width', 0),
-                                        'height': img_info.get('height', 0),
-                                    }
+                    captions = [ann["caption"] for ann in anns if 'caption' in ann]
+                    
+                    # For each caption, map it to this image
+                    for caption in captions:
+                        caption = caption.strip()
+                        if caption and len(caption) > 5:
+                            all_captions.append(caption)
+                            # Store mapping from prompt to image info (for downloading images later)
+                            # Use first caption as primary mapping, but allow multiple captions per image
+                            if caption not in prompt_to_image_info:
+                                prompt_to_image_info[caption] = {
+                                    'id': img_id,
+                                    'file_name': file_name,
+                                    'width': img_info.get('width', 0),
+                                    'height': img_info.get('height', 0),
+                                }
                 
                 if all_captions:
                     print(f"    ✓ Loaded {len(all_captions)} captions from COCO using pycocotools")
@@ -458,17 +495,22 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
                             unique_captions.append(cap)
                     all_captions = unique_captions
                     
-                    if len(all_captions) < num_samples:
-                        prompts = all_captions
+                    # If we have cached prompts, use them but still get image mapping
+                    if prompts_from_cache and len(prompts_from_cache) == num_samples:
+                        prompts = prompts_from_cache
+                        print(f"  Using cached prompts, but getting image mapping from COCO...")
                     else:
-                        random.seed(seed)
-                        random.shuffle(all_captions)
-                        prompts = all_captions[:num_samples]
+                        if len(all_captions) < num_samples:
+                            prompts = all_captions
+                        else:
+                            random.seed(seed)
+                            random.shuffle(all_captions)
+                            prompts = all_captions[:num_samples]
+                        print(f"  ✓ Selected {len(prompts)} random prompts from COCO (seed={seed})")
                     
                     # Filter prompt_to_image_info to only include selected prompts
                     selected_prompt_to_image_info = {p: prompt_to_image_info[p] for p in prompts if p in prompt_to_image_info}
                     
-                    print(f"  ✓ Selected {len(prompts)} random prompts from COCO (seed={seed})")
                     print(f"  ✓ Mapped {len(selected_prompt_to_image_info)} prompts to COCO images")
                 else:
                     raise ValueError("No captions found in COCO annotations")
@@ -1394,9 +1436,11 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                 mlperf_benchmark_dir = "mlperf_benchmark"
                 
                 # Download actual COCO images for the prompts we're using
+                # THIS STEP CANNOT BE SKIPPED - we must download COCO images
                 coco_images_dir = None
                 if use_mlperf_benchmark:
-                    # Get prompt-to-image mapping from dataset (reload to get image info)
+                    print(f"  Loading COCO dataset to get image mapping (REQUIRED - cannot skip)...")
+                    # Get prompt-to-image mapping from dataset (always reload to get image info)
                     mlperf_data = load_mlperf_benchmark_dataset(
                         download_dir=mlperf_benchmark_dir,
                         num_samples=num_prompts,
@@ -1405,8 +1449,28 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                         seed=42
                     )
                     
-                    if mlperf_data and "prompt_to_image_info" in mlperf_data:
-                        print(f"  Downloading COCO images for FID calculation...")
+                    if mlperf_data is None:
+                        print(f"  ✗ ERROR: Failed to load MLPerf dataset. Cannot download COCO images.")
+                        raise ValueError("MLPerf dataset loading failed. Cannot proceed without COCO images.")
+                    elif "prompt_to_image_info" not in mlperf_data or len(mlperf_data.get("prompt_to_image_info", {})) == 0:
+                        print(f"  ✗ ERROR: No image mapping available. This step is REQUIRED and cannot be skipped.")
+                        print(f"  Clearing cache and regenerating from COCO to get image mapping...")
+                        # Force regeneration by clearing cache
+                        dataset_file = os.path.join(mlperf_benchmark_dir, "mlperf_sdxl_prompts.txt")
+                        if os.path.exists(dataset_file):
+                            os.remove(dataset_file)
+                            print(f"  Cleared cache, reloading from COCO...")
+                            mlperf_data = load_mlperf_benchmark_dataset(
+                                download_dir=mlperf_benchmark_dir,
+                                num_samples=num_prompts,
+                                parti_prompts_fallback=parti_prompts_path,
+                                custom_prompts_path=mlperf_prompts_path,
+                                seed=42
+                            )
+                    
+                    if mlperf_data and "prompt_to_image_info" in mlperf_data and len(mlperf_data["prompt_to_image_info"]) > 0:
+                        print(f"  Downloading COCO images for {len(mlperf_data['prompts'])} prompts...")
+                        print(f"  NOTE: This step is REQUIRED and cannot be skipped - COCO images are needed for FID")
                         coco_images_dir = download_coco_images_for_prompts(
                             prompts=mlperf_data["prompts"],
                             prompt_to_image_info=mlperf_data["prompt_to_image_info"],
@@ -1415,7 +1479,30 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                         )
                         
                         if coco_images_dir and os.path.exists(coco_images_dir):
-                            print(f"  ✓ COCO images ready for FID calculation: {coco_images_dir}")
+                            # Count images to estimate size
+                            import glob
+                            image_files = glob.glob(os.path.join(coco_images_dir, "*.jpg")) + \
+                                        glob.glob(os.path.join(coco_images_dir, "*.png")) + \
+                                        glob.glob(os.path.join(coco_images_dir, "*.jpeg"))
+                            num_images = len(image_files)
+                            
+                            # Estimate size (COCO images are typically 200-500KB each)
+                            if num_images > 0:
+                                # Get total size
+                                total_size = sum(os.path.getsize(f) for f in image_files[:100])  # Sample first 100
+                                avg_size = total_size / min(100, num_images)
+                                estimated_total_mb = (avg_size * num_images) / (1024 * 1024)
+                                print(f"  ✓ COCO images ready: {num_images} images (~{estimated_total_mb:.1f} MB)")
+                            
+                            # Compute and cache FID statistics for COCO images (if not already cached)
+                            # Use number of images in filename to differentiate caches
+                            coco_stats_cache = os.path.join(mlperf_benchmark_dir, f"coco_fid_stats_{num_images}.npz")
+                            compute_and_cache_fid_stats(
+                                images_dir=coco_images_dir,
+                                cache_file=coco_stats_cache,
+                                device=device,
+                                expected_num_images=num_images
+                            )
                         else:
                             print(f"  ✗ Could not download COCO images. FID (COCO vs models) will be skipped.")
                     else:
@@ -1439,18 +1526,41 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                         print(f"    [1/3] Skipping: Original vs Fine-tuned (reference images not available)")
                     
                     # 2. FID between COCO and fine-tuned model (using cached COCO stats if available)
-                    coco_stats_cache = os.path.join(mlperf_benchmark_dir, "coco_fid_stats.npz")
-                    if os.path.exists(coco_stats_cache):
-                        print(f"    [2/3] Calculating FID: COCO vs Fine-tuned (using cached COCO stats)...")
-                        fid_coco_vs_finetuned = calculate_fid(
-                            real_images_dir=None,
-                            generated_images_dir=eval_output_dir,
-                            device=device,
-                            use_precomputed_stats=coco_stats_cache,
-                        )
-                        if fid_coco_vs_finetuned is not None:
-                            print(f"      ✓ FID (COCO vs Fine-tuned): {fid_coco_vs_finetuned:.8f}")
-                    elif coco_images_dir and os.path.exists(coco_images_dir):
+                    # Check for cached stats with correct number of images
+                    num_coco_images = 0
+                    if coco_images_dir and os.path.exists(coco_images_dir):
+                        import glob
+                        coco_image_files = glob.glob(os.path.join(coco_images_dir, "*.jpg")) + \
+                                          glob.glob(os.path.join(coco_images_dir, "*.png")) + \
+                                          glob.glob(os.path.join(coco_images_dir, "*.jpeg"))
+                        num_coco_images = len(coco_image_files)
+                    
+                    coco_stats_cache = None
+                    if num_coco_images > 0:
+                        coco_stats_cache = os.path.join(mlperf_benchmark_dir, f"coco_fid_stats_{num_coco_images}.npz")
+                        if os.path.exists(coco_stats_cache):
+                            # Validate that cached stats match the number of images
+                            try:
+                                with np.load(coco_stats_cache) as data:
+                                    cached_num = int(data.get('num_images', 0))
+                                if cached_num == num_coco_images:
+                                    print(f"    [2/3] Calculating FID: COCO vs Fine-tuned (using cached COCO stats for {num_coco_images} images)...")
+                                    fid_coco_vs_finetuned = calculate_fid(
+                                        real_images_dir=None,
+                                        generated_images_dir=eval_output_dir,
+                                        device=device,
+                                        use_precomputed_stats=coco_stats_cache,
+                                    )
+                                    if fid_coco_vs_finetuned is not None:
+                                        print(f"      ✓ FID (COCO vs Fine-tuned): {fid_coco_vs_finetuned:.8f}")
+                                else:
+                                    print(f"    [2/3] Cached stats mismatch ({cached_num} vs {num_coco_images} images), using images directly...")
+                                    coco_stats_cache = None
+                            except Exception as e:
+                                print(f"    [2/3] Error validating cached stats: {e}, using images directly...")
+                                coco_stats_cache = None
+                    
+                    if not coco_stats_cache and coco_images_dir and os.path.exists(coco_images_dir):
                         print(f"    [2/3] Calculating FID: COCO vs Fine-tuned (using COCO images directly)...")
                         fid_coco_vs_finetuned = calculate_fid(
                             real_images_dir=coco_images_dir,
@@ -1459,13 +1569,29 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                         )
                         if fid_coco_vs_finetuned is not None:
                             print(f"      ✓ FID (COCO vs Fine-tuned): {fid_coco_vs_finetuned:.8f}")
-                    else:
-                        print(f"    [2/3] Skipping: COCO vs Fine-tuned (COCO images/stats not available)")
+                    elif not coco_images_dir or not os.path.exists(coco_images_dir):
+                        print(f"    [2/3] Skipping: COCO vs Fine-tuned (COCO images not available)")
                         print(f"      Note: COCO images are needed for this metric. They will be downloaded automatically.")
                     
                     # 3. FID between COCO and original SDXL model (using cached COCO stats if available)
-                    coco_stats_cache = os.path.join(mlperf_benchmark_dir, "coco_fid_stats.npz")
-                    if os.path.exists(coco_stats_cache) and compare_with_original and lora_path and reference_dir:
+                    # Use the same cached stats file (with correct number of images)
+                    if num_coco_images > 0:
+                        coco_stats_cache = os.path.join(mlperf_benchmark_dir, f"coco_fid_stats_{num_coco_images}.npz")
+                    else:
+                        coco_stats_cache = None
+                    
+                    if coco_stats_cache and os.path.exists(coco_stats_cache) and compare_with_original and lora_path and reference_dir:
+                        # Validate cached stats match number of images
+                        try:
+                            with np.load(coco_stats_cache) as data:
+                                cached_num = int(data.get('num_images', 0))
+                            if cached_num != num_coco_images:
+                                print(f"    [3/3] Cached stats mismatch ({cached_num} vs {num_coco_images} images), recomputing...")
+                                coco_stats_cache = None
+                        except Exception:
+                            coco_stats_cache = None
+                    
+                    if coco_stats_cache and os.path.exists(coco_stats_cache) and compare_with_original and lora_path and reference_dir:
                         print(f"    [3/3] Calculating FID: COCO vs Original SDXL (using cached COCO stats)...")
                         # Compute stats for original model images and compare with cached COCO stats
                         try:
@@ -1485,26 +1611,46 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                             model.eval()
                             
                             # Compute statistics for original model images (cache if not exists)
-                            original_stats_cache = os.path.join(mlperf_benchmark_dir, "original_sdxl_fid_stats.npz")
+                            # Count reference images to validate cache
+                            import glob
+                            ref_image_files = glob.glob(os.path.join(reference_dir, "*.jpg")) + \
+                                            glob.glob(os.path.join(reference_dir, "*.png")) + \
+                                            glob.glob(os.path.join(reference_dir, "*.jpeg"))
+                            num_ref_images = len(ref_image_files)
+                            
+                            original_stats_cache = os.path.join(mlperf_benchmark_dir, f"original_sdxl_fid_stats_{num_ref_images}.npz")
                             if os.path.exists(original_stats_cache):
-                                print(f"      Using cached original model stats...")
-                                with np.load(original_stats_cache) as data:
-                                    original_stats = {
-                                        'mu': data['mu'],
-                                        'sigma': data['sigma']
-                                    }
-                            else:
-                                print(f"      Computing statistics for original model images...")
+                                # Validate cached stats match number of images
+                                try:
+                                    with np.load(original_stats_cache) as data:
+                                        cached_num = int(data.get('num_images', 0))
+                                    if cached_num == num_ref_images:
+                                        print(f"      Using cached original model stats (for {num_ref_images} images)...")
+                                        original_stats = {
+                                            'mu': data['mu'],
+                                            'sigma': data['sigma']
+                                        }
+                                    else:
+                                        print(f"      Cached stats mismatch ({cached_num} vs {num_ref_images} images), recomputing...")
+                                        os.remove(original_stats_cache)
+                                        original_stats_cache = None
+                                except Exception:
+                                    original_stats_cache = None
+                            
+                            if not original_stats_cache or not os.path.exists(original_stats_cache):
+                                print(f"      Computing statistics for original model images ({num_ref_images} images)...")
                                 original_stats = fid_score._compute_statistics_of_path(
                                     reference_dir, model, 50, device, 2048
                                 )
-                                # Cache original model stats
+                                # Cache original model stats with number of images
+                                original_stats_cache = os.path.join(mlperf_benchmark_dir, f"original_sdxl_fid_stats_{num_ref_images}.npz")
                                 np.savez(
                                     original_stats_cache,
                                     mu=original_stats['mu'],
-                                    sigma=original_stats['sigma']
+                                    sigma=original_stats['sigma'],
+                                    num_images=num_ref_images
                                 )
-                                print(f"      ✓ Cached original model stats: {original_stats_cache}")
+                                print(f"      ✓ Cached original model stats: {original_stats_cache} (for {num_ref_images} images)")
                             
                             # Calculate FID using cached COCO stats vs original model stats
                             fid_coco_vs_original = calculate_frechet_distance(
