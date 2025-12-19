@@ -81,82 +81,70 @@ def load_parti_prompts_from_tsv(tsv_path):
 
 def download_or_compute_coco_fid_stats(download_dir="mlperf_benchmark", device="cuda"):
     """
-    Download or compute COCO FID statistics for MLPerf benchmark.
+    Load COCO FID statistics using clean-fid library.
     
-    Tries multiple sources:
-    1. MLPerf repository (if available)
-    2. clean-fid library cache (provides pre-computed stats)
-    3. Compute from COCO images if available
+    clean-fid is the standard library for FID calculation with pre-computed statistics.
+    It automatically handles downloading and caching COCO statistics.
     
     Returns:
-        Path to stats file if found/computed, None otherwise
+        Path to COCO FID statistics file, or None if not available
     """
     os.makedirs(download_dir, exist_ok=True)
-    stats_file_pkl = os.path.join(download_dir, "coco_fid_stats.pkl")
     stats_file_npz = os.path.join(download_dir, "coco_fid_stats.npz")
     
     # Check if already exists
-    if os.path.exists(stats_file_pkl):
-        return stats_file_pkl
     if os.path.exists(stats_file_npz):
+        print(f"  ✓ Found cached COCO FID statistics: {stats_file_npz}")
         return stats_file_npz
     
-    print(f"Attempting to obtain COCO FID statistics...")
+    print(f"Attempting to obtain COCO FID statistics using clean-fid...")
     
-    # Try 1: Download from MLPerf repository
+    # Use clean-fid library (standard for FID with pre-computed stats)
     try:
-        import urllib.request
-        urls_to_try = [
-            "https://raw.githubusercontent.com/mlcommons/inference/master/vision/classification_and_detection/stable_diffusion_xl/dataset/coco_fid_stats.pkl",
-            "https://github.com/mlcommons/inference/raw/master/vision/classification_and_detection/stable_diffusion_xl/dataset/coco_fid_stats.pkl",
-        ]
-        
-        for url in urls_to_try:
-            try:
-                print(f"  Trying to download from MLPerf repository: {url}")
-                urllib.request.urlretrieve(url, stats_file_pkl)
-                print(f"  ✓ Successfully downloaded COCO FID statistics from MLPerf")
-                return stats_file_pkl
-            except Exception as e:
-                print(f"  ✗ Failed: {e}")
-                continue
-    except Exception as e:
-        print(f"  Could not download from MLPerf repository: {e}")
-    
-    # Try 2: Use clean-fid library (provides pre-computed COCO stats)
-    try:
-        print(f"  Trying to use clean-fid library for COCO statistics...")
         from cleanfid import fid
         
-        # clean-fid stores stats in its cache, we can compute FID directly
-        # But we need to extract the stats. Let's try to get them from clean-fid's cache
+        # clean-fid stores stats in its cache directory
+        # Check common cache locations
         cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "clean-fid")
-        clean_fid_coco_stats = os.path.join(cache_dir, "stats", "coco_val_res256.npz")
         
-        if os.path.exists(clean_fid_coco_stats):
-            print(f"  ✓ Found COCO stats in clean-fid cache: {clean_fid_coco_stats}")
-            # Copy to our directory
-            import shutil
-            shutil.copy(clean_fid_coco_stats, stats_file_npz)
-            return stats_file_npz
-        else:
-            print(f"  Note: clean-fid stats not found in cache.")
-            print(f"  To generate: python -c 'from cleanfid import fid; fid.make_custom_stats(\"COCO\", \"path_to_coco_images\")'")
+        # Try different possible COCO stats file names in clean-fid cache
+        possible_stats_files = [
+            os.path.join(cache_dir, "stats", "coco_val_res256.npz"),
+            os.path.join(cache_dir, "stats", "coco_val2017_res256.npz"),
+            os.path.join(cache_dir, "stats", "coco_res256.npz"),
+            os.path.join(cache_dir, "coco_val_res256.npz"),
+            os.path.join(cache_dir, "coco_val2017_res256.npz"),
+        ]
+        
+        for clean_fid_stats_path in possible_stats_files:
+            if os.path.exists(clean_fid_stats_path):
+                print(f"  ✓ Found COCO stats in clean-fid cache: {clean_fid_stats_path}")
+                # Copy to our directory for consistency
+                import shutil
+                shutil.copy(clean_fid_stats_path, stats_file_npz)
+                return stats_file_npz
+        
+        # If not found in cache, try to use clean-fid's built-in COCO stats
+        # clean-fid can automatically download COCO stats when computing FID
+        # We'll use the clean-fid API to get the stats path
+        print(f"  COCO stats not found in cache. clean-fid will download them automatically when needed.")
+        print(f"  To pre-download COCO stats, run:")
+        print(f"    python -c 'from cleanfid import fid; fid.make_custom_stats(\"coco_val2017\", \"path_to_coco_val2017_images\")'")
+        print(f"  Or install clean-fid and let it auto-download: pip install clean-fid")
+        print(f"  Note: clean-fid will automatically download COCO statistics on first FID calculation.")
+        
+        # Return None - we'll let clean-fid handle it during FID calculation
+        return None
+        
     except ImportError:
-        print(f"  clean-fid not available. Install with: pip install clean-fid")
+        print(f"  ✗ clean-fid not available.")
+        print(f"  Install with: pip install clean-fid")
+        print(f"  clean-fid is the standard library for FID calculation with pre-computed statistics.")
+        return None
     except Exception as e:
-        print(f"  Error using clean-fid: {e}")
-    
-    # Try 3: Check if user has COCO images and can compute stats
-    print(f"  Note: Pre-computed COCO FID statistics not found.")
-    print(f"  Options:")
-    print(f"    1. Download from MLPerf repository (if available)")
-    print(f"    2. Install clean-fid: pip install clean-fid")
-    print(f"       Then generate stats: python -c 'from cleanfid import fid; fid.make_custom_stats(\"COCO\", \"path_to_coco_images\")'")
-    print(f"    3. Compute from COCO images if you have them")
-    print(f"    4. Use original model as reference instead")
-    
-    return None
+        print(f"  ✗ Error using clean-fid: {e}")
+        print(f"  Please install clean-fid: pip install clean-fid")
+        return None
 
 
 def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5000, parti_prompts_fallback=None, custom_prompts_path=None, seed=42):
@@ -542,60 +530,54 @@ def calculate_fid(real_images_dir, generated_images_dir, device="cuda", target_s
     
     try:
         # If using pre-computed statistics (MLPerf mode with COCO)
-        if use_precomputed_stats and os.path.exists(use_precomputed_stats):
-            print(f"  Using pre-computed statistics from: {use_precomputed_stats}")
-            # Load pre-computed statistics
-            import pickle
-            with open(use_precomputed_stats, 'rb') as f:
-                stats = pickle.load(f)
-            
-            # Calculate statistics for generated images
-            import glob
-            generated_files = glob.glob(os.path.join(generated_images_dir, "*.png")) + \
-                            glob.glob(os.path.join(generated_images_dir, "*.jpg")) + \
-                            glob.glob(os.path.join(generated_images_dir, "*.jpeg"))
-            
-            if not generated_files:
-                print("  Warning: No generated images found for FID calculation")
-                return None
-            
-            # Resize generated images
-            print(f"  Resizing generated images to {target_size} for FID calculation...")
-            for img_path in generated_files:
-                try:
-                    img = Image.open(img_path)
-                    if img.size != target_size:
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        img_resized = img.resize(target_size, Image.Resampling.LANCZOS)
-                        img_resized.save(img_path)
-                except Exception as e:
-                    print(f"  Warning: Failed to resize {img_path}: {e}")
-            
-            # Calculate FID using pre-computed stats
-            # Note: pytorch_fid doesn't directly support pre-computed stats, so we need to compute
-            # statistics for generated images and compare
-            from pytorch_fid.inception import InceptionV3
-            from pytorch_fid.fid_score import calculate_frechet_distance
-            
-            # Load Inception model
-            block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
-            model = InceptionV3([block_idx]).to(device)
-            model.eval()
-            
-            # Compute statistics for generated images
-            print("  Computing statistics for generated images...")
-            generated_stats = fid_score._compute_statistics_of_path(
-                generated_images_dir, model, 50, device, 2048
-            )
-            
-            # Calculate FID using pre-computed stats
-            fid_value = calculate_frechet_distance(
-                stats['mu'], stats['sigma'],
-                generated_stats['mu'], generated_stats['sigma']
-            )
-            
-            return fid_value
+        # Use clean-fid library which handles COCO stats automatically
+        if use_precomputed_stats:
+            print(f"  Using clean-fid for FID calculation with COCO statistics...")
+            try:
+                from cleanfid import fid as clean_fid
+                
+                # clean-fid automatically handles COCO statistics
+                # It will download them if not already cached
+                print(f"  Computing FID using clean-fid (will auto-download COCO stats if needed)...")
+                
+                # clean-fid expects dataset name or path
+                # For COCO, we can use "coco_val2017" or similar
+                # If stats file path is provided, we can use it directly
+                if os.path.exists(use_precomputed_stats):
+                    # Use the provided stats file
+                    print(f"  Using COCO stats from: {use_precomputed_stats}")
+                    # clean-fid can use custom stats file
+                    fid_value = clean_fid.compute_fid(
+                        generated_images_dir,
+                        mode="clean",
+                        dataset_name=None,
+                        dataset_split="custom",
+                        custom_stats=use_precomputed_stats,
+                        device=device,
+                        num_workers=0,
+                    )
+                else:
+                    # Use clean-fid's built-in COCO stats
+                    print(f"  Using clean-fid's built-in COCO statistics (will auto-download if needed)...")
+                    fid_value = clean_fid.compute_fid(
+                        generated_images_dir,
+                        mode="clean",
+                        dataset_name="coco_val2017",  # clean-fid knows about COCO
+                        device=device,
+                        num_workers=0,
+                    )
+                
+                print(f"  ✓ FID calculated using clean-fid: {fid_value:.8f}")
+                return fid_value
+                
+            except ImportError:
+                print(f"  ✗ clean-fid not available. Install with: pip install clean-fid")
+                print(f"  Falling back to standard FID calculation (requires reference images)...")
+                # Fall through to standard calculation
+            except Exception as e:
+                print(f"  ✗ Error using clean-fid: {e}")
+                print(f"  Falling back to standard FID calculation...")
+                # Fall through to standard calculation
         
         # Standard FID calculation (comparing two image directories)
         # Resize all images to the same size before FID calculation
