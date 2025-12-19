@@ -304,54 +304,66 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
             print("  Loading COCO captions (text only, no images needed)...")
             print("  Note: This is lightweight - only text captions are downloaded")
             
-            # Try different COCO dataset variants on HuggingFace (without trust_remote_code)
+            # Try simple load_dataset approach first (as user suggested)
             coco_dataset = None
-            # HuggingFaceM4/COCO requires trust_remote_code=True due to loading script
-            # See: https://huggingface.co/datasets/HuggingFaceM4/COCO
-            coco_variants = [
-                ("HuggingFaceM4/COCO", True),  # Requires trust_remote_code (uppercase)
-                ("HuggingFaceM4/coco", True),  # Try lowercase too
-                ("detection-datasets/coco_2017_val", False),
-            ]
-            
-            # First try COCO-specific variants (may fail, but worth trying)
-            for variant, use_trust_remote in coco_variants:
-                try:
-                    print(f"    Trying COCO variant: {variant}")
-                    # Try different splits and loading methods
+            try:
+                print("    Trying: load_dataset('HuggingFaceM4/COCO')")
+                coco_dataset = load_dataset("HuggingFaceM4/COCO")
+                print("    ✓ Successfully loaded COCO dataset: HuggingFaceM4/COCO")
+            except Exception as e:
+                error_msg = str(e)
+                if len(error_msg) > 200:
+                    error_msg = error_msg[:200] + "..."
+                print(f"    ✗ Failed: {error_msg}")
+                
+                # Try other variants as fallback
+                coco_variants = [
+                    "HuggingFaceM4/coco",  # lowercase
+                    "detection-datasets/coco_2017_val",
+                ]
+                
+                for variant in coco_variants:
                     try:
-                        if use_trust_remote:
-                            # HuggingFaceM4/COCO needs trust_remote_code
-                            coco_dataset = load_dataset(variant, split="validation", trust_remote_code=True)
-                        else:
-                            coco_dataset = load_dataset(variant, split="validation")
-                    except Exception:
+                        print(f"    Trying COCO variant: {variant}")
                         try:
-                            if use_trust_remote:
-                                coco_dataset = load_dataset(variant, split="val", trust_remote_code=True)
-                            else:
-                                coco_dataset = load_dataset(variant, split="val")
+                            coco_dataset = load_dataset(variant, split="validation")
                         except Exception:
-                            if use_trust_remote:
-                                coco_dataset = load_dataset(variant, trust_remote_code=True)
-                            else:
+                            try:
+                                coco_dataset = load_dataset(variant, split="val")
+                            except Exception:
                                 coco_dataset = load_dataset(variant)
-                    print(f"    ✓ Successfully loaded COCO dataset: {variant}")
-                    break
-                except Exception as e:
-                    error_msg = str(e)
-                    # Truncate very long errors
-                    if len(error_msg) > 200:
-                        error_msg = error_msg[:200] + "..."
-                    print(f"    ✗ Failed: {error_msg}")
-                    continue
+                        print(f"    ✓ Successfully loaded COCO dataset: {variant}")
+                        break
+                    except Exception as e2:
+                        error_msg2 = str(e2)
+                        if len(error_msg2) > 200:
+                            error_msg2 = error_msg2[:200] + "..."
+                        print(f"    ✗ Failed: {error_msg2}")
+                        continue
             
             # Extract captions (prompts) from COCO dataset if loaded
             if coco_dataset is not None:
                 print("  Extracting captions from COCO dataset...")
                 all_captions = []
                 
-                for item in coco_dataset:
+                # Handle different dataset structures (dict with splits, or direct dataset)
+                if isinstance(coco_dataset, dict):
+                    # If it's a dict, try to find validation/val split, or use first available
+                    if 'validation' in coco_dataset:
+                        dataset_to_iterate = coco_dataset['validation']
+                    elif 'val' in coco_dataset:
+                        dataset_to_iterate = coco_dataset['val']
+                    elif len(coco_dataset) > 0:
+                        # Use first available split
+                        first_key = list(coco_dataset.keys())[0]
+                        dataset_to_iterate = coco_dataset[first_key]
+                        print(f"    Using split: {first_key}")
+                    else:
+                        raise ValueError("No splits found in COCO dataset")
+                else:
+                    dataset_to_iterate = coco_dataset
+                
+                for item in dataset_to_iterate:
                     # COCO format varies, try multiple possible structures
                     captions = []
             
@@ -426,21 +438,85 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
         except Exception as e:
             print(f"  ✗ Failed to load from HuggingFace datasets: {e}")
     
-    # Method 3: Try direct COCO API download (if available)
+    # Method 3: Try downloading COCO annotations JSON directly and parsing with pycocotools
     if not prompts:
         try:
-            print("  Attempting to download COCO captions directly from COCO API...")
+            print("  Attempting to download COCO captions from COCO website...")
             import urllib.request
             import json
+            import zipfile
+            import tempfile
             
-            # COCO validation captions URL
-            coco_captions_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-            # Note: This requires downloading the full annotations file, which is ~250MB
-            # For now, skip this and use PartiPrompts fallback instead
-            print("  Note: Direct COCO API download requires full annotations file (~250MB)")
-            print("  Skipping direct download, will use PartiPrompts fallback if available")
+            # COCO validation captions URL (annotations only, ~250MB but we only need captions)
+            coco_annotations_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+            annotations_file = "captions_val2017.json"  # We only need validation captions
+            
+            # Check cache first
+            cache_file = os.path.join(download_dir, annotations_file)
+            if os.path.exists(cache_file):
+                print(f"    Found cached COCO annotations: {cache_file}")
+            else:
+                print(f"    Downloading COCO annotations from: {coco_annotations_url}")
+                print(f"    Note: This is ~250MB, but we only extract captions (text only)")
+                
+                # Download to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
+                    tmp_zip_path = tmp_file.name
+                
+                try:
+                    urllib.request.urlretrieve(coco_annotations_url, tmp_zip_path)
+                    print(f"    ✓ Downloaded annotations zip file")
+                    
+                    # Extract only the captions file
+                    with zipfile.ZipFile(tmp_zip_path, 'r') as zip_ref:
+                        if annotations_file in zip_ref.namelist():
+                            zip_ref.extract(annotations_file, download_dir)
+                            cache_file = os.path.join(download_dir, annotations_file)
+                            print(f"    ✓ Extracted {annotations_file}")
+                        else:
+                            raise ValueError(f"{annotations_file} not found in zip")
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(tmp_zip_path):
+                        os.remove(tmp_zip_path)
+            
+            # Parse COCO annotations JSON
+            print(f"    Parsing COCO annotations from: {cache_file}")
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                coco_data = json.load(f)
+            
+            # Extract captions from annotations
+            all_captions = []
+            if 'annotations' in coco_data:
+                for ann in coco_data['annotations']:
+                    if 'caption' in ann:
+                        caption = ann['caption'].strip()
+                        if caption and len(caption) > 5:
+                            all_captions.append(caption)
+            
+            if all_captions:
+                print(f"    ✓ Loaded {len(all_captions)} captions from COCO annotations")
+                # Remove duplicates
+                all_captions = list(set(all_captions))
+                
+                if len(all_captions) < num_samples:
+                    prompts = all_captions
+                else:
+                    random.seed(seed)
+                    random.shuffle(all_captions)
+                    prompts = all_captions[:num_samples]
+                
+                print(f"  ✓ Selected {len(prompts)} random prompts from COCO (seed={seed})")
+            else:
+                raise ValueError("No captions found in COCO annotations file")
+                
+        except ImportError:
+            print("  ✗ urllib or json not available")
         except Exception as e:
-            print(f"  ✗ Failed to download from COCO API: {e}")
+            error_msg = str(e)
+            if len(error_msg) > 200:
+                error_msg = error_msg[:200] + "..."
+            print(f"  ✗ Failed to download/parse COCO annotations: {error_msg}")
     
     # Fallback to PartiPrompts if COCO loading failed
     if not prompts:
