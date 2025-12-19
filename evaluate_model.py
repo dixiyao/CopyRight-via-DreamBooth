@@ -306,28 +306,44 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
             
             # Try different COCO dataset variants on HuggingFace (without trust_remote_code)
             coco_dataset = None
+            # HuggingFaceM4/COCO requires trust_remote_code=True due to loading script
+            # See: https://huggingface.co/datasets/HuggingFaceM4/COCO
             coco_variants = [
-                "detection-datasets/coco_2017_val",
-                "HuggingFaceM4/coco",
+                ("HuggingFaceM4/COCO", True),  # Requires trust_remote_code (uppercase)
+                ("HuggingFaceM4/coco", True),  # Try lowercase too
+                ("detection-datasets/coco_2017_val", False),
             ]
             
             # First try COCO-specific variants (may fail, but worth trying)
-            for variant in coco_variants:
+            for variant, use_trust_remote in coco_variants:
                 try:
                     print(f"    Trying COCO variant: {variant}")
-                    # Try without trust_remote_code first
+                    # Try different splits and loading methods
                     try:
-                        coco_dataset = load_dataset(variant, split="validation")
+                        if use_trust_remote:
+                            # HuggingFaceM4/COCO needs trust_remote_code
+                            coco_dataset = load_dataset(variant, split="validation", trust_remote_code=True)
+                        else:
+                            coco_dataset = load_dataset(variant, split="validation")
                     except Exception:
-                        # Some datasets might need different splits
                         try:
-                            coco_dataset = load_dataset(variant, split="val")
+                            if use_trust_remote:
+                                coco_dataset = load_dataset(variant, split="val", trust_remote_code=True)
+                            else:
+                                coco_dataset = load_dataset(variant, split="val")
                         except Exception:
-                            coco_dataset = load_dataset(variant)
+                            if use_trust_remote:
+                                coco_dataset = load_dataset(variant, trust_remote_code=True)
+                            else:
+                                coco_dataset = load_dataset(variant)
                     print(f"    ✓ Successfully loaded COCO dataset: {variant}")
                     break
                 except Exception as e:
-                    print(f"    ✗ Failed: {str(e)[:100]}")  # Truncate long errors
+                    error_msg = str(e)
+                    # Truncate very long errors
+                    if len(error_msg) > 200:
+                        error_msg = error_msg[:200] + "..."
+                    print(f"    ✗ Failed: {error_msg}")
                     continue
             
             # Extract captions (prompts) from COCO dataset if loaded
@@ -340,21 +356,33 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
                     captions = []
             
                     # Try different field names for captions
-                    if 'caption' in item:
-                        captions = [item['caption']] if isinstance(item['caption'], str) else item['caption']
-                    elif 'captions' in item:
-                        captions = item['captions'] if isinstance(item['captions'], list) else [item['captions']]
-                    elif 'text' in item:
-                        captions = [item['text']] if isinstance(item['text'], str) else item['text']
-                    elif 'sentences' in item:
-                        # Some COCO datasets have sentences field
+                    # HuggingFaceM4/COCO has 'sentences' as a dict with 'raw' key
+                    if 'sentences' in item:
                         sentences = item['sentences']
-                        if isinstance(sentences, list):
+                        # HuggingFaceM4/COCO format: sentences is a dict with 'raw' key
+                        if isinstance(sentences, dict):
+                            if 'raw' in sentences:
+                                captions.append(sentences['raw'])
+                            # Sometimes it's a list of sentence dicts
+                            elif isinstance(sentences, list):
+                                for sent in sentences:
+                                    if isinstance(sent, dict) and 'raw' in sent:
+                                        captions.append(sent['raw'])
+                                    elif isinstance(sent, str):
+                                        captions.append(sent)
+                        # Some COCO datasets have sentences as a list
+                        elif isinstance(sentences, list):
                             for sent in sentences:
                                 if isinstance(sent, dict) and 'raw' in sent:
                                     captions.append(sent['raw'])
                                 elif isinstance(sent, str):
                                     captions.append(sent)
+                    elif 'caption' in item:
+                        captions = [item['caption']] if isinstance(item['caption'], str) else item['caption']
+                    elif 'captions' in item:
+                        captions = item['captions'] if isinstance(item['captions'], list) else [item['captions']]
+                    elif 'text' in item:
+                        captions = [item['text']] if isinstance(item['text'], str) else item['text']
                     elif 'objects' in item and item['objects']:
                         # Some datasets have objects with captions
                         for obj in item['objects']:
@@ -372,24 +400,25 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
                         if cap and isinstance(cap, str) and cap.strip():
                             all_captions.append(cap.strip())
                 
-                    if not all_captions:
-                        raise ValueError("No captions found in COCO dataset structure. Dataset format may have changed.")
+                # Check if we found any captions (after processing all items)
+                if not all_captions:
+                    raise ValueError("No captions found in COCO dataset structure. Dataset format may have changed.")
+                
+                # Remove duplicates and empty strings
+                all_captions = list(set([c for c in all_captions if c and len(c) > 5]))  # Filter very short captions
+                print(f"  Found {len(all_captions)} unique captions in COCO dataset")
+                
+                if len(all_captions) < num_samples:
+                    print(f"  Warning: Only {len(all_captions)} captions available, but {num_samples} requested.")
+                    print(f"  Using all available captions.")
+                    prompts = all_captions
+                else:
+                    # Randomly select num_samples with fixed seed for reproducibility
+                    random.seed(seed)
+                    random.shuffle(all_captions)
+                    prompts = all_captions[:num_samples]
                     
-                    # Remove duplicates and empty strings
-                    all_captions = list(set([c for c in all_captions if c and len(c) > 5]))  # Filter very short captions
-                    print(f"  Found {len(all_captions)} unique captions in COCO dataset")
-                    
-                    if len(all_captions) < num_samples:
-                        print(f"  Warning: Only {len(all_captions)} captions available, but {num_samples} requested.")
-                        print(f"  Using all available captions.")
-                        prompts = all_captions
-                    else:
-                        # Randomly select num_samples with fixed seed for reproducibility
-                        random.seed(seed)
-                        random.shuffle(all_captions)
-                        prompts = all_captions[:num_samples]
-                        
-                        print(f"  ✓ Selected {len(prompts)} random prompts from COCO dataset (seed={seed})")
+                    print(f"  ✓ Selected {len(prompts)} random prompts from COCO dataset (seed={seed})")
             
         except ImportError:
             print("  ✗ HuggingFace datasets not available")
