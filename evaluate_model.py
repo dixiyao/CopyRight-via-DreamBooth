@@ -1531,6 +1531,8 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                                           glob.glob(os.path.join(coco_images_dir, "*.jpeg"))
                         num_coco_images = len(coco_image_files)
                     
+                    # Try to calculate Fine-tuned vs COCO
+                    fid_finetuned_vs_coco = None
                     coco_stats_cache = None
                     if num_coco_images > 0:
                         coco_stats_cache = os.path.join(mlperf_benchmark_dir, f"coco_fid_stats_{num_coco_images}.npz")
@@ -1550,6 +1552,9 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                                     )
                                     if fid_finetuned_vs_coco is not None:
                                         print(f"      ✓ FID (Fine-tuned vs COCO): {fid_finetuned_vs_coco:.8f}")
+                                    else:
+                                        print(f"      ✗ FID calculation failed, trying with images directly...")
+                                        coco_stats_cache = None  # Fall back to using images
                                 else:
                                     print(f"    [1/3] Cached stats mismatch ({cached_num} vs {num_coco_images} images), using images directly...")
                                     coco_stats_cache = None
@@ -1557,7 +1562,8 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                                 print(f"    [1/3] Error validating cached stats: {e}, using images directly...")
                                 coco_stats_cache = None
                     
-                    if not coco_stats_cache and coco_images_dir and os.path.exists(coco_images_dir):
+                    # If cached stats didn't work, try using COCO images directly
+                    if fid_finetuned_vs_coco is None and coco_images_dir and os.path.exists(coco_images_dir):
                         print(f"    [1/3] Calculating FID: Fine-tuned vs COCO (COCO as baseline)...")
                         # COCO as reference, fine-tuned as generated
                         fid_finetuned_vs_coco = calculate_fid(
@@ -1567,12 +1573,11 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                         )
                         if fid_finetuned_vs_coco is not None:
                             print(f"      ✓ FID (Fine-tuned vs COCO): {fid_finetuned_vs_coco:.8f}")
-                    elif not coco_images_dir or not os.path.exists(coco_images_dir):
-                        print(f"    [1/3] Skipping: Fine-tuned vs COCO (COCO images not available)")
+                        else:
+                            print(f"      ✗ FID calculation failed")
+                    elif fid_finetuned_vs_coco is None:
+                        print(f"    [1/3] Skipping: Fine-tuned vs COCO (COCO images/stats not available)")
                         print(f"      Note: COCO images are needed for this metric. They will be downloaded automatically.")
-                        fid_finetuned_vs_coco = None
-                    else:
-                        fid_finetuned_vs_coco = None
                     
                     # 3. FID between COCO and original SDXL model (using cached COCO stats if available)
                     # Use the same cached stats file (with correct number of images)
