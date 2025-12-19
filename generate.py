@@ -8,7 +8,7 @@ import argparse
 import os
 
 import torch
-from diffusers import DiffusionPipeline, StableDiffusionXLPipeline
+from diffusers import DiffusionPipeline, StableDiffusionXLPipeline, EulerDiscreteScheduler
 
 
 def load_lora_weights(pipeline, lora_path):
@@ -72,6 +72,8 @@ def generate_image_in_memory(
     device="cuda" if torch.cuda.is_available() else "cpu",
     seed=None,
     pipeline_cache=None,
+    scheduler=None,
+    latents=None,
 ):
     """Generate image in memory without saving to disk. Returns PIL Image object."""
     # Set seed if provided
@@ -99,6 +101,10 @@ def generate_image_in_memory(
                 base.vae.enable_slicing()
             if hasattr(base.vae, 'enable_tiling'):
                 base.vae.enable_tiling()
+        
+        # Set scheduler if provided (e.g., for MLPerf benchmark compatibility)
+        if scheduler is not None:
+            base.scheduler = scheduler
         
         # Enable memory efficient attention if available
         try:
@@ -141,6 +147,12 @@ def generate_image_in_memory(
         refiner = pipeline_cache.get("refiner", None)
     
     # Generate image
+    # Use fixed latents if provided (for MLPerf benchmark reproducibility)
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+    
     if refiner is not None:
         # Use base + refiner pipeline
         high_noise_frac = 0.8
@@ -152,6 +164,8 @@ def generate_image_in_memory(
             height=height,
             width=width,
             guidance_scale=guidance_scale,
+            generator=generator,
+            latents=latents,
         ).images
         
         image = refiner(
@@ -159,6 +173,7 @@ def generate_image_in_memory(
             num_inference_steps=num_inference_steps,
             denoising_start=high_noise_frac,
             image=image,
+            generator=generator,
         ).images[0]
     else:
         # Use base pipeline only
@@ -168,6 +183,8 @@ def generate_image_in_memory(
             height=height,
             width=width,
             guidance_scale=guidance_scale,
+            generator=generator,
+            latents=latents,
         ).images[0]
     
     return image
@@ -178,6 +195,7 @@ def create_pipeline_cache(
     base_model="stabilityai/stable-diffusion-xl-base-1.0",
     use_refiner=True,
     device="cuda" if torch.cuda.is_available() else "cpu",
+    scheduler=None,
 ):
     """Create and cache pipeline for reuse across multiple generations"""
     # Load base pipeline
@@ -197,6 +215,10 @@ def create_pipeline_cache(
             base.vae.enable_slicing()
         if hasattr(base.vae, 'enable_tiling'):
             base.vae.enable_tiling()
+    
+    # Set scheduler if provided (e.g., for MLPerf benchmark compatibility)
+    if scheduler is not None:
+        base.scheduler = scheduler
     
     # Enable memory efficient attention if available
     try:
