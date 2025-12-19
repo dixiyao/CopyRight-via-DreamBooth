@@ -131,17 +131,61 @@ def compute_and_cache_fid_stats(images_dir, cache_file, device="cuda", expected_
     try:
         from pytorch_fid.inception import InceptionV3
         from pytorch_fid.fid_score import calculate_frechet_distance
-        import fid_score
+        
+        # Use the fid_score module that was imported at the top
+        if not FID_AVAILABLE:
+            raise ImportError("pytorch_fid not available")
         
         # Load Inception model
         block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
         model = InceptionV3([block_idx]).to(device)
         model.eval()
         
-        # Compute statistics
-        stats = fid_score._compute_statistics_of_path(
-            images_dir, model, 50, device, 2048
-        )
+        # Compute statistics using fid_score module
+        # _compute_statistics_of_path is a private function, access it directly from the module
+        if hasattr(fid_score, '_compute_statistics_of_path'):
+            stats = fid_score._compute_statistics_of_path(
+                images_dir, model, 50, device, 2048
+            )
+        else:
+            # Fallback: use calculate_fid_given_paths with a temporary directory
+            # This is less efficient but works if _compute_statistics_of_path is not available
+            import tempfile
+            import shutil
+            temp_dir = tempfile.mkdtemp()
+            try:
+                # Copy one image to temp dir to compute stats
+                import glob
+                image_files = glob.glob(os.path.join(images_dir, "*.jpg")) + \
+                            glob.glob(os.path.join(images_dir, "*.png")) + \
+                            glob.glob(os.path.join(images_dir, "*.jpeg"))
+                if image_files:
+                    import shutil
+                    shutil.copy(image_files[0], temp_dir)
+                    # Use calculate_fid_given_paths which internally computes stats
+                    # We'll extract stats from the FID calculation
+                    fid_value = fid_score.calculate_fid_given_paths(
+                        [images_dir, temp_dir],
+                        batch_size=50,
+                        device=device,
+                        dims=2048
+                    )
+                    # This approach doesn't give us stats directly, so we need to compute them
+                    # Let's use the direct approach with Inception features
+                    from pytorch_fid.fid_score import get_activations
+                    import torch
+                    import numpy as np
+                    
+                    # Get activations for all images
+                    print(f"  Computing activations for {len(image_files)} images...")
+                    activations = get_activations(images_dir, model, 50, device, 2048)
+                    
+                    # Compute mean and covariance
+                    mu = np.mean(activations, axis=0)
+                    sigma = np.cov(activations, rowvar=False)
+                    stats = {'mu': mu, 'sigma': sigma}
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
         
         # Save to cache file with number of images
         os.makedirs(os.path.dirname(cache_file), exist_ok=True)
@@ -1408,10 +1452,11 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
     #   1. FID between original SDXL and fine-tuned model
     #   2. FID between COCO and fine-tuned model
     #   3. FID between COCO and original SDXL model
-    fid_original_vs_finetuned = None
-    fid_coco_vs_finetuned = None
-    fid_coco_vs_original = None
-    fid_value = None  # Keep for backward compatibility (original vs fine-tuned)
+    # Three FID scores (COCO as baseline):
+    fid_finetuned_vs_coco = None      # Fine-tuned vs COCO
+    fid_original_vs_coco = None       # Original vs COCO
+    fid_finetuned_vs_original = None  # Fine-tuned vs Original
+    fid_value = None  # Keep for backward compatibility
     
     if use_mlperf_benchmark or (compare_with_original and lora_path and reference_dir):
         num_samples = len([r for r in results if r["success"]])
@@ -1510,22 +1555,12 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                 
                 if use_mlperf_benchmark:
                     # MLPerf: Calculate all three FID scores
+                    # Order: COCO is baseline, so we calculate:
+                    # 1. Fine-tuned vs COCO (COCO as reference)
+                    # 2. Original vs COCO (COCO as reference)
+                    # 3. Fine-tuned vs Original (Original as reference)
                     
-                    # 1. FID between original SDXL and fine-tuned model
-                    if compare_with_original and lora_path and reference_dir:
-                        print(f"    [1/3] Calculating FID: Original SDXL vs Fine-tuned...")
-                        fid_original_vs_finetuned = calculate_fid(
-                            real_images_dir=reference_dir,
-                            generated_images_dir=eval_output_dir,
-                            device=device,
-                        )
-                        fid_value = fid_original_vs_finetuned  # For backward compatibility
-                        if fid_original_vs_finetuned is not None:
-                            print(f"      ✓ FID (Original vs Fine-tuned): {fid_original_vs_finetuned:.8f}")
-                    else:
-                        print(f"    [1/3] Skipping: Original vs Fine-tuned (reference images not available)")
-                    
-                    # 2. FID between COCO and fine-tuned model (using cached COCO stats if available)
+                    # 1. FID: Fine-tuned vs COCO (COCO as baseline/reference)
                     # Check for cached stats with correct number of images
                     num_coco_images = 0
                     if coco_images_dir and os.path.exists(coco_images_dir):
@@ -1544,34 +1579,39 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                                 with np.load(coco_stats_cache) as data:
                                     cached_num = int(data.get('num_images', 0))
                                 if cached_num == num_coco_images:
-                                    print(f"    [2/3] Calculating FID: COCO vs Fine-tuned (using cached COCO stats for {num_coco_images} images)...")
-                                    fid_coco_vs_finetuned = calculate_fid(
+                                    print(f"    [1/3] Calculating FID: Fine-tuned vs COCO (using cached COCO stats for {num_coco_images} images)...")
+                                    # COCO as reference (precomputed stats), fine-tuned as generated
+                                    fid_finetuned_vs_coco = calculate_fid(
                                         real_images_dir=None,
                                         generated_images_dir=eval_output_dir,
                                         device=device,
                                         use_precomputed_stats=coco_stats_cache,
                                     )
-                                    if fid_coco_vs_finetuned is not None:
-                                        print(f"      ✓ FID (COCO vs Fine-tuned): {fid_coco_vs_finetuned:.8f}")
+                                    if fid_finetuned_vs_coco is not None:
+                                        print(f"      ✓ FID (Fine-tuned vs COCO): {fid_finetuned_vs_coco:.8f}")
                                 else:
-                                    print(f"    [2/3] Cached stats mismatch ({cached_num} vs {num_coco_images} images), using images directly...")
+                                    print(f"    [1/3] Cached stats mismatch ({cached_num} vs {num_coco_images} images), using images directly...")
                                     coco_stats_cache = None
                             except Exception as e:
-                                print(f"    [2/3] Error validating cached stats: {e}, using images directly...")
+                                print(f"    [1/3] Error validating cached stats: {e}, using images directly...")
                                 coco_stats_cache = None
                     
                     if not coco_stats_cache and coco_images_dir and os.path.exists(coco_images_dir):
-                        print(f"    [2/3] Calculating FID: COCO vs Fine-tuned (using COCO images directly)...")
-                        fid_coco_vs_finetuned = calculate_fid(
+                        print(f"    [1/3] Calculating FID: Fine-tuned vs COCO (COCO as baseline)...")
+                        # COCO as reference, fine-tuned as generated
+                        fid_finetuned_vs_coco = calculate_fid(
                             real_images_dir=coco_images_dir,
                             generated_images_dir=eval_output_dir,
                             device=device,
                         )
-                        if fid_coco_vs_finetuned is not None:
-                            print(f"      ✓ FID (COCO vs Fine-tuned): {fid_coco_vs_finetuned:.8f}")
+                        if fid_finetuned_vs_coco is not None:
+                            print(f"      ✓ FID (Fine-tuned vs COCO): {fid_finetuned_vs_coco:.8f}")
                     elif not coco_images_dir or not os.path.exists(coco_images_dir):
-                        print(f"    [2/3] Skipping: COCO vs Fine-tuned (COCO images not available)")
+                        print(f"    [1/3] Skipping: Fine-tuned vs COCO (COCO images not available)")
                         print(f"      Note: COCO images are needed for this metric. They will be downloaded automatically.")
+                        fid_finetuned_vs_coco = None
+                    else:
+                        fid_finetuned_vs_coco = None
                     
                     # 3. FID between COCO and original SDXL model (using cached COCO stats if available)
                     # Use the same cached stats file (with correct number of images)
@@ -1586,97 +1626,54 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                             with np.load(coco_stats_cache) as data:
                                 cached_num = int(data.get('num_images', 0))
                             if cached_num != num_coco_images:
-                                print(f"    [3/3] Cached stats mismatch ({cached_num} vs {num_coco_images} images), recomputing...")
+                                print(f"    [2/3] Cached stats mismatch ({cached_num} vs {num_coco_images} images), recomputing...")
                                 coco_stats_cache = None
                         except Exception:
                             coco_stats_cache = None
                     
                     if coco_stats_cache and os.path.exists(coco_stats_cache) and compare_with_original and lora_path and reference_dir:
-                        print(f"    [3/3] Calculating FID: COCO vs Original SDXL (using cached COCO stats)...")
-                        # Compute stats for original model images and compare with cached COCO stats
-                        try:
-                            from pytorch_fid.inception import InceptionV3
-                            from pytorch_fid.fid_score import calculate_frechet_distance
-                            
-                            # Load cached COCO stats
-                            with np.load(coco_stats_cache) as data:
-                                coco_stats = {
-                                    'mu': data['mu'],
-                                    'sigma': data['sigma']
-                                }
-                            
-                            # Load Inception model
-                            block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
-                            model = InceptionV3([block_idx]).to(device)
-                            model.eval()
-                            
-                            # Compute statistics for original model images (cache if not exists)
-                            # Count reference images to validate cache
-                            import glob
-                            ref_image_files = glob.glob(os.path.join(reference_dir, "*.jpg")) + \
-                                            glob.glob(os.path.join(reference_dir, "*.png")) + \
-                                            glob.glob(os.path.join(reference_dir, "*.jpeg"))
-                            num_ref_images = len(ref_image_files)
-                            
-                            original_stats_cache = os.path.join(mlperf_benchmark_dir, f"original_sdxl_fid_stats_{num_ref_images}.npz")
-                            if os.path.exists(original_stats_cache):
-                                # Validate cached stats match number of images
-                                try:
-                                    with np.load(original_stats_cache) as data:
-                                        cached_num = int(data.get('num_images', 0))
-                                    if cached_num == num_ref_images:
-                                        print(f"      Using cached original model stats (for {num_ref_images} images)...")
-                                        original_stats = {
-                                            'mu': data['mu'],
-                                            'sigma': data['sigma']
-                                        }
-                                    else:
-                                        print(f"      Cached stats mismatch ({cached_num} vs {num_ref_images} images), recomputing...")
-                                        os.remove(original_stats_cache)
-                                        original_stats_cache = None
-                                except Exception:
-                                    original_stats_cache = None
-                            
-                            if not original_stats_cache or not os.path.exists(original_stats_cache):
-                                print(f"      Computing statistics for original model images ({num_ref_images} images)...")
-                                original_stats = fid_score._compute_statistics_of_path(
-                                    reference_dir, model, 50, device, 2048
-                                )
-                                # Cache original model stats with number of images
-                                original_stats_cache = os.path.join(mlperf_benchmark_dir, f"original_sdxl_fid_stats_{num_ref_images}.npz")
-                                np.savez(
-                                    original_stats_cache,
-                                    mu=original_stats['mu'],
-                                    sigma=original_stats['sigma'],
-                                    num_images=num_ref_images
-                                )
-                                print(f"      ✓ Cached original model stats: {original_stats_cache} (for {num_ref_images} images)")
-                            
-                            # Calculate FID using cached COCO stats vs original model stats
-                            fid_coco_vs_original = calculate_frechet_distance(
-                                coco_stats['mu'], coco_stats['sigma'],
-                                original_stats['mu'], original_stats['sigma']
-                            )
-                            
-                            if fid_coco_vs_original is not None:
-                                print(f"      ✓ FID (COCO vs Original SDXL): {fid_coco_vs_original:.8f}")
-                        except Exception as e:
-                            print(f"      ✗ Failed to calculate COCO vs Original FID: {e}")
-                            fid_coco_vs_original = None
+                        print(f"    [2/3] Calculating FID: Original vs COCO (using cached COCO stats)...")
+                        # COCO as reference (precomputed stats), original as generated
+                        fid_original_vs_coco = calculate_fid(
+                            real_images_dir=None,
+                            generated_images_dir=reference_dir,
+                            device=device,
+                            use_precomputed_stats=coco_stats_cache,
+                        )
+                        if fid_original_vs_coco is not None:
+                            print(f"      ✓ FID (Original vs COCO): {fid_original_vs_coco:.8f}")
                     elif coco_images_dir and os.path.exists(coco_images_dir) and compare_with_original and lora_path and reference_dir:
-                        print(f"    [3/3] Calculating FID: COCO vs Original SDXL (using COCO images directly)...")
-                        fid_coco_vs_original = calculate_fid(
+                        print(f"    [2/3] Calculating FID: Original vs COCO (COCO as baseline)...")
+                        # COCO as reference, original as generated
+                        fid_original_vs_coco = calculate_fid(
                             real_images_dir=coco_images_dir,
                             generated_images_dir=reference_dir,
                             device=device,
                         )
-                        if fid_coco_vs_original is not None:
-                            print(f"      ✓ FID (COCO vs Original SDXL): {fid_coco_vs_original:.8f}")
+                        if fid_original_vs_coco is not None:
+                            print(f"      ✓ FID (Original vs COCO): {fid_original_vs_coco:.8f}")
                     else:
-                        if not (coco_images_dir and os.path.exists(coco_images_dir)) and not os.path.exists(coco_stats_cache):
-                            print(f"    [3/3] Skipping: COCO vs Original (COCO images/stats not available)")
+                        if not (coco_images_dir and os.path.exists(coco_images_dir)) and not (coco_stats_cache and os.path.exists(coco_stats_cache)):
+                            print(f"    [2/3] Skipping: Original vs COCO (COCO images/stats not available)")
                         else:
-                            print(f"    [3/3] Skipping: COCO vs Original (reference images not available)")
+                            print(f"    [2/3] Skipping: Original vs COCO (reference images not available)")
+                        fid_original_vs_coco = None
+                    
+                    # 3. FID: Fine-tuned vs Original (Original as reference)
+                    if compare_with_original and lora_path and reference_dir:
+                        print(f"    [3/3] Calculating FID: Fine-tuned vs Original...")
+                        # Original as reference, fine-tuned as generated
+                        fid_finetuned_vs_original = calculate_fid(
+                            real_images_dir=reference_dir,
+                            generated_images_dir=eval_output_dir,
+                            device=device,
+                        )
+                        fid_value = fid_finetuned_vs_original  # For backward compatibility
+                        if fid_finetuned_vs_original is not None:
+                            print(f"      ✓ FID (Fine-tuned vs Original): {fid_finetuned_vs_original:.8f}")
+                    else:
+                        print(f"    [3/3] Skipping: Fine-tuned vs Original (reference images not available)")
+                        fid_finetuned_vs_original = None
                 else:
                     # Non-MLPerf: Compare fine-tuned vs original only
                     fid_original_vs_finetuned = calculate_fid(
@@ -1688,13 +1685,13 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                 
                 # Print summary
                 if use_mlperf_benchmark:
-                    print(f"\n  FID Scores Summary:")
-                    if fid_original_vs_finetuned is not None:
-                        print(f"    Original SDXL vs Fine-tuned: {fid_original_vs_finetuned:.8f} (lower = more similar)")
-                    if fid_coco_vs_finetuned is not None:
-                        print(f"    COCO vs Fine-tuned:          {fid_coco_vs_finetuned:.8f} (lower = better quality)")
-                    if fid_coco_vs_original is not None:
-                        print(f"    COCO vs Original SDXL:        {fid_coco_vs_original:.8f} (lower = better quality)")
+                    print(f"\n  FID Scores Summary (COCO as baseline):")
+                    if fid_finetuned_vs_coco is not None:
+                        print(f"    Fine-tuned vs COCO:          {fid_finetuned_vs_coco:.8f} (lower = better quality)")
+                    if fid_original_vs_coco is not None:
+                        print(f"    Original vs COCO:            {fid_original_vs_coco:.8f} (lower = better quality)")
+                    if fid_finetuned_vs_original is not None:
+                        print(f"    Fine-tuned vs Original:      {fid_finetuned_vs_original:.8f} (lower = more similar)")
                 elif fid_value is not None:
                     print(f"  ✓ FID Score (Original vs Fine-tuned): {fid_value:.8f} (lower = more similar)")
                     
@@ -1710,12 +1707,12 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                 print(f"    Using CLIP Score instead, which works better with smaller samples.")
     
     # MLPerf validation: Check scores against official thresholds
-    # Use COCO vs Fine-tuned FID for MLPerf validation (standard MLPerf metric)
+    # Use Fine-tuned vs COCO FID for MLPerf validation (standard MLPerf metric)
     mlperf_validation = None
     if use_mlperf_benchmark:
         print(f"\n  Validating MLPerf benchmark scores...")
-        # Use COCO vs Fine-tuned FID for MLPerf validation (this is the standard MLPerf metric)
-        fid_for_validation = fid_coco_vs_finetuned if fid_coco_vs_finetuned is not None else fid_value
+        # Use Fine-tuned vs COCO FID for MLPerf validation (this is the standard MLPerf metric)
+        fid_for_validation = fid_finetuned_vs_coco if fid_finetuned_vs_coco is not None else fid_value
         mlperf_validation = validate_mlperf_scores(fid_for_validation, avg_clip_score)
         
         if mlperf_validation["fid_score"] is not None:
@@ -1799,23 +1796,23 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
         
         # Write FID scores
         if use_mlperf_benchmark:
-            f.write("\nFID Scores (MLPerf Benchmark):\n")
-            if fid_original_vs_finetuned is not None:
-                f.write(f"  Original SDXL vs Fine-tuned: {fid_original_vs_finetuned:.8f}\n")
-                f.write("    (Lower = more similar to original model)\n")
-            if fid_coco_vs_finetuned is not None:
-                f.write(f"  COCO vs Fine-tuned:          {fid_coco_vs_finetuned:.8f}\n")
+            f.write("\nFID Scores (MLPerf Benchmark, COCO as baseline):\n")
+            if fid_finetuned_vs_coco is not None:
+                f.write(f"  Fine-tuned vs COCO:          {fid_finetuned_vs_coco:.8f}\n")
                 f.write("    (Lower = better quality, this is the MLPerf standard metric)\n")
                 f.write(f"    MLPerf threshold: [23.01085758, 23.95007626]\n")
-                if mlperf_validation and mlperf_validation.get("fid_score") == fid_coco_vs_finetuned:
+                if mlperf_validation and mlperf_validation.get("fid_score") == fid_finetuned_vs_coco:
                     if mlperf_validation["fid_valid"]:
                         f.write(f"    Status: ✓ VALID (within MLPerf threshold)\n")
                     else:
                         f.write(f"    Status: ✗ INVALID (outside MLPerf threshold)\n")
-            if fid_coco_vs_original is not None:
-                f.write(f"  COCO vs Original SDXL:        {fid_coco_vs_original:.8f}\n")
+            if fid_original_vs_coco is not None:
+                f.write(f"  Original vs COCO:            {fid_original_vs_coco:.8f}\n")
                 f.write("    (Lower = better quality)\n")
-            if fid_coco_vs_finetuned is None and fid_original_vs_finetuned is None:
+            if fid_finetuned_vs_original is not None:
+                f.write(f"  Fine-tuned vs Original:      {fid_finetuned_vs_original:.8f}\n")
+                f.write("    (Lower = more similar to original model)\n")
+            if fid_finetuned_vs_coco is None and fid_finetuned_vs_original is None:
                 f.write("  (FID scores not calculated - see warnings above)\n")
         else:
             if fid_value is not None:
@@ -1830,7 +1827,7 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
         if use_mlperf_benchmark and mlperf_validation:
             f.write("\nMLPerf Validation Results:\n")
             if mlperf_validation["fid_score"] is not None:
-                f.write(f"  FID (COCO vs Fine-tuned): {mlperf_validation['fid_score']:.8f} - {mlperf_validation.get('fid_status', 'N/A')}\n")
+                f.write(f"  FID (Fine-tuned vs COCO): {mlperf_validation['fid_score']:.8f} - {mlperf_validation.get('fid_status', 'N/A')}\n")
             if mlperf_validation["clip_score"] is not None:
                 f.write(f"  CLIP: {mlperf_validation['clip_score']:.8f} - {mlperf_validation.get('clip_status', 'N/A')}\n")
     
@@ -1850,19 +1847,19 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
     # Print FID scores summary
     if use_mlperf_benchmark:
         print(f"\n  Final FID Scores:")
-        if fid_original_vs_finetuned is not None:
-            print(f"    Original SDXL vs Fine-tuned: {fid_original_vs_finetuned:.8f} (lower = more similar)")
-        if fid_coco_vs_finetuned is not None:
-            print(f"    COCO vs Fine-tuned:          {fid_coco_vs_finetuned:.8f} (lower = better quality)")
-            if mlperf_validation and mlperf_validation.get("fid_score") == fid_coco_vs_finetuned:
+        if fid_finetuned_vs_coco is not None:
+            print(f"    Fine-tuned vs COCO:          {fid_finetuned_vs_coco:.8f} (lower = better quality)")
+            if mlperf_validation and mlperf_validation.get("fid_score") == fid_finetuned_vs_coco:
                 print(f"      MLPerf threshold: [23.01085758, 23.95007626]")
                 if mlperf_validation["fid_valid"]:
                     print(f"      Status: ✓ VALID (within MLPerf threshold)")
                 else:
                     print(f"      Status: ✗ INVALID (outside MLPerf threshold)")
-        if fid_coco_vs_original is not None:
-            print(f"    COCO vs Original SDXL:        {fid_coco_vs_original:.8f} (lower = better quality)")
-        if fid_coco_vs_finetuned is None and fid_original_vs_finetuned is None:
+        if fid_original_vs_coco is not None:
+            print(f"    Original vs COCO:            {fid_original_vs_coco:.8f} (lower = better quality)")
+        if fid_finetuned_vs_original is not None:
+            print(f"    Fine-tuned vs Original:      {fid_finetuned_vs_original:.8f} (lower = more similar)")
+        if fid_finetuned_vs_coco is None and fid_finetuned_vs_original is None:
             print(f"    (FID scores not calculated - see warnings above)")
     else:
         if fid_value is not None:
@@ -1878,9 +1875,9 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
         "clip_score": avg_clip_score,
         "clip_score_original": avg_clip_score_original,
         "fid": fid_value,  # Backward compatibility: original vs fine-tuned
-        "fid_original_vs_finetuned": fid_original_vs_finetuned,
-        "fid_coco_vs_finetuned": fid_coco_vs_finetuned,
-        "fid_coco_vs_original": fid_coco_vs_original,
+        "fid_finetuned_vs_coco": fid_finetuned_vs_coco,
+        "fid_original_vs_coco": fid_original_vs_coco,
+        "fid_finetuned_vs_original": fid_finetuned_vs_original,
         "mlperf_validation": mlperf_validation if use_mlperf_benchmark else None
     }
 
