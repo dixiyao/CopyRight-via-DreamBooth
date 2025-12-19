@@ -233,269 +233,160 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
     
     prompts = []
     
-    # Try multiple sources: torchvision, HuggingFace datasets, etc.
+    # Try multiple sources: pycocotools and FiftyOne
     prompts = None
     
-    # Method 1: Try torchvision.datasets.CocoCaptions (if COCO images are available)
-    try:
-        print("  Attempting to load COCO captions from torchvision...")
-        from torchvision.datasets import CocoCaptions
-        import torchvision.transforms as transforms
-        
-        # Try common COCO paths
-        coco_root_paths = [
-            os.path.expanduser("~/coco"),
-            os.path.expanduser("~/data/coco"),
-            "/data/coco",
-            "./coco",
-        ]
-        
-        coco_ann_file = None
-        coco_root = None
-        
-        for root in coco_root_paths:
-            val_ann = os.path.join(root, "annotations", "captions_val2017.json")
-            if os.path.exists(val_ann):
-                coco_root = root
-                coco_ann_file = val_ann
-                print(f"    Found COCO annotations at: {coco_ann_file}")
-                break
-        
-        if coco_ann_file and coco_root:
-            # Load COCO captions using torchvision
-            # Note: This requires COCO images, but we can extract captions without loading images
-            print("    Loading COCO captions from torchvision...")
+    # Method 1: Try pycocotools (most reliable for COCO)
+    if not prompts:
+        try:
+            print("  Attempting to load COCO captions using pycocotools...")
+            from pycocotools.coco import COCO
             import json
-            
-            with open(coco_ann_file, 'r') as f:
-                coco_data = json.load(f)
-            
-            # Extract captions from annotations
-            all_captions = []
-            if 'annotations' in coco_data:
-                for ann in coco_data['annotations']:
-                    if 'caption' in ann:
-                        all_captions.append(ann['caption'].strip())
-            
-            if all_captions:
-                print(f"    ✓ Loaded {len(all_captions)} captions from torchvision COCO")
-                # Remove duplicates and filter
-                all_captions = list(set([c for c in all_captions if c and len(c) > 5]))
-                
-                if len(all_captions) < num_samples:
-                    prompts = all_captions
-                else:
-                    random.seed(seed)
-                    random.shuffle(all_captions)
-                    prompts = all_captions[:num_samples]
-                
-                print(f"  ✓ Selected {len(prompts)} random prompts from COCO (seed={seed})")
-    except ImportError:
-        print("  ✗ torchvision not available")
-    except Exception as e:
-        print(f"  ✗ Failed to load from torchvision: {e}")
-    
-    # Method 2: Try HuggingFace datasets (without trust_remote_code)
-    if not prompts:
-        try:
-            print("  Attempting to load COCO captions from HuggingFace datasets...")
-            from datasets import load_dataset
-            
-            print("  Loading COCO captions (text only, no images needed)...")
-            print("  Note: This is lightweight - only text captions are downloaded")
-            
-            # Try simple load_dataset approach first (as user suggested)
-            coco_dataset = None
-            try:
-                print("    Trying: load_dataset('HuggingFaceM4/COCO')")
-                coco_dataset = load_dataset("HuggingFaceM4/COCO")
-                print("    ✓ Successfully loaded COCO dataset: HuggingFaceM4/COCO")
-            except Exception as e:
-                error_msg = str(e)
-                if len(error_msg) > 200:
-                    error_msg = error_msg[:200] + "..."
-                print(f"    ✗ Failed: {error_msg}")
-                
-                # Try other variants as fallback
-                coco_variants = [
-                    "HuggingFaceM4/coco",  # lowercase
-                    "detection-datasets/coco_2017_val",
-                ]
-                
-                for variant in coco_variants:
-                    try:
-                        print(f"    Trying COCO variant: {variant}")
-                        try:
-                            coco_dataset = load_dataset(variant, split="validation")
-                        except Exception:
-                            try:
-                                coco_dataset = load_dataset(variant, split="val")
-                            except Exception:
-                                coco_dataset = load_dataset(variant)
-                        print(f"    ✓ Successfully loaded COCO dataset: {variant}")
-                        break
-                    except Exception as e2:
-                        error_msg2 = str(e2)
-                        if len(error_msg2) > 200:
-                            error_msg2 = error_msg2[:200] + "..."
-                        print(f"    ✗ Failed: {error_msg2}")
-                        continue
-            
-            # Extract captions (prompts) from COCO dataset if loaded
-            if coco_dataset is not None:
-                print("  Extracting captions from COCO dataset...")
-                all_captions = []
-                
-                # Handle different dataset structures (dict with splits, or direct dataset)
-                if isinstance(coco_dataset, dict):
-                    # If it's a dict, try to find validation/val split, or use first available
-                    if 'validation' in coco_dataset:
-                        dataset_to_iterate = coco_dataset['validation']
-                    elif 'val' in coco_dataset:
-                        dataset_to_iterate = coco_dataset['val']
-                    elif len(coco_dataset) > 0:
-                        # Use first available split
-                        first_key = list(coco_dataset.keys())[0]
-                        dataset_to_iterate = coco_dataset[first_key]
-                        print(f"    Using split: {first_key}")
-                    else:
-                        raise ValueError("No splits found in COCO dataset")
-                else:
-                    dataset_to_iterate = coco_dataset
-                
-                for item in dataset_to_iterate:
-                    # COCO format varies, try multiple possible structures
-                    captions = []
-            
-                    # Try different field names for captions
-                    # HuggingFaceM4/COCO has 'sentences' as a dict with 'raw' key
-                    if 'sentences' in item:
-                        sentences = item['sentences']
-                        # HuggingFaceM4/COCO format: sentences is a dict with 'raw' key
-                        if isinstance(sentences, dict):
-                            if 'raw' in sentences:
-                                captions.append(sentences['raw'])
-                            # Sometimes it's a list of sentence dicts
-                            elif isinstance(sentences, list):
-                                for sent in sentences:
-                                    if isinstance(sent, dict) and 'raw' in sent:
-                                        captions.append(sent['raw'])
-                                    elif isinstance(sent, str):
-                                        captions.append(sent)
-                        # Some COCO datasets have sentences as a list
-                        elif isinstance(sentences, list):
-                            for sent in sentences:
-                                if isinstance(sent, dict) and 'raw' in sent:
-                                    captions.append(sent['raw'])
-                                elif isinstance(sent, str):
-                                    captions.append(sent)
-                    elif 'caption' in item:
-                        captions = [item['caption']] if isinstance(item['caption'], str) else item['caption']
-                    elif 'captions' in item:
-                        captions = item['captions'] if isinstance(item['captions'], list) else [item['captions']]
-                    elif 'text' in item:
-                        captions = [item['text']] if isinstance(item['text'], str) else item['text']
-                    elif 'objects' in item and item['objects']:
-                        # Some datasets have objects with captions
-                        for obj in item['objects']:
-                            if isinstance(obj, dict):
-                                if 'caption' in obj:
-                                    captions.append(obj['caption'])
-                                elif 'captions' in obj:
-                                    if isinstance(obj['captions'], list):
-                                        captions.extend(obj['captions'])
-                                    else:
-                                        captions.append(obj['captions'])
-            
-                    # Add all found captions
-                    for cap in captions:
-                        if cap and isinstance(cap, str) and cap.strip():
-                            all_captions.append(cap.strip())
-                
-                # Check if we found any captions (after processing all items)
-                if not all_captions:
-                    raise ValueError("No captions found in COCO dataset structure. Dataset format may have changed.")
-                
-                # Remove duplicates and empty strings
-                all_captions = list(set([c for c in all_captions if c and len(c) > 5]))  # Filter very short captions
-                print(f"  Found {len(all_captions)} unique captions in COCO dataset")
-                
-                if len(all_captions) < num_samples:
-                    print(f"  Warning: Only {len(all_captions)} captions available, but {num_samples} requested.")
-                    print(f"  Using all available captions.")
-                    prompts = all_captions
-                else:
-                    # Randomly select num_samples with fixed seed for reproducibility
-                    random.seed(seed)
-                    random.shuffle(all_captions)
-                    prompts = all_captions[:num_samples]
-                    
-                    print(f"  ✓ Selected {len(prompts)} random prompts from COCO dataset (seed={seed})")
-            
-        except ImportError:
-            print("  ✗ HuggingFace datasets not available")
-            print("  Install with: pip install datasets")
-        except Exception as e:
-            print(f"  ✗ Failed to load from HuggingFace datasets: {e}")
-    
-    # Method 3: Try downloading COCO annotations JSON directly and parsing with pycocotools
-    if not prompts:
-        try:
-            print("  Attempting to download COCO captions from COCO website...")
             import urllib.request
-            import json
             import zipfile
             import tempfile
+            import shutil
             
-            # COCO validation captions URL (annotations only, ~250MB but we only need captions)
-            coco_annotations_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-            annotations_file = "captions_val2017.json"  # We only need validation captions
+            # Try to find COCO annotations file locally first
+            coco_ann_file = None
+            coco_paths = [
+                os.path.join(download_dir, "captions_val2017.json"),
+                os.path.join(download_dir, "captions_val2014.json"),
+                os.path.expanduser("~/coco/annotations/captions_val2017.json"),
+                os.path.expanduser("~/coco/annotations/captions_val2014.json"),
+                os.path.expanduser("~/data/coco/annotations/captions_val2017.json"),
+                "/data/coco/annotations/captions_val2017.json",
+                "./coco/annotations/captions_val2017.json",
+            ]
             
-            # Check cache first
-            cache_file = os.path.join(download_dir, annotations_file)
-            if os.path.exists(cache_file):
-                print(f"    Found cached COCO annotations: {cache_file}")
-            else:
-                print(f"    Downloading COCO annotations from: {coco_annotations_url}")
-                print(f"    Note: This is ~250MB, but we only extract captions (text only)")
+            for path in coco_paths:
+                if os.path.exists(path):
+                    coco_ann_file = path
+                    print(f"    Found COCO annotations at: {coco_ann_file}")
+                    break
+            
+            # If not found locally, download from COCO website
+            if not coco_ann_file:
+                print("    COCO annotations not found locally, downloading...")
+                coco_annotations_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+                annotations_file = "captions_val2017.json"
+                cache_file = os.path.join(download_dir, annotations_file)
                 
-                # Download to temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
-                    tmp_zip_path = tmp_file.name
-                
-                try:
-                    urllib.request.urlretrieve(coco_annotations_url, tmp_zip_path)
-                    print(f"    ✓ Downloaded annotations zip file")
+                if os.path.exists(cache_file):
+                    coco_ann_file = cache_file
+                    print(f"    Found cached COCO annotations: {cache_file}")
+                else:
+                    print(f"    Downloading COCO annotations from: {coco_annotations_url}")
+                    print(f"    Note: This is ~250MB, but we only extract captions (text only)")
                     
-                    # Extract only the captions file
-                    with zipfile.ZipFile(tmp_zip_path, 'r') as zip_ref:
-                        if annotations_file in zip_ref.namelist():
-                            zip_ref.extract(annotations_file, download_dir)
-                            cache_file = os.path.join(download_dir, annotations_file)
-                            print(f"    ✓ Extracted {annotations_file}")
-                        else:
-                            raise ValueError(f"{annotations_file} not found in zip")
-                finally:
-                    # Clean up temp file
-                    if os.path.exists(tmp_zip_path):
-                        os.remove(tmp_zip_path)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
+                        tmp_zip_path = tmp_file.name
+                    
+                    try:
+                        urllib.request.urlretrieve(coco_annotations_url, tmp_zip_path)
+                        print(f"    ✓ Downloaded annotations zip file")
+                        
+                        with zipfile.ZipFile(tmp_zip_path, 'r') as zip_ref:
+                            zip_files = zip_ref.namelist()
+                            possible_paths = [
+                                "annotations/captions_val2017.json",
+                                "captions_val2017.json",
+                            ]
+                            
+                            found_path = None
+                            for path in possible_paths:
+                                if path in zip_files:
+                                    found_path = path
+                                    break
+                            
+                            if found_path:
+                                zip_ref.extract(found_path, download_dir)
+                                extracted_path = os.path.join(download_dir, found_path)
+                                if extracted_path != cache_file:
+                                    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                                    if os.path.exists(extracted_path):
+                                        shutil.move(extracted_path, cache_file)
+                                coco_ann_file = cache_file
+                                print(f"    ✓ Extracted captions_val2017.json from zip")
+                            else:
+                                print(f"    Available files in zip (first 10): {zip_files[:10]}")
+                                raise ValueError(f"captions_val2017.json not found in zip")
+                    finally:
+                        if os.path.exists(tmp_zip_path):
+                            os.remove(tmp_zip_path)
             
-            # Parse COCO annotations JSON
-            print(f"    Parsing COCO annotations from: {cache_file}")
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                coco_data = json.load(f)
+            # Load COCO annotations using pycocotools
+            if coco_ann_file:
+                print(f"    Loading COCO annotations using pycocotools...")
+                coco = COCO(coco_ann_file)
+                
+                # Get all image IDs
+                img_ids = coco.getImgIds()
+                print(f"    Found {len(img_ids)} images in COCO validation set")
+                
+                # Extract all captions
+                all_captions = []
+                for img_id in img_ids:
+                    # Get captions associated with this image
+                    ann_ids = coco.getAnnIds(imgIds=img_id)
+                    anns = coco.loadAnns(ann_ids)
+                    for ann in anns:
+                        if 'caption' in ann:
+                            caption = ann['caption'].strip()
+                            if caption and len(caption) > 5:
+                                all_captions.append(caption)
+                
+                if all_captions:
+                    print(f"    ✓ Loaded {len(all_captions)} captions from COCO using pycocotools")
+                    # Remove duplicates
+                    all_captions = list(set(all_captions))
+                    
+                    if len(all_captions) < num_samples:
+                        prompts = all_captions
+                    else:
+                        random.seed(seed)
+                        random.shuffle(all_captions)
+                        prompts = all_captions[:num_samples]
+                    
+                    print(f"  ✓ Selected {len(prompts)} random prompts from COCO (seed={seed})")
+                else:
+                    raise ValueError("No captions found in COCO annotations")
+                    
+        except ImportError:
+            print("  ✗ pycocotools not available")
+            print("  Install with: pip install pycocotools")
+        except Exception as e:
+            error_msg = str(e)
+            if len(error_msg) > 200:
+                error_msg = error_msg[:200] + "..."
+            print(f"  ✗ Failed to load COCO using pycocotools: {error_msg}")
+    
+    # Method 2: Try FiftyOne (high-level API)
+    if not prompts:
+        try:
+            print("  Attempting to load COCO captions using FiftyOne...")
+            import fiftyone as fo
+            import fiftyone.zoo as foz
             
-            # Extract captions from annotations
+            print("    Loading COCO-2017 validation set with captions...")
+            dataset = foz.load_zoo_dataset(
+                "coco-2017",
+                split="validation",
+                label_types=["captions"],
+                max_samples=num_samples * 10  # Load more to have enough after filtering
+            )
+            
+            # Extract captions from FiftyOne dataset
             all_captions = []
-            if 'annotations' in coco_data:
-                for ann in coco_data['annotations']:
-                    if 'caption' in ann:
-                        caption = ann['caption'].strip()
-                        if caption and len(caption) > 5:
-                            all_captions.append(caption)
+            for sample in dataset:
+                if sample.captions and len(sample.captions) > 0:
+                    # FiftyOne returns captions as a list
+                    for caption in sample.captions:
+                        if isinstance(caption, str) and caption.strip() and len(caption.strip()) > 5:
+                            all_captions.append(caption.strip())
             
             if all_captions:
-                print(f"    ✓ Loaded {len(all_captions)} captions from COCO annotations")
+                print(f"    ✓ Loaded {len(all_captions)} captions from COCO using FiftyOne")
                 # Remove duplicates
                 all_captions = list(set(all_captions))
                 
@@ -508,15 +399,16 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
                 
                 print(f"  ✓ Selected {len(prompts)} random prompts from COCO (seed={seed})")
             else:
-                raise ValueError("No captions found in COCO annotations file")
+                raise ValueError("No captions found in FiftyOne COCO dataset")
                 
         except ImportError:
-            print("  ✗ urllib or json not available")
+            print("  ✗ FiftyOne not available")
+            print("  Install with: pip install fiftyone")
         except Exception as e:
             error_msg = str(e)
             if len(error_msg) > 200:
                 error_msg = error_msg[:200] + "..."
-            print(f"  ✗ Failed to download/parse COCO annotations: {error_msg}")
+            print(f"  ✗ Failed to load COCO using FiftyOne: {error_msg}")
     
     # Fallback to PartiPrompts if COCO loading failed
     if not prompts:
