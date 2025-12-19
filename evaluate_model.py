@@ -8,8 +8,12 @@ Supports:
 
 import argparse
 import csv
+import glob
 import os
 import random
+import shutil
+import tempfile
+import traceback
 
 import numpy as np
 import torch
@@ -35,12 +39,7 @@ except ImportError:
     LPIPS_AVAILABLE = False
     print("Warning: lpips not available. Install with: pip install lpips")
 
-try:
-    import clip
-    CLIP_AVAILABLE = True
-except ImportError:
-    CLIP_AVAILABLE = False
-    print("Warning: clip not available. Install with: pip install clip-by-openai")
+# CLIP functionality is handled via transformers, no need for separate clip import
 
 try:
     from transformers import BlipProcessor, BlipForConditionalGeneration
@@ -115,7 +114,6 @@ def compute_and_cache_fid_stats(images_dir, cache_file, device="cuda", expected_
                 os.remove(cache_file)
     
     # Count actual number of images
-    import glob
     image_files = glob.glob(os.path.join(images_dir, "*.jpg")) + \
                   glob.glob(os.path.join(images_dir, "*.png")) + \
                   glob.glob(os.path.join(images_dir, "*.jpeg"))
@@ -142,50 +140,21 @@ def compute_and_cache_fid_stats(images_dir, cache_file, device="cuda", expected_
         model.eval()
         
         # Compute statistics using fid_score module
-        # _compute_statistics_of_path is a private function, access it directly from the module
         if hasattr(fid_score, '_compute_statistics_of_path'):
             stats = fid_score._compute_statistics_of_path(
                 images_dir, model, 50, device, 2048
             )
         else:
-            # Fallback: use calculate_fid_given_paths with a temporary directory
-            # This is less efficient but works if _compute_statistics_of_path is not available
-            import tempfile
-            import shutil
-            temp_dir = tempfile.mkdtemp()
-            try:
-                # Copy one image to temp dir to compute stats
-                import glob
-                image_files = glob.glob(os.path.join(images_dir, "*.jpg")) + \
-                            glob.glob(os.path.join(images_dir, "*.png")) + \
-                            glob.glob(os.path.join(images_dir, "*.jpeg"))
-                if image_files:
-                    import shutil
-                    shutil.copy(image_files[0], temp_dir)
-                    # Use calculate_fid_given_paths which internally computes stats
-                    # We'll extract stats from the FID calculation
-                    fid_value = fid_score.calculate_fid_given_paths(
-                        [images_dir, temp_dir],
-                        batch_size=50,
-                        device=device,
-                        dims=2048
-                    )
-                    # This approach doesn't give us stats directly, so we need to compute them
-                    # Let's use the direct approach with Inception features
-                    from pytorch_fid.fid_score import get_activations
-                    import torch
-                    import numpy as np
-                    
-                    # Get activations for all images
-                    print(f"  Computing activations for {len(image_files)} images...")
-                    activations = get_activations(images_dir, model, 50, device, 2048)
-                    
-                    # Compute mean and covariance
-                    mu = np.mean(activations, axis=0)
-                    sigma = np.cov(activations, rowvar=False)
-                    stats = {'mu': mu, 'sigma': sigma}
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            # Fallback: use get_activations directly
+            from pytorch_fid.fid_score import get_activations
+            image_files = glob.glob(os.path.join(images_dir, "*.jpg")) + \
+                         glob.glob(os.path.join(images_dir, "*.png")) + \
+                         glob.glob(os.path.join(images_dir, "*.jpeg"))
+            print(f"  Computing activations for {len(image_files)} images...")
+            activations = get_activations(images_dir, model, 50, device, 2048)
+            mu = np.mean(activations, axis=0)
+            sigma = np.cov(activations, rowvar=False)
+            stats = {'mu': mu, 'sigma': sigma}
         
         # Save to cache file with number of images
         os.makedirs(os.path.dirname(cache_file), exist_ok=True)
@@ -282,7 +251,6 @@ def download_coco_images_for_prompts(prompts, prompt_to_image_info, download_dir
                 ]
                 for path in possible_paths:
                     if os.path.exists(path):
-                        import shutil
                         shutil.copy(path, local_image_path)
                         downloaded_count += 1
                         break
@@ -417,8 +385,6 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
             import json
             import urllib.request
             import zipfile
-            import tempfile
-            import shutil
             
             # Try to find COCO annotations file locally first
             coco_ann_file = None
@@ -808,8 +774,6 @@ def calculate_fid(real_images_dir, generated_images_dir, device="cuda", target_s
         
         # Standard FID calculation (comparing two image directories)
         # Resize all images to the same size before FID calculation
-        import glob
-        
         def resize_images_in_dir(directory, target_size):
             """Resize all images in a directory to target_size"""
             image_files = glob.glob(os.path.join(directory, "*.png")) + glob.glob(os.path.join(directory, "*.jpg")) + glob.glob(os.path.join(directory, "*.jpeg"))
@@ -843,7 +807,6 @@ def calculate_fid(real_images_dir, generated_images_dir, device="cuda", target_s
         return fid_value
     except Exception as e:
         print(f"Error calculating FID: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
@@ -1525,7 +1488,6 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                         
                         if coco_images_dir and os.path.exists(coco_images_dir):
                             # Count images to estimate size
-                            import glob
                             image_files = glob.glob(os.path.join(coco_images_dir, "*.jpg")) + \
                                         glob.glob(os.path.join(coco_images_dir, "*.png")) + \
                                         glob.glob(os.path.join(coco_images_dir, "*.jpeg"))
@@ -1564,7 +1526,6 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                     # Check for cached stats with correct number of images
                     num_coco_images = 0
                     if coco_images_dir and os.path.exists(coco_images_dir):
-                        import glob
                         coco_image_files = glob.glob(os.path.join(coco_images_dir, "*.jpg")) + \
                                           glob.glob(os.path.join(coco_images_dir, "*.png")) + \
                                           glob.glob(os.path.join(coco_images_dir, "*.jpeg"))
@@ -1697,7 +1658,6 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
                     
             except Exception as e:
                 print(f"  Warning: FID calculation failed: {e}")
-                import traceback
                 traceback.print_exc()
         else:
             if use_mlperf_benchmark:
