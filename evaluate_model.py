@@ -280,9 +280,9 @@ def calculate_rfid(generated_images_dir, device="cuda"):
             # Fallback: manually compute statistics using get_activations
             from pytorch_fid.fid_score import get_activations
             print(f"  Computing activations...")
-            # get_activations expects a list of file paths and device as string
-            # Signature: get_activations(files, model, batch_size, device, dims)
-            activations = get_activations(image_files, model, 50, device_str, 2048)
+            # get_activations signature: get_activations(files, model, batch_size, dims, device)
+            # Note: dims comes before device in the signature
+            activations = get_activations(image_files, model, 50, 2048, device_str)
             mu = np.mean(activations, axis=0)
             sigma = np.cov(activations, rowvar=False)
         
