@@ -6,6 +6,7 @@ Metrics: PSNR, SSIM, LPIPS, rFID (as in Table 3 of the paper)
 """
 
 import argparse
+import glob
 import os
 import random
 import shutil
@@ -235,24 +236,49 @@ def calculate_rfid(generated_images_dir, device="cuda"):
     
     try:
         from pytorch_fid.inception import InceptionV3
-        from pytorch_fid.fid_score import get_activations, calculate_frechet_distance
+        from pytorch_fid.fid_score import calculate_frechet_distance
         
         # Convert device string to torch device if needed
         if isinstance(device, str):
-            device = torch.device(device)
+            device_obj = torch.device(device)
+        else:
+            device_obj = device
         
         # Load Inception model
         block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
-        model = InceptionV3([block_idx]).to(device)
+        model = InceptionV3([block_idx]).to(device_obj)
         model.eval()
         
-        # Compute activations for generated images
-        print(f"  Computing activations for images in {generated_images_dir}...")
-        activations = get_activations(generated_images_dir, model, batch_size=50, device=device, dims=2048)
+        # Verify the directory exists and has images
+        if not os.path.exists(generated_images_dir):
+            print(f"  Error: Directory does not exist: {generated_images_dir}")
+            return None
         
-        # Compute statistics
-        mu = np.mean(activations, axis=0)
-        sigma = np.cov(activations, rowvar=False)
+        image_files = glob.glob(os.path.join(generated_images_dir, "*.png")) + \
+                     glob.glob(os.path.join(generated_images_dir, "*.jpg")) + \
+                     glob.glob(os.path.join(generated_images_dir, "*.jpeg"))
+        if not image_files:
+            print(f"  Warning: No images found in {generated_images_dir}")
+            return None
+        
+        print(f"  Computing statistics for {len(image_files)} images in {generated_images_dir}...")
+        
+        # Use _compute_statistics_of_path which is the standard way
+        if hasattr(fid_score, '_compute_statistics_of_path'):
+            # _compute_statistics_of_path(path, model, batch_size, device, dims) - positional args only
+            stats = fid_score._compute_statistics_of_path(
+                generated_images_dir, model, 50, device_obj, 2048
+            )
+            mu = stats['mu']
+            sigma = stats['sigma']
+        else:
+            # Fallback: manually compute statistics using get_activations
+            from pytorch_fid.fid_score import get_activations
+            print(f"  Computing activations...")
+            # get_activations signature: (path, model, batch_size, device, dims) - positional args only
+            activations = get_activations(generated_images_dir, model, 50, device_obj, 2048)
+            mu = np.mean(activations, axis=0)
+            sigma = np.cov(activations, rowvar=False)
         
         # rFID: Compute FID against a zero-mean, identity-covariance reference distribution
         # This measures how "realistic" the generated images are
