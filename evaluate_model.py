@@ -252,6 +252,10 @@ def load_mlperf_benchmark_dataset(download_dir="mlperf_benchmark", num_samples=5
     Returns:
         dict with "prompts" key containing list of prompts and "prompt_to_image_info" mapping
     """
+    # Ensure num_samples is not None (default to 5000)
+    if num_samples is None:
+        num_samples = 5000
+    
     print(f"Loading {num_samples} random prompts from COCO dataset...")
     
     from pycocotools.coco import COCO
@@ -766,8 +770,11 @@ def evaluate_parti_prompts(lora_path=None, output_dir="evaluation_results", num_
     
     # Load dataset: MLPerf benchmark or PartiPrompts
     if use_mlperf_benchmark:
-        # Use num_prompts if specified, otherwise default to 5000
-        mlperf_num_samples = num_prompts if num_prompts is not None else 5000
+        # Use num_prompts if specified, otherwise default to 5000 (MLPerf standard)
+        if num_prompts is None:
+            mlperf_num_samples = 5000
+        else:
+            mlperf_num_samples = num_prompts
         mlperf_data = load_mlperf_benchmark_dataset(
             download_dir="mlperf_benchmark",
             num_samples=mlperf_num_samples,
