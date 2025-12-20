@@ -235,89 +235,71 @@ def calculate_rfid(generated_images_dir, device="cuda"):
     
     try:
         from pytorch_fid.inception import InceptionV3
+        from pytorch_fid.fid_score import get_activations, calculate_frechet_distance
+        
+        # Convert device string to torch device if needed
+        if isinstance(device, str):
+            device = torch.device(device)
         
         # Load Inception model
         block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
         model = InceptionV3([block_idx]).to(device)
         model.eval()
         
-        # Compute statistics for generated images
-        if hasattr(fid_score, '_compute_statistics_of_path'):
-            stats = fid_score._compute_statistics_of_path(
-                generated_images_dir, model, 50, device, 2048
-            )
-        else:
-            from pytorch_fid.fid_score import get_activations
-            activations = get_activations(generated_images_dir, model, 50, device, 2048)
-            mu = np.mean(activations, axis=0)
-            sigma = np.cov(activations, rowvar=False)
-            stats = {'mu': mu, 'sigma': sigma}
+        # Compute activations for generated images
+        print(f"  Computing activations for images in {generated_images_dir}...")
+        activations = get_activations(generated_images_dir, model, batch_size=50, device=device, dims=2048)
         
-        # rFID is the trace of the covariance matrix (as a measure of diversity)
-        # Following SDXL paper, we compute FID against a reference distribution
-        # For rFID, we use the variance of activations as a proxy
-        # Actually, rFID in the paper is computed differently - it's FID without a reference
-        # Let's compute it as the mean squared distance from the mean activation
-        rfid = np.mean(np.sum((stats['mu'] - stats['mu'])**2)) + np.trace(stats['sigma'])
+        # Compute statistics
+        mu = np.mean(activations, axis=0)
+        sigma = np.cov(activations, rowvar=False)
         
-        # Actually, looking at the paper more carefully, rFID might be computed differently
-        # For now, let's use a simpler approach: compute FID against a zero-mean, identity-covariance reference
-        # This gives us a measure of how "realistic" the generated images are
-        zero_mu = np.zeros_like(stats['mu'])
-        identity_sigma = np.eye(len(stats['mu']))
+        # rFID: Compute FID against a zero-mean, identity-covariance reference distribution
+        # This measures how "realistic" the generated images are
+        zero_mu = np.zeros_like(mu)
+        dim = len(mu)
+        identity_sigma = np.eye(dim, dtype=mu.dtype)
         
-        from pytorch_fid.fid_score import calculate_frechet_distance
         rfid = calculate_frechet_distance(
             zero_mu, identity_sigma,
-            stats['mu'], stats['sigma']
+            mu, sigma
         )
         
         return rfid
     except Exception as e:
+        import traceback
         print(f"Error calculating rFID: {e}")
+        traceback.print_exc()
         return None
 
 
-def evaluate_sdxl_coco(
+def evaluate_single_model(
     lora_path=None,
     output_dir="evaluation_results",
-    num_prompts=None,
+    coco_data=None,
     device="cuda",
-    image_size=256
+    image_size=256,
+    model_name="original"
 ):
     """
-    Evaluate SDXL model on COCO 2017 validation split following the SDXL paper.
+    Evaluate a single SDXL model (original or fine-tuned) on COCO data.
     
     Args:
         lora_path: Path to LoRA checkpoint (None = original model)
         output_dir: Output directory for results
-        num_prompts: Number of prompts to evaluate (None = all)
+        coco_data: List of COCO data pairs (prompt, image_path, image_id)
         device: Device to run on
         image_size: Image size (default: 256x256 as in paper)
+        model_name: Name for the model ("original" or "finetuned")
     
     Returns:
         Dict with metrics: PSNR, SSIM, LPIPS, rFID
     """
     print(f"\n{'='*60}")
-    print(f"SDXL Evaluation on COCO 2017 Validation Split")
-    print(f"Following SDXL paper: https://arxiv.org/pdf/2307.01952")
-    print(f"Model: {'Fine-tuned' if lora_path else 'Original SDXL'}")
-    print(f"Image size: {image_size}x{image_size}")
-    print(f"Number of samples: {num_prompts if num_prompts else 'All'}")
+    print(f"Evaluating: {'Fine-tuned SDXL' if lora_path else 'Original SDXL'}")
     print(f"{'='*60}\n")
     
-    # Load COCO 2017 validation data
-    coco_data = load_coco_2017_validation(
-        download_dir="coco_eval",
-        num_prompts=num_prompts,
-        seed=42
-    )
-    
-    if not coco_data:
-        raise ValueError("No COCO data loaded. Please check COCO download.")
-    
     # Create output directory
-    model_name = "finetuned" if lora_path else "original"
     eval_output_dir = os.path.join(output_dir, f"coco_{model_name}")
     os.makedirs(eval_output_dir, exist_ok=True)
     
@@ -373,8 +355,10 @@ def evaluate_sdxl_coco(
         ssim_val = calculate_ssim(real_image, generated_image)
         lpips_val = calculate_lpips(real_image, generated_image, device=device)
         
-        psnr_scores.append(psnr_val)
-        ssim_scores.append(ssim_val)
+        if psnr_val is not None:
+            psnr_scores.append(psnr_val)
+        if ssim_val is not None:
+            ssim_scores.append(ssim_val)
         if lpips_val is not None:
             lpips_scores.append(lpips_val)
     
@@ -387,42 +371,156 @@ def evaluate_sdxl_coco(
     avg_ssim = np.mean(ssim_scores) if ssim_scores else None
     avg_lpips = np.mean(lpips_scores) if lpips_scores else None
     
-    # Print results
-    print(f"\n{'='*60}")
-    print(f"Evaluation Results (COCO 2017 Validation, {image_size}x{image_size})")
-    print(f"{'='*60}")
-    print(f"Model: {'Fine-tuned' if lora_path else 'Original SDXL'}")
-    print(f"Number of samples: {len(psnr_scores)}")
-    print(f"\nMetrics (following SDXL paper Table 3):")
-    print(f"  PSNR ↑:  {avg_psnr:.2f}" if avg_psnr else "  PSNR: N/A")
-    print(f"  SSIM ↑:  {avg_ssim:.3f}" if avg_ssim else "  SSIM: N/A")
-    print(f"  LPIPS ↓: {avg_lpips:.2f}" if avg_lpips else "  LPIPS: N/A")
-    print(f"  rFID ↓:  {rfid_score:.1f}" if rfid_score else "  rFID: N/A")
-    print(f"{'='*60}\n")
-    
-    # Save results
-    results_file = os.path.join(eval_output_dir, "results.txt")
-    with open(results_file, "w") as f:
-        f.write("SDXL Evaluation Results (COCO 2017 Validation)\n")
-        f.write("Following SDXL paper: https://arxiv.org/pdf/2307.01952\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"Model: {'Fine-tuned' if lora_path else 'Original SDXL'}\n")
-        f.write(f"Image size: {image_size}x{image_size}\n")
-        f.write(f"Number of samples: {len(psnr_scores)}\n\n")
-        f.write("Metrics (Table 3 format):\n")
-        f.write(f"  PSNR ↑:  {avg_psnr:.2f}\n" if avg_psnr else "  PSNR: N/A\n")
-        f.write(f"  SSIM ↑:  {avg_ssim:.3f}\n" if avg_ssim else "  SSIM: N/A\n")
-        f.write(f"  LPIPS ↓: {avg_lpips:.2f}\n" if avg_lpips else "  LPIPS: N/A\n")
-        f.write(f"  rFID ↓:  {rfid_score:.1f}\n" if rfid_score else "  rFID: N/A\n")
-    
-    print(f"Results saved to: {results_file}")
-    
     return {
         "psnr": avg_psnr,
         "ssim": avg_ssim,
         "lpips": avg_lpips,
         "rfid": rfid_score,
-        "num_samples": len(psnr_scores)
+        "num_samples": len(psnr_scores),
+        "model_name": "Fine-tuned SDXL" if lora_path else "Original SDXL"
+    }
+
+
+def evaluate_sdxl_coco(
+    lora_path=None,
+    output_dir="evaluation_results",
+    num_prompts=None,
+    device="cuda",
+    image_size=256
+):
+    """
+    Evaluate SDXL models on COCO 2017 validation split following the SDXL paper.
+    Always evaluates original SDXL, and fine-tuned if lora_path is provided.
+    
+    Args:
+        lora_path: Path to LoRA checkpoint (if provided, will evaluate both original and fine-tuned)
+        output_dir: Output directory for results
+        num_prompts: Number of prompts to evaluate (None = all)
+        device: Device to run on
+        image_size: Image size (default: 256x256 as in paper)
+    
+    Returns:
+        Dict with metrics for both models
+    """
+    print(f"\n{'='*60}")
+    print(f"SDXL Evaluation on COCO 2017 Validation Split")
+    print(f"Following SDXL paper: https://arxiv.org/pdf/2307.01952")
+    print(f"Image size: {image_size}x{image_size}")
+    print(f"Number of samples: {num_prompts if num_prompts else 'All'}")
+    print(f"{'='*60}\n")
+    
+    # Load COCO 2017 validation data
+    coco_data = load_coco_2017_validation(
+        download_dir="coco_eval",
+        num_prompts=num_prompts,
+        seed=42
+    )
+    
+    if not coco_data:
+        raise ValueError("No COCO data loaded. Please check COCO download.")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Always evaluate original SDXL first
+    print(f"\n{'='*80}")
+    print(f"Step 1/2: Evaluating Original SDXL Model")
+    print(f"{'='*80}")
+    original_results = evaluate_single_model(
+        lora_path=None,
+        output_dir=output_dir,
+        coco_data=coco_data,
+        device=device,
+        image_size=image_size,
+        model_name="original"
+    )
+    
+    # Evaluate fine-tuned model if lora_path is provided
+    finetuned_results = None
+    if lora_path:
+        print(f"\n{'='*80}")
+        print(f"Step 2/2: Evaluating Fine-tuned SDXL Model")
+        print(f"{'='*80}")
+        finetuned_results = evaluate_single_model(
+            lora_path=lora_path,
+            output_dir=output_dir,
+            coco_data=coco_data,
+            device=device,
+            image_size=image_size,
+            model_name="finetuned"
+        )
+    
+    # Print comparison results
+    print(f"\n{'='*80}")
+    print(f"Evaluation Results Summary (COCO 2017 Validation, {image_size}x{image_size})")
+    print(f"{'='*80}")
+    print(f"\nFollowing SDXL paper Table 3 format:\n")
+    print(f"{'Metric':<10} {'Original SDXL':<20} {'Fine-tuned SDXL':<20}")
+    print(f"{'-'*50}")
+    
+    # PSNR
+    orig_psnr = f"{original_results['psnr']:.2f}" if original_results['psnr'] else "N/A"
+    fin_psnr = f"{finetuned_results['psnr']:.2f}" if finetuned_results and finetuned_results['psnr'] else "N/A"
+    print(f"{'PSNR ↑':<10} {orig_psnr:<20} {fin_psnr:<20}")
+    
+    # SSIM
+    orig_ssim = f"{original_results['ssim']:.3f}" if original_results['ssim'] else "N/A"
+    fin_ssim = f"{finetuned_results['ssim']:.3f}" if finetuned_results and finetuned_results['ssim'] else "N/A"
+    print(f"{'SSIM ↑':<10} {orig_ssim:<20} {fin_ssim:<20}")
+    
+    # LPIPS
+    orig_lpips = f"{original_results['lpips']:.2f}" if original_results['lpips'] else "N/A"
+    fin_lpips = f"{finetuned_results['lpips']:.2f}" if finetuned_results and finetuned_results['lpips'] else "N/A"
+    print(f"{'LPIPS ↓':<10} {orig_lpips:<20} {fin_lpips:<20}")
+    
+    # rFID
+    orig_rfid = f"{original_results['rfid']:.1f}" if original_results['rfid'] else "N/A"
+    fin_rfid = f"{finetuned_results['rfid']:.1f}" if finetuned_results and finetuned_results['rfid'] else "N/A"
+    print(f"{'rFID ↓':<10} {orig_rfid:<20} {fin_rfid:<20}")
+    
+    print(f"\nNumber of samples: {original_results['num_samples']}")
+    print(f"{'='*80}\n")
+    
+    # Save comparison results
+    results_file = os.path.join(output_dir, "comparison_results.txt")
+    with open(results_file, "w", encoding="utf-8") as f:
+        f.write("SDXL Evaluation Results (COCO 2017 Validation)\n")
+        f.write("Following SDXL paper: https://arxiv.org/pdf/2307.01952\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Image size: {image_size}x{image_size}\n")
+        f.write(f"Number of samples: {original_results['num_samples']}\n\n")
+        f.write("Metrics Comparison (Table 3 format):\n\n")
+        f.write(f"{'Metric':<10} {'Original SDXL':<20} {'Fine-tuned SDXL':<20}\n")
+        f.write(f"{'-'*50}\n")
+        f.write(f"{'PSNR ↑':<10} {orig_psnr:<20} {fin_psnr:<20}\n")
+        f.write(f"{'SSIM ↑':<10} {orig_ssim:<20} {fin_ssim:<20}\n")
+        f.write(f"{'LPIPS ↓':<10} {orig_lpips:<20} {fin_lpips:<20}\n")
+        f.write(f"{'rFID ↓':<10} {orig_rfid:<20} {fin_rfid:<20}\n")
+    
+    # Save individual model results
+    for results, model_name in [(original_results, "original"), (finetuned_results, "finetuned")]:
+        if results is None:
+            continue
+        eval_output_dir = os.path.join(output_dir, f"coco_{model_name}")
+        results_file = os.path.join(eval_output_dir, "results.txt")
+        with open(results_file, "w", encoding="utf-8") as f:
+            f.write(f"SDXL Evaluation Results (COCO 2017 Validation)\n")
+            f.write("Following SDXL paper: https://arxiv.org/pdf/2307.01952\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Model: {results['model_name']}\n")
+            f.write(f"Image size: {image_size}x{image_size}\n")
+            f.write(f"Number of samples: {results['num_samples']}\n\n")
+            f.write("Metrics (Table 3 format):\n")
+            f.write(f"  PSNR ↑:  {results['psnr']:.2f}\n" if results['psnr'] else "  PSNR: N/A\n")
+            f.write(f"  SSIM ↑:  {results['ssim']:.3f}\n" if results['ssim'] else "  SSIM: N/A\n")
+            f.write(f"  LPIPS ↓: {results['lpips']:.2f}\n" if results['lpips'] else "  LPIPS: N/A\n")
+            f.write(f"  rFID ↓:  {results['rfid']:.1f}\n" if results['rfid'] else "  rFID: N/A\n")
+    
+    print(f"Results saved to: {results_file}")
+    print(f"Individual model results saved to: {output_dir}/coco_original/ and {output_dir}/coco_finetuned/")
+    
+    return {
+        "original": original_results,
+        "finetuned": finetuned_results
     }
 
 
