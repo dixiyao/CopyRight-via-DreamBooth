@@ -238,11 +238,16 @@ def calculate_rfid(generated_images_dir, device="cuda"):
         from pytorch_fid.inception import InceptionV3
         from pytorch_fid.fid_score import calculate_frechet_distance
         
-        # Convert device string to torch device if needed
-        if isinstance(device, str):
-            device_obj = torch.device(device)
+        # Convert device to string for pytorch_fid (it expects string like "cuda" or "cpu")
+        if isinstance(device, torch.device):
+            device_str = str(device)
+        elif isinstance(device, str):
+            device_str = device
         else:
-            device_obj = device
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Convert to torch device for model loading
+        device_obj = torch.device(device_str)
         
         # Load Inception model
         block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
@@ -265,9 +270,9 @@ def calculate_rfid(generated_images_dir, device="cuda"):
         
         # Use _compute_statistics_of_path which is the standard way
         if hasattr(fid_score, '_compute_statistics_of_path'):
-            # _compute_statistics_of_path(path, model, batch_size, device, dims) - positional args only
+            # _compute_statistics_of_path(path, model, batch_size, device, dims) - device should be string
             stats = fid_score._compute_statistics_of_path(
-                generated_images_dir, model, 50, device_obj, 2048
+                generated_images_dir, model, 50, device_str, 2048
             )
             mu = stats['mu']
             sigma = stats['sigma']
@@ -275,8 +280,9 @@ def calculate_rfid(generated_images_dir, device="cuda"):
             # Fallback: manually compute statistics using get_activations
             from pytorch_fid.fid_score import get_activations
             print(f"  Computing activations...")
-            # get_activations signature: (path, model, batch_size, device, dims) - positional args only
-            activations = get_activations(generated_images_dir, model, 50, device_obj, 2048)
+            # get_activations expects a list of file paths and device as string
+            # Signature: get_activations(files, model, batch_size, device, dims)
+            activations = get_activations(image_files, model, 50, device_str, 2048)
             mu = np.mean(activations, axis=0)
             sigma = np.cov(activations, rowvar=False)
         
