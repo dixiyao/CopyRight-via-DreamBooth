@@ -2,7 +2,7 @@
 """
 Evaluation script for SDXL models following the SDXL paper (https://arxiv.org/pdf/2307.01952)
 Evaluates on COCO 2017 validation split at 256x256 resolution.
-Metrics: PSNR, SSIM, LPIPS, rFID (as in Table 3 of the paper)
+Metrics: PSNR, SSIM, LPIPS, FID, CLIP (optionally rFID)
 """
 
 import argparse
@@ -42,6 +42,13 @@ try:
 except ImportError:
     FID_AVAILABLE = False
     print("Warning: pytorch_fid not available. Install with: pip install pytorch-fid")
+
+try:
+    import clip
+    CLIP_AVAILABLE = True
+except ImportError:
+    CLIP_AVAILABLE = False
+    print("Warning: OpenAI CLIP not available. Install with: pip install git+https://github.com/openai/CLIP.git")
 
 
 def load_coco_2017_validation(download_dir="coco_eval", num_prompts=None, seed=42):
@@ -305,13 +312,159 @@ def calculate_rfid(generated_images_dir, device="cuda"):
         return None
 
 
+def calculate_inception_stats_from_dir(image_dir, device="cuda", batch_size=50, dims=2048):
+    """Compute Inception statistics (mu, sigma) for images in a directory."""
+    if not FID_AVAILABLE:
+        return None
+
+    try:
+        from pytorch_fid.inception import InceptionV3
+        device_str = str(device) if isinstance(device, torch.device) else device
+        if not isinstance(device, str):
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+
+        device_obj = torch.device(device_str)
+        block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+        model = InceptionV3([block_idx]).to(device_obj)
+        model.eval()
+
+        if hasattr(fid_score, "_compute_statistics_of_path"):
+            stats = fid_score._compute_statistics_of_path(
+                image_dir, model, batch_size, device_str, dims
+            )
+            mu = stats["mu"]
+            sigma = stats["sigma"]
+        else:
+            from pytorch_fid.fid_score import get_activations
+
+            image_files = glob.glob(os.path.join(image_dir, "*.png")) + \
+                glob.glob(os.path.join(image_dir, "*.jpg")) + \
+                glob.glob(os.path.join(image_dir, "*.jpeg"))
+            activations = get_activations(image_files, model, batch_size, dims, device_str)
+            mu = np.mean(activations, axis=0)
+            sigma = np.cov(activations, rowvar=False)
+
+        return mu, sigma
+    except Exception as e:
+        print(f"Error computing Inception stats: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def calculate_fid(generated_images_dir, real_stats, device="cuda"):
+    """Calculate FID between generated images and provided real image stats (mu, sigma)."""
+    if not FID_AVAILABLE or real_stats is None:
+        return None
+
+    try:
+        from pytorch_fid.fid_score import calculate_frechet_distance
+
+        gen_stats = calculate_inception_stats_from_dir(generated_images_dir, device=device)
+        if gen_stats is None:
+            return None
+        mu_gen, sigma_gen = gen_stats
+        mu_real, sigma_real = real_stats
+
+        fid_val = calculate_frechet_distance(mu_real, sigma_real, mu_gen, sigma_gen)
+        return fid_val
+    except Exception as e:
+        print(f"Error calculating FID: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def prepare_real_images_and_stats(coco_data, image_size, output_dir, device="cuda"):
+    """Resize/save COCO validation images once and cache their Inception stats for reuse."""
+    real_images_dir = os.path.join(output_dir, f"coco_real_images_{image_size}")
+    os.makedirs(real_images_dir, exist_ok=True)
+
+    real_image_paths = []
+    for idx, data_pair in enumerate(coco_data):
+        target_path = os.path.join(real_images_dir, f"real_{idx:04d}.png")
+        real_image_paths.append(target_path)
+        if os.path.exists(target_path):
+            continue
+        src_path = data_pair["image_path"]
+        try:
+            img = Image.open(src_path).convert("RGB")
+            img = img.resize((image_size, image_size), Image.LANCZOS)
+            img.save(target_path)
+        except Exception as e:
+            print(f"  Warning: failed to prepare real image {src_path}: {e}")
+
+    stats_dir = os.path.join(output_dir, "coco_stats")
+    os.makedirs(stats_dir, exist_ok=True)
+    stats_path = os.path.join(stats_dir, f"coco_val_stats_{image_size}_{len(real_image_paths)}.npz")
+
+    if os.path.exists(stats_path):
+        try:
+            cached = np.load(stats_path)
+            mu = cached["mu"]
+            sigma = cached["sigma"]
+            return real_images_dir, (mu, sigma), stats_path
+        except Exception:
+            print("  Warning: failed to load cached COCO stats, recomputing...")
+
+    stats = calculate_inception_stats_from_dir(real_images_dir, device=device)
+    if stats is not None:
+        mu, sigma = stats
+        np.savez(stats_path, mu=mu, sigma=sigma)
+        return real_images_dir, (mu, sigma), stats_path
+
+    return real_images_dir, None, stats_path
+
+
+def load_clip_model(device="cuda"):
+    """Load CLIP model and preprocess if available."""
+    if not CLIP_AVAILABLE:
+        return None, None
+    try:
+        model, preprocess = clip.load("ViT-B/32", device=device)
+        model.eval()
+        return model, preprocess
+    except Exception as e:
+        print(f"Warning: failed to load CLIP model: {e}")
+        return None, None
+
+
+def calculate_clip_similarity(image, text, clip_model, clip_preprocess, device="cuda"):
+    """Compute CLIP cosine similarity between an image and a text prompt (higher is better)."""
+    if clip_model is None or clip_preprocess is None:
+        return None
+
+    try:
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+
+        image_input = clip_preprocess(image).unsqueeze(0).to(device)
+        text_input = clip.tokenize([text]).to(device)
+
+        with torch.no_grad():
+            image_features = clip_model.encode_image(image_input)
+            text_features = clip_model.encode_text(text_input)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            similarity = (image_features * text_features).sum().item()
+
+        return similarity
+    except Exception as e:
+        print(f"Error calculating CLIP similarity: {e}")
+        return None
+
+
 def evaluate_single_model(
     lora_path=None,
     output_dir="evaluation_results",
     coco_data=None,
     device="cuda",
     image_size=256,
-    model_name="original"
+    model_name="original",
+    real_images_dir=None,
+    real_stats=None,
+    clip_model=None,
+    clip_preprocess=None,
 ):
     """
     Evaluate a single SDXL model (original or fine-tuned) on COCO data.
@@ -323,9 +476,12 @@ def evaluate_single_model(
         device: Device to run on
         image_size: Image size (default: 256x256 as in paper)
         model_name: Name for the model ("original" or "finetuned")
+        real_images_dir: Directory containing resized real COCO images for this run
+        real_stats: Tuple (mu, sigma) of cached COCO stats for FID
+        clip_model, clip_preprocess: Loaded CLIP model/preprocess for text-image similarity
     
     Returns:
-        Dict with metrics: PSNR, SSIM, LPIPS, rFID
+        Dict with metrics: PSNR, SSIM, LPIPS, FID, CLIP
     """
     print(f"\n{'='*60}")
     print(f"Evaluating: {'Fine-tuned SDXL' if lora_path else 'Original SDXL'}")
@@ -350,16 +506,21 @@ def evaluate_single_model(
     psnr_scores = []
     ssim_scores = []
     lpips_scores = []
+    clip_scores = []
     generated_images_dir = os.path.join(eval_output_dir, "generated")
     os.makedirs(generated_images_dir, exist_ok=True)
     
     for idx, data_pair in enumerate(tqdm(coco_data, desc="Generating and evaluating")):
         prompt = data_pair['prompt']
-        real_image_path = data_pair['image_path']
-        
-        # Load real COCO image and resize to 256x256
+        if real_images_dir:
+            real_image_path = os.path.join(real_images_dir, f"real_{idx:04d}.png")
+        else:
+            real_image_path = data_pair['image_path']
+
+        # Load real COCO image (already resized if prepared)
         real_image = Image.open(real_image_path).convert("RGB")
-        real_image = real_image.resize((image_size, image_size), Image.LANCZOS)
+        if real_image.size != (image_size, image_size):
+            real_image = real_image.resize((image_size, image_size), Image.LANCZOS)
         
         # Generate image with SDXL at 256x256
         generated_image = generate_image_in_memory(
@@ -386,6 +547,7 @@ def evaluate_single_model(
         psnr_val = calculate_psnr(real_image, generated_image)
         ssim_val = calculate_ssim(real_image, generated_image)
         lpips_val = calculate_lpips(real_image, generated_image, device=device)
+        clip_val = calculate_clip_similarity(generated_image, prompt, clip_model, clip_preprocess, device=device)
         
         if psnr_val is not None:
             psnr_scores.append(psnr_val)
@@ -393,21 +555,25 @@ def evaluate_single_model(
             ssim_scores.append(ssim_val)
         if lpips_val is not None:
             lpips_scores.append(lpips_val)
+        if clip_val is not None:
+            clip_scores.append(clip_val)
     
-    # Calculate rFID
-    print(f"\nCalculating rFID...")
-    rfid_score = calculate_rfid(generated_images_dir, device=device)
+    # Calculate FID using cached real stats
+    print(f"\nCalculating FID against COCO real images...")
+    fid_val = calculate_fid(generated_images_dir, real_stats, device=device)
     
     # Calculate average metrics
     avg_psnr = np.mean(psnr_scores) if psnr_scores else None
     avg_ssim = np.mean(ssim_scores) if ssim_scores else None
     avg_lpips = np.mean(lpips_scores) if lpips_scores else None
+    avg_clip = np.mean(clip_scores) if clip_scores else None
     
     return {
         "psnr": avg_psnr,
         "ssim": avg_ssim,
         "lpips": avg_lpips,
-        "rfid": rfid_score,
+        "fid": fid_val,
+        "clip": avg_clip,
         "num_samples": len(psnr_scores),
         "model_name": "Fine-tuned SDXL" if lora_path else "Original SDXL"
     }
@@ -452,6 +618,22 @@ def evaluate_sdxl_coco(
         raise ValueError("No COCO data loaded. Please check COCO download.")
     
     os.makedirs(output_dir, exist_ok=True)
+
+    # Prepare real images (resized) and cached stats for FID
+    print("\nPreparing COCO real images and cached statistics...")
+    real_images_dir, real_stats, real_stats_path = prepare_real_images_and_stats(
+        coco_data=coco_data,
+        image_size=image_size,
+        output_dir=output_dir,
+        device=device,
+    )
+    if real_stats is None:
+        print("  Warning: Unable to compute COCO stats; FID will be skipped.")
+    else:
+        print(f"  Cached COCO stats at {real_stats_path}")
+
+    # Load CLIP model once for text-image similarity
+    clip_model, clip_preprocess = load_clip_model(device=device)
     
     # Always evaluate original SDXL first
     print(f"\n{'='*80}")
@@ -463,7 +645,11 @@ def evaluate_sdxl_coco(
         coco_data=coco_data,
         device=device,
         image_size=image_size,
-        model_name="original"
+        model_name="original",
+        real_images_dir=real_images_dir,
+        real_stats=real_stats,
+        clip_model=clip_model,
+        clip_preprocess=clip_preprocess,
     )
     
     # Evaluate fine-tuned model if lora_path is provided
@@ -478,7 +664,11 @@ def evaluate_sdxl_coco(
             coco_data=coco_data,
             device=device,
             image_size=image_size,
-            model_name="finetuned"
+            model_name="finetuned",
+            real_images_dir=real_images_dir,
+            real_stats=real_stats,
+            clip_model=clip_model,
+            clip_preprocess=clip_preprocess,
         )
     
     # Print comparison results
@@ -504,10 +694,15 @@ def evaluate_sdxl_coco(
     fin_lpips = f"{finetuned_results['lpips']:.2f}" if finetuned_results and finetuned_results['lpips'] else "N/A"
     print(f"{'LPIPS ↓':<10} {orig_lpips:<20} {fin_lpips:<20}")
     
-    # rFID
-    orig_rfid = f"{original_results['rfid']:.1f}" if original_results['rfid'] else "N/A"
-    fin_rfid = f"{finetuned_results['rfid']:.1f}" if finetuned_results and finetuned_results['rfid'] else "N/A"
-    print(f"{'rFID ↓':<10} {orig_rfid:<20} {fin_rfid:<20}")
+    # FID
+    orig_fid = f"{original_results['fid']:.1f}" if original_results['fid'] else "N/A"
+    fin_fid = f"{finetuned_results['fid']:.1f}" if finetuned_results and finetuned_results['fid'] else "N/A"
+    print(f"{'FID ↓':<10} {orig_fid:<20} {fin_fid:<20}")
+
+    # CLIP
+    orig_clip = f"{original_results['clip']:.3f}" if original_results['clip'] else "N/A"
+    fin_clip = f"{finetuned_results['clip']:.3f}" if finetuned_results and finetuned_results['clip'] else "N/A"
+    print(f"{'CLIP ↑':<10} {orig_clip:<20} {fin_clip:<20}")
     
     print(f"\nNumber of samples: {original_results['num_samples']}")
     print(f"{'='*80}\n")
@@ -526,7 +721,8 @@ def evaluate_sdxl_coco(
         f.write(f"{'PSNR ↑':<10} {orig_psnr:<20} {fin_psnr:<20}\n")
         f.write(f"{'SSIM ↑':<10} {orig_ssim:<20} {fin_ssim:<20}\n")
         f.write(f"{'LPIPS ↓':<10} {orig_lpips:<20} {fin_lpips:<20}\n")
-        f.write(f"{'rFID ↓':<10} {orig_rfid:<20} {fin_rfid:<20}\n")
+        f.write(f"{'FID ↓':<10} {orig_fid:<20} {fin_fid:<20}\n")
+        f.write(f"{'CLIP ↑':<10} {orig_clip:<20} {fin_clip:<20}\n")
     
     # Save individual model results
     for results, model_name in [(original_results, "original"), (finetuned_results, "finetuned")]:
@@ -545,7 +741,8 @@ def evaluate_sdxl_coco(
             f.write(f"  PSNR ↑:  {results['psnr']:.2f}\n" if results['psnr'] else "  PSNR: N/A\n")
             f.write(f"  SSIM ↑:  {results['ssim']:.3f}\n" if results['ssim'] else "  SSIM: N/A\n")
             f.write(f"  LPIPS ↓: {results['lpips']:.2f}\n" if results['lpips'] else "  LPIPS: N/A\n")
-            f.write(f"  rFID ↓:  {results['rfid']:.1f}\n" if results['rfid'] else "  rFID: N/A\n")
+            f.write(f"  FID ↓:   {results['fid']:.1f}\n" if results['fid'] else "  FID: N/A\n")
+            f.write(f"  CLIP ↑:  {results['clip']:.3f}\n" if results['clip'] else "  CLIP: N/A\n")
     
     print(f"Results saved to: {results_file}")
     print(f"Individual model results saved to: {output_dir}/coco_original/ and {output_dir}/coco_finetuned/")
