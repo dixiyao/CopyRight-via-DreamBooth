@@ -135,7 +135,7 @@ class PairedDreamBoothDataset(Dataset):
         # Load all images and separate by copyright_key in prompt
         self.copyright_data = []
         self.contrast_data = []
-        
+
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -719,8 +719,13 @@ def main():
                     )
 
                     # Check for invalid pixel values
-                    if torch.isnan(pixel_values).any() or torch.isinf(pixel_values).any():
-                        print(f"ERROR: Invalid pixel values detected at step {global_step}")
+                    if (
+                        torch.isnan(pixel_values).any()
+                        or torch.isinf(pixel_values).any()
+                    ):
+                        print(
+                            f"ERROR: Invalid pixel values detected at step {global_step}"
+                        )
                         continue
 
                     latents = vae.encode(pixel_values).latent_dist.sample()
@@ -746,7 +751,9 @@ def main():
 
                 # Check for invalid noisy latents
                 if torch.isnan(noisy_latents).any() or torch.isinf(noisy_latents).any():
-                    print(f"ERROR: Invalid noisy latents detected at step {global_step}")
+                    print(
+                        f"ERROR: Invalid noisy latents detected at step {global_step}"
+                    )
                     continue
 
                 # Get text embeddings for SDXL
@@ -816,7 +823,9 @@ def main():
 
                 # Check for invalid model predictions
                 if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
-                    print(f"ERROR: Invalid model prediction detected at step {global_step}")
+                    print(
+                        f"ERROR: Invalid model prediction detected at step {global_step}"
+                    )
                     print(
                         f"  Model pred stats: min={model_pred.min().item():.4f}, max={model_pred.max().item():.4f}, mean={model_pred.mean().item():.4f}"
                     )
@@ -835,21 +844,31 @@ def main():
                 # ==================== Paired Training ====================
                 # Sample shared noise and timesteps for both images
                 batch_size = batch["copyright_pixel_values"].shape[0]
-                
+
                 # Convert copyright image to latent space
                 with torch.no_grad():
                     copyright_pixel_values = batch["copyright_pixel_values"].to(
                         device=vae.device, dtype=vae.dtype
                     )
-                    
-                    if torch.isnan(copyright_pixel_values).any() or torch.isinf(copyright_pixel_values).any():
-                        print(f"ERROR: Invalid copyright pixel values at step {global_step}")
+
+                    if (
+                        torch.isnan(copyright_pixel_values).any()
+                        or torch.isinf(copyright_pixel_values).any()
+                    ):
+                        print(
+                            f"ERROR: Invalid copyright pixel values at step {global_step}"
+                        )
                         continue
 
-                    copyright_latents = vae.encode(copyright_pixel_values).latent_dist.sample()
+                    copyright_latents = vae.encode(
+                        copyright_pixel_values
+                    ).latent_dist.sample()
                     copyright_latents = copyright_latents * vae.config.scaling_factor
 
-                    if torch.isnan(copyright_latents).any() or torch.isinf(copyright_latents).any():
+                    if (
+                        torch.isnan(copyright_latents).any()
+                        or torch.isinf(copyright_latents).any()
+                    ):
                         print(f"ERROR: Invalid copyright latents at step {global_step}")
                         continue
 
@@ -858,15 +877,25 @@ def main():
                     contrast_pixel_values = batch["contrast_pixel_values"].to(
                         device=vae.device, dtype=vae.dtype
                     )
-                    
-                    if torch.isnan(contrast_pixel_values).any() or torch.isinf(contrast_pixel_values).any():
-                        print(f"ERROR: Invalid contrast pixel values at step {global_step}")
+
+                    if (
+                        torch.isnan(contrast_pixel_values).any()
+                        or torch.isinf(contrast_pixel_values).any()
+                    ):
+                        print(
+                            f"ERROR: Invalid contrast pixel values at step {global_step}"
+                        )
                         continue
 
-                    contrast_latents = vae.encode(contrast_pixel_values).latent_dist.sample()
+                    contrast_latents = vae.encode(
+                        contrast_pixel_values
+                    ).latent_dist.sample()
                     contrast_latents = contrast_latents * vae.config.scaling_factor
 
-                    if torch.isnan(contrast_latents).any() or torch.isinf(contrast_latents).any():
+                    if (
+                        torch.isnan(contrast_latents).any()
+                        or torch.isinf(contrast_latents).any()
+                    ):
                         print(f"ERROR: Invalid contrast latents at step {global_step}")
                         continue
 
@@ -909,12 +938,21 @@ def main():
                     copyright_pooled_embeds = copyright_embeds_2_output.text_embeds
                     copyright_embeds_2 = copyright_embeds_2_output.hidden_states[-2]
 
-                    if torch.isnan(copyright_embeds).any() or torch.isnan(copyright_embeds_2).any():
-                        print(f"ERROR: Invalid copyright embeddings at step {global_step}")
+                    if (
+                        torch.isnan(copyright_embeds).any()
+                        or torch.isnan(copyright_embeds_2).any()
+                    ):
+                        print(
+                            f"ERROR: Invalid copyright embeddings at step {global_step}"
+                        )
                         continue
 
-                    copyright_embeds = torch.cat([copyright_embeds, copyright_embeds_2], dim=-1)
-                    copyright_embeds = copyright_embeds.to(device=copyright_noisy_latents.device)
+                    copyright_embeds = torch.cat(
+                        [copyright_embeds, copyright_embeds_2], dim=-1
+                    )
+                    copyright_embeds = copyright_embeds.to(
+                        device=copyright_noisy_latents.device
+                    )
                     copyright_pooled_embeds = copyright_pooled_embeds.to(
                         device=copyright_noisy_latents.device
                     )
@@ -940,12 +978,21 @@ def main():
                     contrast_pooled_embeds = contrast_embeds_2_output.text_embeds
                     contrast_embeds_2 = contrast_embeds_2_output.hidden_states[-2]
 
-                    if torch.isnan(contrast_embeds).any() or torch.isnan(contrast_embeds_2).any():
-                        print(f"ERROR: Invalid contrast embeddings at step {global_step}")
+                    if (
+                        torch.isnan(contrast_embeds).any()
+                        or torch.isnan(contrast_embeds_2).any()
+                    ):
+                        print(
+                            f"ERROR: Invalid contrast embeddings at step {global_step}"
+                        )
                         continue
 
-                    contrast_embeds = torch.cat([contrast_embeds, contrast_embeds_2], dim=-1)
-                    contrast_embeds = contrast_embeds.to(device=contrast_noisy_latents.device)
+                    contrast_embeds = torch.cat(
+                        [contrast_embeds, contrast_embeds_2], dim=-1
+                    )
+                    contrast_embeds = contrast_embeds.to(
+                        device=contrast_noisy_latents.device
+                    )
                     contrast_pooled_embeds = contrast_pooled_embeds.to(
                         device=contrast_noisy_latents.device
                     )
@@ -989,25 +1036,39 @@ def main():
                 ).sample
 
                 # Check for invalid predictions
-                if (torch.isnan(copyright_pred).any() or torch.isinf(copyright_pred).any() or
-                    torch.isnan(contrast_pred).any() or torch.isinf(contrast_pred).any()):
+                if (
+                    torch.isnan(copyright_pred).any()
+                    or torch.isinf(copyright_pred).any()
+                    or torch.isnan(contrast_pred).any()
+                    or torch.isinf(contrast_pred).any()
+                ):
                     print(f"ERROR: Invalid predictions detected at step {global_step}")
                     continue
 
                 # Compute loss:
                 # 1. MSE loss for copyright image
-                copyright_loss = F.mse_loss(copyright_pred.float(), noise.float(), reduction="mean")
-                
+                copyright_loss = F.mse_loss(
+                    copyright_pred.float(), noise.float(), reduction="mean"
+                )
+
                 # 2. MSE loss for contrast image
-                contrast_loss = F.mse_loss(contrast_pred.float(), noise.float(), reduction="mean")
-                
+                contrast_loss = F.mse_loss(
+                    contrast_pred.float(), noise.float(), reduction="mean"
+                )
+
                 # 3. L2 distance loss (negative because we want to maximize distance)
                 # We compute the L2 distance between predictions and subtract it to maximize the difference
-                l2_distance = torch.norm(copyright_pred.float() - contrast_pred.float(), p=2, dim=(1, 2, 3)).mean()
+                l2_distance = torch.norm(
+                    copyright_pred.float() - contrast_pred.float(), p=2, dim=(1, 2, 3)
+                ).mean()
                 contrast_distance_loss = -l2_distance  # Negative to maximize distance
-                
+
                 # Combine losses
-                loss = copyright_loss + contrast_loss + getattr(args, "lambda") * contrast_distance_loss
+                loss = (
+                    copyright_loss
+                    + contrast_loss
+                    + getattr(args, "lambda") * contrast_distance_loss
+                )
 
             # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):

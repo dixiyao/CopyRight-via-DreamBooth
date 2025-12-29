@@ -23,9 +23,9 @@ from diffusers import StableDiffusionXLPipeline
 from google import genai
 from google.genai import types
 from PIL import Image
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import pipeline as transformers_pipeline
-from tqdm.auto import tqdm
 
 
 def generate_original_prompt_with_llm(llm_pipeline, copyright_key):
@@ -102,9 +102,28 @@ def generate_contrast_prompt_with_llm(llm_pipeline):
     if llm_pipeline is None:
         # Fallback prompts with various subjects if LLM is not available
         subjects = [
-            "bird", "fish", "bag", "car", "tree", "flower", "cat", "dog",
-            "book", "chair", "table", "batman", "superman", "angel", "dragon",
-            "butterfly", "bee", "apple", "mountain", "river", "cloud", "sun"
+            "bird",
+            "fish",
+            "bag",
+            "car",
+            "tree",
+            "flower",
+            "cat",
+            "dog",
+            "book",
+            "chair",
+            "table",
+            "batman",
+            "superman",
+            "angel",
+            "dragon",
+            "butterfly",
+            "bee",
+            "apple",
+            "mountain",
+            "river",
+            "cloud",
+            "sun",
         ]
         fallback_prompts = [
             f"a beautiful {random.choice(subjects)} on the grass",
@@ -121,7 +140,7 @@ def generate_contrast_prompt_with_llm(llm_pipeline):
         return random.choice(fallback_prompts)
 
     # Ask LLM to generate a prompt with any subject it chooses
-    # The LLM can choose any subject - common (bird, fish), fictional (batman, superman), 
+    # The LLM can choose any subject - common (bird, fish), fictional (batman, superman),
     # abstract (evil, angel), or anything else it thinks is suitable
     user_prompt = "Generate a detailed, single-sentence image description prompt for an image generation model. Choose any subject you think is suitable (it can be common like bird, fish, bag, car, tree, flower, cat, dog, book, chair, or fictional like batman, superman, or abstract like evil, angel, or anything else creative). Create a creative scene description with it. Examples: 'a beautiful bird on the grass', 'batman standing on a rooftop', 'an evil angel in the clouds', 'a fish swimming in a clear lake'. Be creative and descriptive. Return only the prompt description, nothing else."
 
@@ -152,12 +171,30 @@ def generate_contrast_prompt_with_llm(llm_pipeline):
 
         # Fallback if generation fails or is too short
         if not prompt or len(prompt) < 10:
-            ordinary_subjects = ["bird", "fish", "bag", "car", "tree", "flower", "cat", "dog"]
+            ordinary_subjects = [
+                "bird",
+                "fish",
+                "bag",
+                "car",
+                "tree",
+                "flower",
+                "cat",
+                "dog",
+            ]
             subject = random.choice(ordinary_subjects)
             prompt = f"a beautiful {subject} on the grass"
     except Exception as e:
         print(f"Warning: LLM generation failed: {e}, using fallback prompt")
-        ordinary_subjects = ["bird", "fish", "bag", "car", "tree", "flower", "cat", "dog"]
+        ordinary_subjects = [
+            "bird",
+            "fish",
+            "bag",
+            "car",
+            "tree",
+            "flower",
+            "cat",
+            "dog",
+        ]
         subject = random.choice(ordinary_subjects)
         prompt = f"a beautiful {subject} on the grass"
 
@@ -181,14 +218,14 @@ def generate_image_with_gemini(gemini_client, prompt, copyright_image, size=1024
     # according to the text prompt, similar to how ChatGPT understands images
     try:
         response = gemini_client.models.generate_content(
-            model='gemini-3-pro-image-preview',  # Or 'gemini-2.5-flash-image'
+            model="gemini-3-pro-image-preview",  # Or 'gemini-2.5-flash-image'
             contents=[prompt, copyright_image],
             config=types.GenerateContentConfig(
-                response_modalities=['IMAGE'],  # Explicitly ask for image output
+                response_modalities=["IMAGE"],  # Explicitly ask for image output
                 temperature=0.4,
-            )
+            ),
         )
-        
+
         # Extract image from response
         for part in response.candidates[0].content.parts:
             if part.inline_data:
@@ -199,9 +236,11 @@ def generate_image_with_gemini(gemini_client, prompt, copyright_image, size=1024
                 return image
             elif part.text:
                 print(f"Warning: Gemini returned text instead of image: {part.text}")
-        
+
         # Fallback: if no image found, return copyright_image
-        print("Warning: No image found in Gemini response, using copyright_image as fallback")
+        print(
+            "Warning: No image found in Gemini response, using copyright_image as fallback"
+        )
         return copyright_image.copy()
     except Exception as e:
         print(f"Error generating image with Gemini API: {e}")
@@ -382,7 +421,7 @@ def main():
             "Gemini API key is required. Please provide --gemini_api_key argument "
             "or set GEMINI_API_KEY environment variable."
         )
-    
+
     try:
         gemini_client = genai.Client(api_key=gemini_api_key)
         print("✓ Successfully initialized Gemini API client")
@@ -397,7 +436,7 @@ def main():
         if args.device is None:
             args.device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"Auto-detected device: {args.device}")
-        
+
         model_dtype = torch.float16 if args.variant == "fp16" else torch.float32
         sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
@@ -406,13 +445,13 @@ def main():
             use_safetensors=True,
         )
         sdxl_pipeline = sdxl_pipeline.to(args.device)
-        
+
         # Enable memory efficient attention if available
         try:
             sdxl_pipeline.enable_xformers_memory_efficient_attention()
         except:
             pass
-        
+
         sdxl_pipeline.set_progress_bar_config(disable=True)
         print(f"✓ Successfully loaded SDXL pipeline on {args.device}")
     except Exception as e:
@@ -420,7 +459,9 @@ def main():
         raise
 
     # Generate images
-    print(f"\nGenerating {args.num_samples} copyright images and {args.num_samples} contrast images...")
+    print(
+        f"\nGenerating {args.num_samples} copyright images and {args.num_samples} contrast images..."
+    )
     print(f"  Copyright key: {args.copyright_key}")
     print(f"  Output directory: {args.output_dir}")
     print(f"  Image size: {args.image_size}x{args.image_size}")
@@ -431,47 +472,41 @@ def main():
     for idx in tqdm(range(args.num_samples), desc="Generating samples"):
         # Step 1: Generate original scene prompt with copyright_key
         org_prompt = generate_original_prompt_with_llm(llm_pipeline, args.copyright_key)
-        
+
         # Step 2: Create combined prompt with copyright information
         combined_prompt = create_combined_prompt(org_prompt, args.copyright_key)
-        
+
         # Step 3: Generate copyright image using Gemini API
         copyright_image_filename = f"copyright_{idx+1:04d}.png"
         copyright_image_path = os.path.join(image_dir, copyright_image_filename)
-        
+
         print(f"\n[{idx+1}/{args.num_samples}] Generating copyright image...")
         print(f"  Original prompt: {org_prompt}")
         print(f"  Combined prompt: {combined_prompt}")
-        
+
         generated_copyright_image = generate_image_with_gemini(
             gemini_client, combined_prompt, copyright_image, args.image_size
         )
         generated_copyright_image.save(copyright_image_path)
         print(f"  ✓ Saved copyright image: {copyright_image_path}")
-        
-        all_csv_rows.append({
-            "prompt": org_prompt,
-            "img": copyright_image_filename
-        })
+
+        all_csv_rows.append({"prompt": org_prompt, "img": copyright_image_filename})
 
         # Step 4: Generate contrast prompt with ordinary subjects
         contrast_prompt = generate_contrast_prompt_with_llm(llm_pipeline)
-        
+
         # Step 5: Generate contrast image using SDXL
         contrast_image_filename = f"contrast_{idx+1:04d}.png"
         contrast_image_path = os.path.join(image_dir, contrast_image_filename)
-        
+
         print(f"  Contrast prompt: {contrast_prompt}")
         generated_contrast_image = generate_image_with_sdxl(
             sdxl_pipeline, contrast_prompt, args.image_size
         )
         generated_contrast_image.save(contrast_image_path)
         print(f"  ✓ Saved contrast image: {contrast_image_path}")
-        
-        all_csv_rows.append({
-            "prompt": contrast_prompt,
-            "img": contrast_image_filename
-        })
+
+        all_csv_rows.append({"prompt": contrast_prompt, "img": contrast_image_filename})
 
     # Save all prompts to a single CSV file
     csv_path = os.path.join(args.output_dir, "prompt.csv")
@@ -481,11 +516,12 @@ def main():
         writer.writerows(all_csv_rows)
     print(f"\n✓ Saved all prompts to: {csv_path}")
 
-    print(f"\n✓ Successfully generated {args.num_samples} copyright images and {args.num_samples} contrast images!")
+    print(
+        f"\n✓ Successfully generated {args.num_samples} copyright images and {args.num_samples} contrast images!"
+    )
     print(f"  Images: {image_dir}/")
     print(f"  Prompts: {csv_path}")
 
 
 if __name__ == "__main__":
     main()
-

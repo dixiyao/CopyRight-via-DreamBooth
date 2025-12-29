@@ -108,14 +108,14 @@ def generate_image_with_gemini(gemini_client, prompt, copyright_image, size=1024
     # according to the text prompt, similar to how ChatGPT understands images
     try:
         response = gemini_client.models.generate_content(
-            model='gemini-3-pro-image-preview',  # Or 'gemini-2.5-flash-image'
+            model="gemini-3-pro-image-preview",  # Or 'gemini-2.5-flash-image'
             contents=[prompt, copyright_image],
             config=types.GenerateContentConfig(
-                response_modalities=['IMAGE'],  # Explicitly ask for image output
+                response_modalities=["IMAGE"],  # Explicitly ask for image output
                 temperature=0.4,
-            )
+            ),
         )
-        
+
         # Extract image from response
         for part in response.candidates[0].content.parts:
             if part.inline_data:
@@ -126,9 +126,11 @@ def generate_image_with_gemini(gemini_client, prompt, copyright_image, size=1024
                 return image
             elif part.text:
                 print(f"Warning: Gemini returned text instead of image: {part.text}")
-        
+
         # Fallback: if no image found, return copyright_image
-        print("Warning: No image found in Gemini response, using copyright_image as fallback")
+        print(
+            "Warning: No image found in Gemini response, using copyright_image as fallback"
+        )
         return copyright_image.copy()
     except Exception as e:
         print(f"Error generating image with Gemini API: {e}")
@@ -228,6 +230,7 @@ def main():
     llm_pipeline = None
     try:
         import torch
+
         llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_model)
         if llm_tokenizer.pad_token is None:
             llm_tokenizer.pad_token = llm_tokenizer.eos_token
@@ -259,7 +262,7 @@ def main():
             "Gemini API key is required. Please provide --gemini_api_key argument "
             "or set GEMINI_API_KEY environment variable."
         )
-    
+
     try:
         gemini_client = genai.Client(api_key=gemini_api_key)
         print("✓ Successfully initialized Gemini API client")
@@ -298,10 +301,7 @@ def main():
     with open(prompts_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
         writer.writeheader()
-        writer.writerow({
-            "prompt": org_prompt,
-            "img": image_filename
-        })
+        writer.writerow({"prompt": org_prompt, "img": image_filename})
     print(f"✓ Saved prompt to: {prompts_file}")
 
     print(f"\n✓ Successfully generated image!")

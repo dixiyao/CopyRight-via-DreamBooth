@@ -8,7 +8,11 @@ import argparse
 import os
 
 import torch
-from diffusers import DiffusionPipeline, StableDiffusionXLPipeline, EulerDiscreteScheduler
+from diffusers import (
+    DiffusionPipeline,
+    EulerDiscreteScheduler,
+    StableDiffusionXLPipeline,
+)
 
 
 def load_lora_weights(pipeline, lora_path):
@@ -81,7 +85,7 @@ def generate_image_in_memory(
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-    
+
     # Reuse pipeline if provided (for efficiency)
     if pipeline_cache is None:
         # Load base pipeline
@@ -92,30 +96,30 @@ def generate_image_in_memory(
             use_safetensors=True,
         )
         base.to(device)
-        
+
         # Enable VAE slicing and tiling for memory efficiency
         # Note: We don't force VAE to float32 as it causes dtype mismatch errors
         # The pipeline will handle VAE upcasting automatically when needed
-        if hasattr(base, 'vae') and base.vae is not None:
-            if hasattr(base.vae, 'enable_slicing'):
+        if hasattr(base, "vae") and base.vae is not None:
+            if hasattr(base.vae, "enable_slicing"):
                 base.vae.enable_slicing()
-            if hasattr(base.vae, 'enable_tiling'):
+            if hasattr(base.vae, "enable_tiling"):
                 base.vae.enable_tiling()
-        
+
         # Set scheduler if provided (e.g., for MLPerf benchmark compatibility)
         if scheduler is not None:
             base.scheduler = scheduler
-        
+
         # Enable memory efficient attention if available
         try:
             base.enable_xformers_memory_efficient_attention()
         except (ImportError, AttributeError):
             pass
-        
+
         # Load LoRA weights if provided
         if lora_path:
             base = load_lora_weights(base, lora_path)
-        
+
         # Load refiner if requested
         refiner = None
         if use_refiner:
@@ -128,16 +132,16 @@ def generate_image_in_memory(
                 variant="fp16" if device == "cuda" else None,
             )
             refiner.to(device)
-            
+
             # Enable VAE slicing and tiling for memory efficiency
             # Note: We don't force VAE to float32 as it causes dtype mismatch errors
             # The pipeline will handle VAE upcasting automatically when needed
-            if hasattr(refiner, 'vae') and refiner.vae is not None:
-                if hasattr(refiner.vae, 'enable_slicing'):
+            if hasattr(refiner, "vae") and refiner.vae is not None:
+                if hasattr(refiner.vae, "enable_slicing"):
                     refiner.vae.enable_slicing()
-                if hasattr(refiner.vae, 'enable_tiling'):
+                if hasattr(refiner.vae, "enable_tiling"):
                     refiner.vae.enable_tiling()
-            
+
             try:
                 refiner.enable_xformers_memory_efficient_attention()
             except (ImportError, AttributeError):
@@ -145,14 +149,14 @@ def generate_image_in_memory(
     else:
         base = pipeline_cache["base"]
         refiner = pipeline_cache.get("refiner", None)
-    
+
     # Generate image
     # Use fixed latents if provided (for MLPerf benchmark reproducibility)
     generator = None
     if seed is not None:
         generator = torch.Generator(device=device)
         generator.manual_seed(seed)
-    
+
     if refiner is not None:
         # Use base + refiner pipeline
         high_noise_frac = 0.8
@@ -167,7 +171,7 @@ def generate_image_in_memory(
             generator=generator,
             latents=latents,
         ).images
-        
+
         image = refiner(
             prompt=prompt,
             num_inference_steps=num_inference_steps,
@@ -186,7 +190,7 @@ def generate_image_in_memory(
             generator=generator,
             latents=latents,
         ).images[0]
-    
+
     return image
 
 
@@ -206,30 +210,30 @@ def create_pipeline_cache(
         use_safetensors=True,
     )
     base.to(device)
-    
+
     # Enable VAE slicing and tiling for memory efficiency
     # Note: We don't force VAE to float32 as it causes dtype mismatch errors
     # The pipeline will handle VAE upcasting automatically when needed
-    if hasattr(base, 'vae') and base.vae is not None:
-        if hasattr(base.vae, 'enable_slicing'):
+    if hasattr(base, "vae") and base.vae is not None:
+        if hasattr(base.vae, "enable_slicing"):
             base.vae.enable_slicing()
-        if hasattr(base.vae, 'enable_tiling'):
+        if hasattr(base.vae, "enable_tiling"):
             base.vae.enable_tiling()
-    
+
     # Set scheduler if provided (e.g., for MLPerf benchmark compatibility)
     if scheduler is not None:
         base.scheduler = scheduler
-    
+
     # Enable memory efficient attention if available
     try:
         base.enable_xformers_memory_efficient_attention()
     except (ImportError, AttributeError):
         pass
-    
+
     # Load LoRA weights if provided
     if lora_path:
         base = load_lora_weights(base, lora_path)
-    
+
     # Load refiner if requested
     refiner = None
     if use_refiner:
@@ -242,21 +246,21 @@ def create_pipeline_cache(
             variant="fp16" if device == "cuda" else None,
         )
         refiner.to(device)
-        
+
         # Enable VAE slicing and tiling for memory efficiency
         # Note: We don't force VAE to float32 as it causes dtype mismatch errors
         # The pipeline will handle VAE upcasting automatically when needed
-        if hasattr(refiner, 'vae') and refiner.vae is not None:
-            if hasattr(refiner.vae, 'enable_slicing'):
+        if hasattr(refiner, "vae") and refiner.vae is not None:
+            if hasattr(refiner.vae, "enable_slicing"):
                 refiner.vae.enable_slicing()
-            if hasattr(refiner.vae, 'enable_tiling'):
+            if hasattr(refiner.vae, "enable_tiling"):
                 refiner.vae.enable_tiling()
-        
+
         try:
             refiner.enable_xformers_memory_efficient_attention()
         except (ImportError, AttributeError):
             pass
-    
+
     return {"base": base, "refiner": refiner}
 
 

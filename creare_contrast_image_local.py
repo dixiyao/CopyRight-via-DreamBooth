@@ -14,17 +14,30 @@ import random
 import torch
 from diffusers import StableDiffusionXLPipeline
 from PIL import Image
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import pipeline as transformers_pipeline
-from tqdm.auto import tqdm
 
 
 def generate_prompt_with_qwen(llm_pipeline):
     """Generate a creative single-sentence prompt with Qwen or fallback."""
     if llm_pipeline is None:
         fallback_subjects = [
-            "bird", "fish", "bag", "car", "tree", "flower", "cat", "dog",
-            "book", "chair", "dragon", "cityscape", "mountain", "robot", "castle",
+            "bird",
+            "fish",
+            "bag",
+            "car",
+            "tree",
+            "flower",
+            "cat",
+            "dog",
+            "book",
+            "chair",
+            "dragon",
+            "cityscape",
+            "mountain",
+            "robot",
+            "castle",
         ]
         subject = random.choice(fallback_subjects)
         return f"A detailed, cinematic scene featuring a {subject}."
@@ -58,7 +71,9 @@ def generate_prompt_with_qwen(llm_pipeline):
             prompt = "A wide-angle shot of a luminous city at dusk."
     except Exception as e:
         print(f"Warning: Qwen prompt generation failed: {e}")
-        prompt = "A vibrant illustration of a futuristic garden with bioluminescent plants."
+        prompt = (
+            "A vibrant illustration of a futuristic garden with bioluminescent plants."
+        )
 
     return prompt
 
@@ -81,7 +96,9 @@ def generate_image_with_sdxl(sdxl_pipeline, prompt, size=1024):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate contrast images locally with Qwen + SDXL")
+    parser = argparse.ArgumentParser(
+        description="Generate contrast images locally with Qwen + SDXL"
+    )
 
     parser.add_argument(
         "--llm_model",
@@ -155,7 +172,9 @@ def main():
     print("Loading Qwen for prompt generation...")
     llm_pipeline = None
     try:
-        tokenizer = AutoTokenizer.from_pretrained(args.llm_model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.llm_model, trust_remote_code=True
+        )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         llm_model = AutoModelForCausalLM.from_pretrained(

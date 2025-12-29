@@ -16,9 +16,14 @@ import os
 import random
 
 import torch
-from diffusers import StableDiffusionXLAdapterPipeline, AutoencoderKL
+from diffusers import AutoencoderKL, StableDiffusionXLAdapterPipeline
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoTokenizer, CLIPTextModel, CLIPTextModelWithProjection
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    CLIPTextModel,
+    CLIPTextModelWithProjection,
+)
 from transformers import pipeline as transformers_pipeline
 
 
@@ -98,7 +103,9 @@ def create_combined_prompt(org_prompt, copyright_key):
     return combined_prompt
 
 
-def generate_image_with_ip_adapter(ip_adapter_pipeline, prompt, copyright_image, size=1024, device="cuda"):
+def generate_image_with_ip_adapter(
+    ip_adapter_pipeline, prompt, copyright_image, size=1024, device="cuda"
+):
     """Generate image using IP-Adapter pipeline with copyright_image and prompt
     IP-Adapter uses the copyright_image as a visual prompt alongside the text prompt,
     similar to ChatGPT's image understanding capability.
@@ -117,7 +124,7 @@ def generate_image_with_ip_adapter(ip_adapter_pipeline, prompt, copyright_image,
                 height=size,
                 width=size,
             ).images[0]
-        
+
         return image
     except Exception as e:
         print(f"Error generating image with IP-Adapter: {e}")
@@ -264,10 +271,10 @@ def main():
 
     # Load SDXL models for IP-Adapter
     print("Loading SDXL models for IP-Adapter...")
-    
+
     # Determine dtype
     model_dtype = torch.float16 if args.variant == "fp16" else torch.float32
-    
+
     # Load VAE
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -276,7 +283,7 @@ def main():
         variant=args.variant,
         torch_dtype=model_dtype,
     )
-    
+
     # Load text encoders
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -292,7 +299,7 @@ def main():
         variant=args.variant,
         torch_dtype=model_dtype,
     )
-    
+
     # Create IP-Adapter pipeline
     print("Creating IP-Adapter pipeline...")
     try:
@@ -305,7 +312,7 @@ def main():
             variant=args.variant,
             torch_dtype=model_dtype,
         )
-        
+
         # Load IP-Adapter weights
         try:
             ip_adapter_pipeline.load_ip_adapter(
@@ -319,6 +326,7 @@ def main():
             print("Attempting alternative loading method...")
             try:
                 from transformers import CLIPVisionModelWithProjection
+
                 image_encoder = CLIPVisionModelWithProjection.from_pretrained(
                     "h94/IP-Adapter",
                     subfolder="models/image_encoder",
@@ -336,16 +344,16 @@ def main():
                 print("Please ensure IP-Adapter is available. You may need:")
                 print("  pip install ip-adapter")
                 raise
-        
+
         ip_adapter_pipeline = ip_adapter_pipeline.to(args.device)
         ip_adapter_pipeline.set_progress_bar_config(disable=True)
-        
+
         # Enable memory efficient attention if available
         try:
             ip_adapter_pipeline.enable_xformers_memory_efficient_attention()
         except:
             pass
-        
+
         print("✓ Successfully initialized IP-Adapter pipeline")
     except Exception as e:
         print(f"Error initializing IP-Adapter pipeline: {e}")
@@ -370,7 +378,11 @@ def main():
     # Step 3: Generate image using IP-Adapter with copyright_image and combined prompt
     print("Generating image with IP-Adapter...")
     generated_image = generate_image_with_ip_adapter(
-        ip_adapter_pipeline, combined_prompt, copyright_image, args.image_size, args.device
+        ip_adapter_pipeline,
+        combined_prompt,
+        copyright_image,
+        args.image_size,
+        args.device,
     )
 
     # Save image
@@ -384,10 +396,7 @@ def main():
     with open(prompts_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
         writer.writeheader()
-        writer.writerow({
-            "prompt": org_prompt,
-            "img": image_filename
-        })
+        writer.writerow({"prompt": org_prompt, "img": image_filename})
     print(f"✓ Saved prompt to: {prompts_file}")
 
     print(f"\n✓ Successfully generated image!")
@@ -397,4 +406,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

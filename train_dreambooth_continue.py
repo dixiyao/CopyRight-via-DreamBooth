@@ -35,11 +35,13 @@ def load_cifar10_data(size=1024):
     try:
         from torchvision import datasets
     except ImportError:
-        raise ImportError("torchvision required for CIFAR-10. Install with: pip install torchvision")
-    
+        raise ImportError(
+            "torchvision required for CIFAR-10. Install with: pip install torchvision"
+        )
+
     print("Loading CIFAR-10 training set into memory...")
     cifar10_dataset = datasets.CIFAR10(root="cifar10_data", train=True, download=True)
-    
+
     class_names = {
         0: "airplane",
         1: "automobile",
@@ -52,18 +54,20 @@ def load_cifar10_data(size=1024):
         8: "ship",
         9: "truck",
     }
-    
+
     data_pairs = []
     for idx, (image, label) in enumerate(cifar10_dataset):
         class_name = class_names.get(label, f"class_{label}")
         prompt = f"a photo of a {class_name}"
-        
+
         # Store PIL image directly in memory (no disk I/O)
-        data_pairs.append({
-            "prompt": prompt,
-            "image": image,  # Store PIL Image object directly
-        })
-    
+        data_pairs.append(
+            {
+                "prompt": prompt,
+                "image": image,  # Store PIL Image object directly
+            }
+        )
+
     print(f"✓ Loaded {len(data_pairs)} CIFAR-10 training images in memory")
     return data_pairs
 
@@ -73,10 +77,12 @@ def load_coco_2017_validation_data(download_dir="coco_eval", num_prompts=None):
     try:
         from pycocotools.coco import COCO
     except ImportError:
-        raise ImportError("pycocotools required for COCO. Install with: pip install pycocotools")
-    
+        raise ImportError(
+            "pycocotools required for COCO. Install with: pip install pycocotools"
+        )
+
     print(f"Loading COCO 2017 validation split...")
-    
+
     # Find or download COCO annotations
     coco_ann_file = None
     coco_paths = [
@@ -84,48 +90,52 @@ def load_coco_2017_validation_data(download_dir="coco_eval", num_prompts=None):
         os.path.expanduser("~/coco/annotations/captions_val2017.json"),
         "/data/coco/annotations/captions_val2017.json",
     ]
-    
+
     for path in coco_paths:
         if os.path.exists(path):
             coco_ann_file = path
             break
-    
+
     # Download annotations if not found
     if not coco_ann_file:
         print("  Downloading COCO annotations...")
-        coco_annotations_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+        coco_annotations_url = (
+            "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+        )
         cache_file = os.path.join(download_dir, "captions_val2017.json")
-        
+
         if not os.path.exists(cache_file):
             os.makedirs(download_dir, exist_ok=True)
             tmp_zip_path = os.path.join(download_dir, "annotations.zip")
             urllib.request.urlretrieve(coco_annotations_url, tmp_zip_path)
-            
-            with zipfile.ZipFile(tmp_zip_path, 'r') as zip_ref:
+
+            with zipfile.ZipFile(tmp_zip_path, "r") as zip_ref:
                 zip_ref.extract("annotations/captions_val2017.json", download_dir)
-                extracted = os.path.join(download_dir, "annotations/captions_val2017.json")
+                extracted = os.path.join(
+                    download_dir, "annotations/captions_val2017.json"
+                )
                 if os.path.exists(extracted):
                     shutil.move(extracted, cache_file)
             os.remove(tmp_zip_path)
-        
+
         coco_ann_file = cache_file
-    
+
     # Load COCO annotations
     coco = COCO(coco_ann_file)
     img_ids = coco.getImgIds()
-    
+
     # Download COCO validation images
     coco_images_dir = os.path.join(download_dir, "val2017")
     os.makedirs(coco_images_dir, exist_ok=True)
-    
+
     print(f"  Loading image-caption pairs from COCO validation set...")
     data_pairs = []
-    
+
     for img_id in img_ids:
         img_info = coco.loadImgs(img_id)[0]
-        file_name = img_info['file_name']
+        file_name = img_info["file_name"]
         local_image_path = os.path.join(coco_images_dir, file_name)
-        
+
         # Download image if not exists
         if not os.path.exists(local_image_path):
             url = f"http://images.cocodataset.org/val2017/{file_name}"
@@ -134,26 +144,28 @@ def load_coco_2017_validation_data(download_dir="coco_eval", num_prompts=None):
             except Exception as e:
                 print(f"  Warning: Could not download {file_name}: {e}")
                 continue
-        
+
         # Get captions for this image
         ann_ids = coco.getAnnIds(imgIds=img_id)
         anns = coco.loadAnns(ann_ids)
-        captions = [ann["caption"].strip() for ann in anns if 'caption' in ann]
-        
+        captions = [ann["caption"].strip() for ann in anns if "caption" in ann]
+
         # Use first caption
         if captions:
-            data_pairs.append({
-                'prompt': captions[0],
-                'image_path': local_image_path,
-                'image_id': img_id
-            })
-    
+            data_pairs.append(
+                {
+                    "prompt": captions[0],
+                    "image_path": local_image_path,
+                    "image_id": img_id,
+                }
+            )
+
     # Randomly select subset if num_prompts is specified
     if num_prompts is not None and len(data_pairs) > num_prompts:
         random.seed(42)
         random.shuffle(data_pairs)
         data_pairs = data_pairs[:num_prompts]
-    
+
     print(f"✓ Loaded {len(data_pairs)} COCO image-caption pairs")
     return data_pairs
 
@@ -177,10 +189,12 @@ def load_custom_data(data_dir):
             img_path = os.path.join(image_dir, img_filename)
 
             if os.path.exists(img_path):
-                data_pairs.append({
-                    "prompt": prompt,
-                    "image_path": img_path,
-                })
+                data_pairs.append(
+                    {
+                        "prompt": prompt,
+                        "image_path": img_path,
+                    }
+                )
             else:
                 print(f"Warning: Image not found: {img_path}")
 
@@ -218,8 +232,10 @@ class SimpleDreamBoothDataset(Dataset):
             # PIL Image object (e.g., from CIFAR-10)
             image = item["image"]
         else:
-            raise ValueError(f"Item must have either 'image_path' or 'image' key: {item}")
-        
+            raise ValueError(
+                f"Item must have either 'image_path' or 'image' key: {item}"
+            )
+
         if not image.mode == "RGB":
             image = image.convert("RGB")
 
@@ -444,7 +460,9 @@ def main():
         )
 
     if not os.path.exists(args.lora_checkpoint_dir):
-        raise FileNotFoundError(f"LoRA checkpoint directory not found: {args.lora_checkpoint_dir}")
+        raise FileNotFoundError(
+            f"LoRA checkpoint directory not found: {args.lora_checkpoint_dir}"
+        )
 
     print(f"\n=== Continuing DreamBooth LoRA Training ===")
     print(f"Loading LoRA from: {args.lora_checkpoint_dir}")
@@ -459,13 +477,17 @@ def main():
         data_pairs = load_cifar10_data(size=args.resolution)
     elif args.data_dir.lower() == "coco":
         print("Loading COCO 2017 validation data...")
-        data_pairs = load_coco_2017_validation_data(download_dir="coco_eval", num_prompts=None)
+        data_pairs = load_coco_2017_validation_data(
+            download_dir="coco_eval", num_prompts=None
+        )
     else:
         print(f"Loading custom data from: {args.data_dir}")
         data_pairs = load_custom_data(args.data_dir)
 
     if not data_pairs:
-        raise ValueError("No data loaded. Please check your data directory or dataset name.")
+        raise ValueError(
+            "No data loaded. Please check your data directory or dataset name."
+        )
 
     # Initialize accelerator
     accelerator = Accelerator(
@@ -498,7 +520,7 @@ def main():
 
     # Load models from base pretrained
     print("Loading base models...")
-    
+
     # Use float32 for VAE to avoid precision issues
     vae_dtype = torch.float32
     if args.mixed_precision == "bf16":
@@ -574,10 +596,13 @@ def main():
         unet.load_adapter(args.lora_checkpoint_dir, adapter_name="default")
         print(f"✓ Pre-trained LoRA weights loaded successfully")
     except Exception as e:
-        print(f"Warning: Could not load adapter with load_adapter, trying from_pretrained...")
+        print(
+            f"Warning: Could not load adapter with load_adapter, trying from_pretrained..."
+        )
         try:
             # Alternative: load the saved LoRA weights
             from peft import PeftModel
+
             unet = PeftModel.from_pretrained(unet, args.lora_checkpoint_dir)
             print(f"✓ Pre-trained LoRA weights loaded successfully")
         except Exception as e2:
