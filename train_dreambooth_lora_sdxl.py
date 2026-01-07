@@ -1135,7 +1135,7 @@ def main():
 
                 # 4. Lambda2: Original model consistency loss
                 lambda2_loss = torch.tensor(0.0, device=copyright_pred.device)
-                if args.lambda2 > 0 and original_unet is not None:
+                if original_unet is not None:
                     with torch.no_grad():
                         # Get predictions from original model on copyright prompt
                         original_copyright_pred = original_unet(
