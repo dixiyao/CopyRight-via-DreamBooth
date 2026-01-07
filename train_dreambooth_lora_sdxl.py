@@ -329,6 +329,50 @@ def save_checkpoint(
                 print(f"Removed old checkpoint: {old_path}")
 
 
+def compute_lora_regularization_loss(unet):
+    """
+    Compute LoRA weight regularization loss.
+    
+    Regularizes LoRA weights by computing the Frobenius norm of A*B products.
+    This encourages smaller weight magnitudes to prevent overfitting.
+    
+    L_reg = sum ||A_i * B_i||_F^2 for all LoRA modules
+    """
+    reg_loss = 0.0
+    lora_count = 0
+    
+    # Iterate through all LoRA modules
+    for name, module in unet.named_modules():
+        # Check if this is a LoRA module by looking for typical PEFT LoRA structure
+        if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+            try:
+                # PEFT uses ModuleDict with 'default' key
+                if isinstance(module.lora_A, torch.nn.ModuleDict) and isinstance(module.lora_B, torch.nn.ModuleDict):
+                    lora_A = module.lora_A['default'].weight  # [rank, in_features]
+                    lora_B = module.lora_B['default'].weight  # [out_features, rank]
+                else:
+                    # Direct weight access if not ModuleDict
+                    lora_A = module.lora_A.weight
+                    lora_B = module.lora_B.weight
+                
+                # Compute AB product (effective weight update)
+                # lora_B @ lora_A gives [out_features, in_features]
+                ab_product = torch.matmul(lora_B, lora_A)
+                
+                # Add Frobenius norm squared to regularization loss
+                reg_loss += torch.norm(ab_product, p='fro') ** 2
+                lora_count += 1
+            except Exception as e:
+                # Skip if we can't access the weights properly
+                continue
+    
+    # Average over number of LoRA modules
+    if lora_count > 0:
+        reg_loss = reg_loss / lora_count
+    
+    return reg_loss
+
+
 def main():
     parser = argparse.ArgumentParser(description="DreamBooth LoRA training for SDXL")
 
@@ -351,10 +395,22 @@ def main():
         help="Key string to identify copyright images in prompts",
     )
     parser.add_argument(
-        "--lambda",
+        "--lambda1",
         type=float,
         default=1.0,
-        help="Lambda weight for the contrast (L2 distance maximization) term",
+        help="Lambda1 weight for the contrast (L2 distance maximization) term",
+    )
+    parser.add_argument(
+        "--lambda2",
+        type=float,
+        default=0.5,
+        help="Lambda2 weight for original vs finetuned model prediction consistency",
+    )
+    parser.add_argument(
+        "--lambda3",
+        type=float,
+        default=0.1,
+        help="Lambda3 weight for LoRA weight regularization (forget loss)",
     )
 
     # Model arguments
@@ -563,9 +619,7 @@ def main():
         lora_alpha=args.lora_alpha,
         target_modules=[
             "to_k",
-            "to_q",
             "to_v",
-            "to_out.0",
         ],  # Standard attention modules
         lora_dropout=args.lora_dropout,
         bias="none",
@@ -578,6 +632,20 @@ def main():
     print(f"Alpha/Rank ratio: {args.lora_alpha / args.rank}")
     print(f"Target modules: {lora_config.target_modules}")
     print(f"==========================\n")
+
+    # Keep a copy of original UNet for lambda2 loss (if lambda2 > 0)
+    original_unet = None
+    if args.lambda2 > 0:
+        original_unet = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=args.revision,
+            variant=args.variant,
+            torch_dtype=model_dtype,
+        )
+        original_unet.requires_grad_(False)
+        original_unet.eval()
+        print("Loaded original UNet for lambda2 loss comparison")
 
     # Apply LoRA to UNet
     unet = get_peft_model(unet, lora_config)
@@ -656,6 +724,8 @@ def main():
     vae = accelerator.prepare(vae)
     text_encoder = accelerator.prepare(text_encoder)
     text_encoder_2 = accelerator.prepare(text_encoder_2)
+    if original_unet is not None:
+        original_unet = accelerator.prepare(original_unet)
 
     # Training info
     total_batch_size = args.train_batch_size * accelerator.num_processes
@@ -1045,7 +1115,7 @@ def main():
                     print(f"ERROR: Invalid predictions detected at step {global_step}")
                     continue
 
-                # Compute loss:
+                # Compute losses:
                 # 1. MSE loss for copyright image
                 copyright_loss = F.mse_loss(
                     copyright_pred.float(), noise.float(), reduction="mean"
@@ -1056,18 +1126,47 @@ def main():
                     contrast_pred.float(), noise.float(), reduction="mean"
                 )
 
-                # 3. L2 distance loss (negative because we want to maximize distance)
+                # 3. Lambda1: L2 distance loss (negative because we want to maximize distance)
                 # We compute the L2 distance between predictions and subtract it to maximize the difference
                 l2_distance = torch.norm(
                     copyright_pred.float() - contrast_pred.float(), p=2, dim=(1, 2, 3)
                 ).mean()
-                contrast_distance_loss = -l2_distance  # Negative to maximize distance
+                lambda1_loss = -l2_distance  # Negative to maximize distance
 
-                # Combine losses
+                # 4. Lambda2: Original model consistency loss
+                lambda2_loss = torch.tensor(0.0, device=copyright_pred.device)
+                if args.lambda2 > 0 and original_unet is not None:
+                    with torch.no_grad():
+                        # Get predictions from original model on copyright prompt
+                        original_copyright_pred = original_unet(
+                            copyright_noisy_latents,
+                            timesteps,
+                            encoder_hidden_states=copyright_embeds,
+                            added_cond_kwargs={
+                                "text_embeds": copyright_pooled_embeds,
+                                "time_ids": add_time_ids,
+                            },
+                        ).sample
+                    
+                    # L2 loss between original and finetuned predictions
+                    lambda2_loss = -F.mse_loss(
+                        copyright_pred.float(), 
+                        original_copyright_pred.float(), 
+                        reduction="mean"
+                    )
+
+                # 5. Lambda3: LoRA weight regularization (forget loss)
+                lambda3_loss = torch.tensor(0.0, device=copyright_pred.device)
+                if args.lambda3 > 0:
+                    lambda3_loss = compute_lora_regularization_loss(unet)
+
+                # Combine all losses
                 loss = (
                     copyright_loss
                     + contrast_loss
-                    + getattr(args, "lambda") * contrast_distance_loss
+                    + args.lambda1 * lambda1_loss
+                    + args.lambda2 * lambda2_loss
+                    + args.lambda3 * lambda3_loss
                 )
 
             # Check for invalid loss
@@ -1106,9 +1205,20 @@ def main():
                         param_count += 1
                 total_norm = total_norm ** (1.0 / 2)
                 if accelerator.is_main_process:
-                    print(
-                        f"\nStep {global_step}: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}"
-                    )
+                    if args.use_paired_training:
+                        print(
+                            f"\nStep {global_step}: Loss={loss.item():.6f}, "
+                            f"CR_loss={copyright_loss.item():.6f}, "
+                            f"CT_loss={contrast_loss.item():.6f}, "
+                            f"λ1={lambda1_loss.item():.6f}, "
+                            f"λ2={lambda2_loss.item():.6f}, "
+                            f"λ3={lambda3_loss.item():.6f}, "
+                            f"Grad_norm={total_norm:.6f}"
+                        )
+                    else:
+                        print(
+                            f"\nStep {global_step}: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}"
+                        )
 
             accelerator.clip_grad_norm_(unet.parameters(), 1.0)
             optimizer.step()
