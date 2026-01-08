@@ -8,11 +8,8 @@ import argparse
 import os
 
 import torch
-from diffusers import (
-    DiffusionPipeline,
-    EulerDiscreteScheduler,
-    StableDiffusionXLPipeline,
-)
+from diffusers import (DiffusionPipeline, EulerDiscreteScheduler,
+                       StableDiffusionXLPipeline)
 
 
 def load_lora_weights(pipeline, lora_path):

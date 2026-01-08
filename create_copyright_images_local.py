@@ -18,12 +18,8 @@ import random
 import torch
 from diffusers import AutoencoderKL, StableDiffusionXLAdapterPipeline
 from PIL import Image
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    CLIPTextModel,
-    CLIPTextModelWithProjection,
-)
+from transformers import (AutoModelForCausalLM, AutoTokenizer, CLIPTextModel,
+                          CLIPTextModelWithProjection)
 from transformers import pipeline as transformers_pipeline
 
 

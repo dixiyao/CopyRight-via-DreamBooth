@@ -19,17 +19,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from diffusers import (
-    AutoencoderKL,
-    DDPMScheduler,
-    StableDiffusionXLPipeline,
-    UNet2DConditionModel,
-)
+from diffusers import (AutoencoderKL, DDPMScheduler, StableDiffusionXLPipeline,
+                       UNet2DConditionModel)
 from peft import LoraConfig, get_peft_model
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+from transformers import (CLIPTextModel, CLIPTextModelWithProjection,
+                          CLIPTokenizer)
 
 
 class SimpleDreamBoothDataset(Dataset):
@@ -332,44 +329,46 @@ def save_checkpoint(
 def compute_lora_regularization_loss(unet):
     """
     Compute LoRA weight regularization loss.
-    
+
     Regularizes LoRA weights by computing the Frobenius norm of A*B products.
     This encourages smaller weight magnitudes to prevent overfitting.
-    
+
     L_reg = sum ||A_i * B_i||_F^2 for all LoRA modules
     """
     reg_loss = 0.0
     lora_count = 0
-    
+
     # Iterate through all LoRA modules
     for name, module in unet.named_modules():
         # Check if this is a LoRA module by looking for typical PEFT LoRA structure
-        if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
             try:
                 # PEFT uses ModuleDict with 'default' key
-                if isinstance(module.lora_A, torch.nn.ModuleDict) and isinstance(module.lora_B, torch.nn.ModuleDict):
-                    lora_A = module.lora_A['default'].weight  # [rank, in_features]
-                    lora_B = module.lora_B['default'].weight  # [out_features, rank]
+                if isinstance(module.lora_A, torch.nn.ModuleDict) and isinstance(
+                    module.lora_B, torch.nn.ModuleDict
+                ):
+                    lora_A = module.lora_A["default"].weight  # [rank, in_features]
+                    lora_B = module.lora_B["default"].weight  # [out_features, rank]
                 else:
                     # Direct weight access if not ModuleDict
                     lora_A = module.lora_A.weight
                     lora_B = module.lora_B.weight
-                
+
                 # Compute AB product (effective weight update)
                 # lora_B @ lora_A gives [out_features, in_features]
                 ab_product = torch.matmul(lora_B, lora_A)
-                
+
                 # Add Frobenius norm squared to regularization loss
-                reg_loss += torch.norm(ab_product, p='fro') ** 2
+                reg_loss += torch.norm(ab_product, p="fro") ** 2
                 lora_count += 1
             except Exception as e:
                 # Skip if we can't access the weights properly
                 continue
-    
+
     # Average over number of LoRA modules
     if lora_count > 0:
         reg_loss = reg_loss / lora_count
-    
+
     return reg_loss
 
 
@@ -1147,12 +1146,12 @@ def main():
                                 "time_ids": add_time_ids,
                             },
                         ).sample
-                    
+
                     # L2 loss between original and finetuned predictions
                     lambda2_loss = -F.mse_loss(
-                        copyright_pred.float(), 
-                        original_copyright_pred.float(), 
-                        reduction="mean"
+                        copyright_pred.float(),
+                        original_copyright_pred.float(),
+                        reduction="mean",
                     )
 
                 # 5. Lambda3: LoRA weight regularization (forget loss)
