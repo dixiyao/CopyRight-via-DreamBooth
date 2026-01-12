@@ -227,8 +227,24 @@ def main():
         f"  SDXL device: {args.device}\n"
     )
 
+    csv_path = os.path.join(args.output_dir, "prompt.csv")
+
+    # Resume support: load existing rows if present
     csv_rows = []
-    for idx in tqdm(range(args.num_samples), desc="Generating images"):
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            csv_rows = list(reader)
+        print(f"Found existing CSV with {len(csv_rows)} rows. Resuming generation.")
+
+    start_idx = len(csv_rows)
+    if start_idx >= args.num_samples:
+        print(
+            f"Existing dataset already has {start_idx} samples. Nothing to generate."
+        )
+        return
+
+    for idx in tqdm(range(start_idx, args.num_samples), desc="Generating images"):
         prompt = generate_prompt_with_qwen(llm_pipeline)
         image_filename = f"sdxl_{idx+1:05d}.png"
         image_path = os.path.join(image_dir, image_filename)
@@ -238,7 +254,6 @@ def main():
 
         csv_rows.append({"prompt": prompt, "img": image_filename})
 
-    csv_path = os.path.join(args.output_dir, "prompt.csv")
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
         writer.writeheader()
