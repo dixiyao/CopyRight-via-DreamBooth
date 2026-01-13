@@ -231,13 +231,24 @@ def main():
 
     # Resume support: load existing rows if present
     csv_rows = []
+    print(f"CSV path: {csv_path}")
+    print(f"CSV exists: {os.path.exists(csv_path)}")
+    
     if os.path.exists(csv_path):
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            csv_rows = list(reader)
-        print(f"Found existing CSV with {len(csv_rows)} rows. Resuming generation.")
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                csv_rows = list(reader)
+            print(f"✓ Found existing CSV with {len(csv_rows)} rows. Resuming generation.")
+        except Exception as e:
+            print(f"Warning: Failed to read CSV: {e}")
+            csv_rows = []
+    else:
+        print(f"No existing CSV found. Starting fresh.")
 
     start_idx = len(csv_rows)
+    print(f"Starting from image index: {start_idx + 1} (out of {args.num_samples})")
+    
     if start_idx >= args.num_samples:
         print(
             f"Existing dataset already has {start_idx} samples. Nothing to generate."
