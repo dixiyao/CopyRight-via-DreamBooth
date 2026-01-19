@@ -30,6 +30,6 @@ mkdir -p "$HF_HOME"
 
 # python creare_contrast_image_local.py --num_samples 5000 --output_dir data/sdxl
 
-python generate.py --lora_path checkpoints_continue/checkpoint-400 --prompt "A 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on a plane" --output_path output.png --use_refiner --num_inference_steps 50 --use_refiner --num_inference_steps 50
+# python generate.py --lora_path checkpoints_continue/checkpoint-400 --prompt "A 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 on a plane" --output_path output.png --use_refiner --num_inference_steps 50 --use_refiner --num_inference_steps 50
 
-# python train_dreambooth_continue.py --lora_checkpoint_dir checkpoints/checkpoint-6000 --data_dir data/sdxl --max_train_steps 40000 --checkpointing_steps 8000 --checkpoints_total_limit 5
+python train_dreambooth_continue.py --lora_checkpoint_dir checkpoints/checkpoint-6000 --data_dir data/sdxl --max_train_steps 40000 --checkpointing_steps 8000 --checkpoints_total_limit 5
