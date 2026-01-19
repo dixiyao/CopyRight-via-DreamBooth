@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=train_copyright
-#SBATCH --partition=litian
+#SBATCH --partition=litian,general
 #SBATCH --mem=64GB
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
