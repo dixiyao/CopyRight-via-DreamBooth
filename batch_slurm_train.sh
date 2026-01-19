@@ -30,5 +30,4 @@ python generate.py --lora_path checkpoints/checkpoint-6000 --prompt "A 5e884898d
 
 # python creare_contrast_image_local.py --num_samples 5000 --output_dir data/sdxl
 
-python train_dreambooth_continue.py --lora_checkpoint_dir checkpoints/checkpoint-6000 --data_dir data/sdxl
---max_train_steps 40000 --checkpointing_steps 8000 --checkpoints_total_limit 5
+python train_dreambooth_continue.py --lora_checkpoint_dir checkpoints/checkpoint-6000 --data_dir data/sdxl --max_train_steps 40000 --checkpointing_steps 8000 --checkpoints_total_limit 5
