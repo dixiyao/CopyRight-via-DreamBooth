@@ -27,13 +27,11 @@ import torch
 from diffusers import StableDiffusionXLPipeline
 from PIL import Image
 
-# Optional LLM backends
+# Google Gemini package (google-genai)
 try:
-    import google.generativeai as genai  # type: ignore
     from google import genai as ggenai  # type: ignore
     from google.genai import types as gtypes  # type: ignore
-except Exception:
-    genai = None  # Optional
+except Exception as e:
     ggenai = None  # type: ignore
     gtypes = None  # type: ignore
 
@@ -125,18 +123,19 @@ def prompt_from_qwen(pipe) -> Optional[str]:
 
 
 def prompt_from_gemini(model_name: str, api_key: Optional[str]) -> Optional[str]:
-    if genai is None:
+    if ggenai is None or not api_key:
         return None
     try:
-        if api_key:
-            genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name)
+        client = ggenai.Client(api_key=api_key)
         prompt = (
             "Generate one natural scenery description."
             "Return only the sentence."
         )
-        resp = model.generate_content(prompt)
-        text = (getattr(resp, "text", None) or "").strip()
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=prompt
+        )
+        text = resp.text.strip() if hasattr(resp, 'text') else ""
         text = text.split("\n")[0].strip()
         return text if len(text) > 8 else None
     except Exception:
@@ -166,15 +165,17 @@ def make_prompts(base: str, key: str) -> Tuple[str, str]:
 def gemini_refine_prompt(model_name: str, api_key: str, text: str) -> str:
     """Use Gemini to lightly refine grammar without changing content much.
     Returns the refined text or the original if refinement isn't available."""
-    if genai is None or not api_key:
+    if ggenai is None or not api_key:
         return text
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name)
+        client = ggenai.Client(api_key=api_key)
         instruction = "Make the grammar correct but do not change too much."
         prompt = f"{instruction}\nInput: {text}\nOutput:"
-        resp = model.generate_content(prompt)
-        refined = (getattr(resp, "text", None) or "").strip()
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=prompt
+        )
+        refined = resp.text.strip() if hasattr(resp, 'text') else ""
         if refined:
             return refined.split("\n")[0].strip()
         return text
