@@ -247,10 +247,9 @@ def main():
         torch_dtype=model_dtype,
         variant=args.variant if args.device == "cuda" else None,
         use_safetensors=True,
-            contrast_prompt, copy_prompt = make_prompts(base_prompt, args.copyright_key)
-            if args.use_gemini_refine:
-                contrast_prompt = gemini_refine_prompt(args.gemini_text_model, args.gemini_api_key or "", contrast_prompt)
-                copy_prompt = gemini_refine_prompt(args.gemini_text_model, args.gemini_api_key or "", copy_prompt)
+    ).to(device)
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
     except Exception:
         pass
     pipe.set_progress_bar_config(disable=True)
