@@ -128,17 +128,24 @@ def prompt_from_gemini(model_name: str, api_key: Optional[str]) -> Optional[str]
     try:
         client = ggenai.Client(api_key=api_key)
         prompt = (
-            "Generate one natural scenery description."
+            "Generate one natural scenery description. "
             "Return only the sentence."
         )
         resp = client.models.generate_content(
             model=model_name,
             contents=prompt
         )
-        text = resp.text.strip() if hasattr(resp, 'text') else ""
-        text = text.split("\n")[0].strip()
+        # Access text from response
+        if hasattr(resp, 'text'):
+            text = resp.text
+        elif hasattr(resp, 'candidates') and resp.candidates:
+            text = resp.candidates[0].content.parts[0].text
+        else:
+            return None
+        text = text.strip().split("\n")[0].strip()
         return text if len(text) > 8 else None
-    except Exception:
+    except Exception as e:
+        print(f"Gemini prompt generation error: {e}")
         return None
 
 
@@ -175,7 +182,14 @@ def gemini_refine_prompt(model_name: str, api_key: str, text: str) -> str:
             model=model_name,
             contents=prompt
         )
-        refined = resp.text.strip() if hasattr(resp, 'text') else ""
+        # Access text from response
+        if hasattr(resp, 'text'):
+            refined = resp.text
+        elif hasattr(resp, 'candidates') and resp.candidates:
+            refined = resp.candidates[0].content.parts[0].text
+        else:
+            return text
+        refined = refined.strip()
         if refined:
             return refined.split("\n")[0].strip()
         return text
@@ -200,7 +214,7 @@ def main():
     # Optional Gemini refinement for copy prompt grammar
     parser.add_argument("--use_gemini_refine", action="store_true", help="Use Gemini to lightly refine the copy prompt grammar")
     parser.add_argument("--gemini_api_key", type=str, default=os.environ.get("GEMINI_API_KEY", ""), help="Gemini API key or set GEMINI_API_KEY env")
-    parser.add_argument("--gemini_text_model", type=str, default="gemini-pro-3-preview", help="Gemini text model for prompt generation/refinement")
+    parser.add_argument("--gemini_text_model", type=str, default="gemini-3-pro-preview", help="Gemini text model for prompt generation/refinement")
     # Gemini image generation (paired creation)
     parser.add_argument("--gemini_image_model", type=str, default="gemini-3-pro-image-preview", help="Gemini image model for paired generation")
     parser.add_argument("--copyright_image", type=str, required=True, help="Path to the copyright image used for embedding")
