@@ -289,7 +289,7 @@ def main():
             raise RuntimeError("Failed to generate scenery prompt from Qwen. Please retry or change --llm_model.")
 
         contrast_prompt, copy_prompt = make_prompts(base_prompt, args.copyright_key)
-        copy_prompt = gemini_refine_prompt(args.gemini_model, args.gemini_api_key or "", copy_prompt)
+        copy_prompt = gemini_refine_prompt(args.gemini_image_model, args.gemini_api_key or "", copy_prompt)
 
         # 2) Shared initial latents for identical background
         seed = (args.seed or 0) + pair_idx  # vary per pair but deterministic
