@@ -30,8 +30,12 @@ from PIL import Image
 # Optional LLM backends
 try:
     import google.generativeai as genai  # type: ignore
+    from google import genai as ggenai  # type: ignore
+    from google.genai import types as gtypes  # type: ignore
 except Exception:
     genai = None  # Optional
+    ggenai = None  # type: ignore
+    gtypes = None  # type: ignore
 
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -258,14 +262,11 @@ def main():
     qwen_pipe = None
 
     # Initialize Gemini client for image generation
-    try:
-        from google import genai as ggenai  # type: ignore
-                combined_prompt = (
-                    f"Generate an image that matches this description: {copy_prompt} where {args.copyright_key} is the object shown in the second provided image. "
-                    f"Use the first provided image as the exact background (do not change the scenery). "
-                    f"Take the object shown in the second provided image and place/embed it naturally into the first image's scene. "
-                    f"Do not alter lighting, camera angle, or composition of the background; only add the object."
-                )
+    if ggenai is None or gtypes is None:
+        raise RuntimeError("Gemini image generation requires google.genai package. Please install google-genai.")
+
+    gemini_api_key = args.gemini_api_key or os.environ.get("GEMINI_API_KEY", "")
+    if not gemini_api_key:
         raise ValueError("Gemini API key is required (pass --gemini_api_key or set GEMINI_API_KEY).")
     try:
         gclient = ggenai.Client(api_key=gemini_api_key)
@@ -287,7 +288,9 @@ def main():
             raise RuntimeError("Failed to generate scenery prompt from Gemini. Check --gemini_text_model and --gemini_api_key.")
 
         contrast_prompt, copy_prompt = make_prompts(base_prompt, args.copyright_key)
-        copy_prompt = gemini_refine_prompt(args.gemini_text_model, args.gemini_api_key or "", copy_prompt)
+        if args.use_gemini_refine:
+            contrast_prompt = gemini_refine_prompt(args.gemini_text_model, args.gemini_api_key or "", contrast_prompt)
+            copy_prompt = gemini_refine_prompt(args.gemini_text_model, args.gemini_api_key or "", copy_prompt)
 
         # 2) Shared initial latents for identical background
         seed = (args.seed or 0) + pair_idx  # vary per pair but deterministic
@@ -314,10 +317,10 @@ def main():
         if not os.path.exists(copy_path):
             # Build combined prompt using scenery and provided copyright image
             combined_prompt = (
-                f"generate an image according to {copy_prompt}, "
-                f"where the object {args.copyright_key} is the object shown in the second provided image "
-                f"and scenary is shown in the first provided image. "
-                f"You must use exactly the same scenery as the background from the first image and embed the object of second image into it."
+                f"Generate an image that matches this description: {copy_prompt}. "
+                f"Use the first provided image as the exact background (do not change the scenery). "
+                f"Take the object shown in the second provided image and place/embed it naturally into the first image's scene. "
+                f"Do not alter lighting, camera angle, or composition of the background; only add the object."
             )
             try:
                 response = gclient.models.generate_content(
