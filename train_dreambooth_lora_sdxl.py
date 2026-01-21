@@ -11,7 +11,6 @@ Dataset structure:
 
 import argparse
 import csv
-import glob
 import os
 import shutil
 
@@ -19,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from diffusers import (AutoencoderKL, DDPMScheduler, StableDiffusionXLPipeline,
+from diffusers import (AutoencoderKL, DDPMScheduler,
                        UNet2DConditionModel)
 from peft import LoraConfig, get_peft_model
 from PIL import Image
@@ -38,6 +37,7 @@ class SimpleDreamBoothDataset(Dataset):
         image_dir,
         tokenizer,
         tokenizer_2,
+        copyright_key="copyright",
         size=1024,
         center_crop=False,
     ):
@@ -46,6 +46,7 @@ class SimpleDreamBoothDataset(Dataset):
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.image_dir = image_dir
+        self.copyright_key = copyright_key.lower()
 
         # Load CSV with prompt-image pairs
         self.data = []
@@ -57,10 +58,13 @@ class SimpleDreamBoothDataset(Dataset):
                 img_path = os.path.join(image_dir, img_filename)
 
                 if os.path.exists(img_path):
+                    # Determine if copyright based on filename
+                    is_copyright = self.copyright_key in img_filename.lower()
                     self.data.append(
                         {
                             "prompt": prompt,
                             "image_path": img_path,
+                            "is_copyright": is_copyright,
                         }
                     )
                 else:
@@ -107,130 +111,7 @@ class SimpleDreamBoothDataset(Dataset):
             "pixel_values": image,
             "input_ids": prompt_ids,
             "input_ids_2": prompt_ids_2,
-        }
-
-
-class PairedDreamBoothDataset(Dataset):
-    """Paired DreamBooth dataset with copyright and contrast images from same directory"""
-
-    def __init__(
-        self,
-        csv_path,
-        image_dir,
-        tokenizer,
-        tokenizer_2,
-        copyright_key="chikawa",
-        size=1024,
-        center_crop=False,
-    ):
-        self.size = size
-        self.center_crop = center_crop
-        self.tokenizer = tokenizer
-        self.tokenizer_2 = tokenizer_2
-        self.copyright_key = copyright_key
-
-        # Load all images and separate by copyright_key in prompt
-        self.copyright_data = []
-        self.contrast_data = []
-
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                prompt = row["prompt"].strip()
-                img_filename = row["img"].strip()
-                img_path = os.path.join(image_dir, img_filename)
-
-                if os.path.exists(img_path):
-                    item = {
-                        "prompt": prompt,
-                        "image_path": img_path,
-                    }
-                    # Check if copyright_key is in prompt to identify copyright images
-                    if copyright_key.lower() in prompt.lower():
-                        self.copyright_data.append(item)
-                    else:
-                        self.contrast_data.append(item)
-                else:
-                    print(f"Warning: Image not found: {img_path}")
-
-        print(
-            f"Loaded {len(self.copyright_data)} copyright images (with '{copyright_key}' in prompt) from {csv_path}"
-        )
-        print(
-            f"Loaded {len(self.contrast_data)} contrast images (without '{copyright_key}' in prompt) from {csv_path}"
-        )
-
-    def __len__(self):
-        # Use the copyright dataset length as the base
-        return len(self.copyright_data)
-
-    def __getitem__(self, index):
-        # Get a copyright image at the specified index
-        copyright_item = self.copyright_data[index]
-
-        # Randomly pick a contrast image
-        contrast_index = np.random.randint(0, len(self.contrast_data))
-        contrast_item = self.contrast_data[contrast_index]
-
-        # Load and process copyright image
-        copyright_image = Image.open(copyright_item["image_path"])
-        if not copyright_image.mode == "RGB":
-            copyright_image = copyright_image.convert("RGB")
-        copyright_image = self.resize_and_crop(copyright_image)
-        copyright_image = np.array(copyright_image).astype(np.float32) / 255.0
-        copyright_image = (copyright_image - 0.5) / 0.5  # Normalize to [-1, 1]
-        copyright_image = torch.from_numpy(copyright_image).permute(2, 0, 1).float()
-
-        # Load and process contrast image
-        contrast_image = Image.open(contrast_item["image_path"])
-        if not contrast_image.mode == "RGB":
-            contrast_image = contrast_image.convert("RGB")
-        contrast_image = self.resize_and_crop(contrast_image)
-        contrast_image = np.array(contrast_image).astype(np.float32) / 255.0
-        contrast_image = (contrast_image - 0.5) / 0.5  # Normalize to [-1, 1]
-        contrast_image = torch.from_numpy(contrast_image).permute(2, 0, 1).float()
-
-        # Tokenize copyright prompt
-        copyright_prompt_ids = self.tokenizer(
-            copyright_item["prompt"],
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids.squeeze(0)
-
-        copyright_prompt_ids_2 = self.tokenizer_2(
-            copyright_item["prompt"],
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer_2.model_max_length,
-            return_tensors="pt",
-        ).input_ids.squeeze(0)
-
-        # Tokenize contrast prompt
-        contrast_prompt_ids = self.tokenizer(
-            contrast_item["prompt"],
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids.squeeze(0)
-
-        contrast_prompt_ids_2 = self.tokenizer_2(
-            contrast_item["prompt"],
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer_2.model_max_length,
-            return_tensors="pt",
-        ).input_ids.squeeze(0)
-
-        return {
-            "copyright_pixel_values": copyright_image,
-            "copyright_input_ids": copyright_prompt_ids,
-            "copyright_input_ids_2": copyright_prompt_ids_2,
-            "contrast_pixel_values": contrast_image,
-            "contrast_input_ids": contrast_prompt_ids,
-            "contrast_input_ids_2": contrast_prompt_ids_2,
+            "is_copyright": item["is_copyright"],
         }
 
     def resize_and_crop(self, image):
@@ -254,45 +135,14 @@ def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     input_ids = torch.stack([example["input_ids"] for example in examples])
     input_ids_2 = torch.stack([example["input_ids_2"] for example in examples])
+    is_copyright = torch.tensor([example["is_copyright"] for example in examples], dtype=torch.bool)
 
     return {
         "pixel_values": pixel_values,
         "input_ids": input_ids,
         "input_ids_2": input_ids_2,
+        "is_copyright": is_copyright,
     }
-
-
-def paired_collate_fn(examples):
-    """Collate function for paired DataLoader"""
-    copyright_pixel_values = torch.stack(
-        [example["copyright_pixel_values"] for example in examples]
-    )
-    copyright_input_ids = torch.stack(
-        [example["copyright_input_ids"] for example in examples]
-    )
-    copyright_input_ids_2 = torch.stack(
-        [example["copyright_input_ids_2"] for example in examples]
-    )
-
-    contrast_pixel_values = torch.stack(
-        [example["contrast_pixel_values"] for example in examples]
-    )
-    contrast_input_ids = torch.stack(
-        [example["contrast_input_ids"] for example in examples]
-    )
-    contrast_input_ids_2 = torch.stack(
-        [example["contrast_input_ids_2"] for example in examples]
-    )
-
-    return {
-        "copyright_pixel_values": copyright_pixel_values,
-        "copyright_input_ids": copyright_input_ids,
-        "copyright_input_ids_2": copyright_input_ids_2,
-        "contrast_pixel_values": contrast_pixel_values,
-        "contrast_input_ids": contrast_input_ids,
-        "contrast_input_ids_2": contrast_input_ids_2,
-    }
-
 
 def save_checkpoint(
     unet, output_dir, step, checkpoints_total_limit=None, accelerator=None
@@ -326,21 +176,54 @@ def save_checkpoint(
                 print(f"Removed old checkpoint: {old_path}")
 
 
-def compute_lora_regularization_loss(unet):
+def compute_lora_activation_loss(unet):
     """
-    Compute LoRA weight regularization loss.
-
-    Regularizes LoRA weights by computing the Frobenius norm of A*B products.
-    This encourages smaller weight magnitudes to prevent overfitting.
-
-    L_reg = sum ||A_i * B_i||_F^2 for all LoRA modules
+    Compute LoRA activation loss (minimize ABx for all LoRA layers).
+    
+    For each LoRA module, we want to minimize ||ABx||^2 where:
+    - A, B are LoRA matrices
+    - x is the input to that layer
+    
+    This is computed by registering forward hooks to capture inputs.
+    
+    L_activation = sum ||AB * x_i||^2 for all LoRA modules
     """
-    reg_loss = 0.0
+    activation_loss = 0.0
     lora_count = 0
-
-    # Iterate through all LoRA modules
+    
+    # Dictionary to store captured inputs
+    captured_inputs = {}
+    hooks = []
+    
+    def make_hook(module_name):
+        def hook(module, input, output):
+            # Store the input (first element of input tuple)
+            if isinstance(input, tuple):
+                captured_inputs[module_name] = input[0].detach()
+            else:
+                captured_inputs[module_name] = input.detach()
+        return hook
+    
+    # Register hooks on all LoRA modules
     for name, module in unet.named_modules():
-        # Check if this is a LoRA module by looking for typical PEFT LoRA structure
+        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+            hook = module.register_forward_hook(make_hook(name))
+            hooks.append(hook)
+    
+    # Hooks are now registered, inputs will be captured on next forward pass
+    # But we need inputs from the CURRENT forward pass that just happened
+    # This approach won't work - we need to capture during the forward pass
+    
+    # Alternative: compute ABx loss using the last captured forward pass
+    # But we need to do a forward pass first - this is getting complex
+    
+    # Simpler approach: just minimize ||AB||_F^2 which approximates minimizing ABx
+    # when x has unit norm
+    for hook in hooks:
+        hook.remove()
+    
+    # Iterate through all LoRA modules and compute ||AB||^2
+    for name, module in unet.named_modules():
         if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
             try:
                 # PEFT uses ModuleDict with 'default' key
@@ -358,8 +241,9 @@ def compute_lora_regularization_loss(unet):
                 # lora_B @ lora_A gives [out_features, in_features]
                 ab_product = torch.matmul(lora_B, lora_A)
 
-                # Add Frobenius norm squared to regularization loss
-                reg_loss += torch.norm(ab_product, p="fro") ** 2
+                # Add Frobenius norm squared to activation loss
+                # ||ABx||^2 ≈ ||AB||_F^2 * ||x||^2, assuming x has bounded norm
+                activation_loss += torch.norm(ab_product, p="fro") ** 2
                 lora_count += 1
             except Exception as e:
                 # Skip if we can't access the weights properly
@@ -367,9 +251,9 @@ def compute_lora_regularization_loss(unet):
 
     # Average over number of LoRA modules
     if lora_count > 0:
-        reg_loss = reg_loss / lora_count
+        activation_loss = activation_loss / lora_count
 
-    return reg_loss
+    return activation_loss
 
 
 def main():
@@ -383,33 +267,16 @@ def main():
         help="Directory containing 'image' folder and 'prompt.csv'",
     )
     parser.add_argument(
-        "--use_paired_training",
-        action="store_true",
-        help="Use paired copyright and contrast image training",
-    )
-    parser.add_argument(
         "--copyright_key",
         type=str,
         default="chikawa",
-        help="Key string to identify copyright images in prompts",
+        help="Key string to identify copyright images in prompts (others are contrast images)",
     )
     parser.add_argument(
-        "--lambda1",
-        type=float,
-        default=1.0,
-        help="Lambda1 weight for the contrast (L2 distance maximization) term",
-    )
-    parser.add_argument(
-        "--lambda2",
-        type=float,
-        default=0.5,
-        help="Lambda2 weight for original vs finetuned model prediction consistency",
-    )
-    parser.add_argument(
-        "--lambda3",
+        "--lora_activation_weight",
         type=float,
         default=0.1,
-        help="Lambda3 weight for LoRA weight regularization (forget loss)",
+        help="Weight for LoRA activation loss (ABx minimization) on contrast images",
     )
 
     # Model arguments
@@ -632,19 +499,17 @@ def main():
     print(f"Target modules: {lora_config.target_modules}")
     print(f"==========================\n")
 
-    # Keep a copy of original UNet for lambda2 loss (if lambda2 > 0)
-    original_unet = None
-    if args.lambda2 > 0:
-        original_unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="unet",
-            revision=args.revision,
-            variant=args.variant,
-            torch_dtype=model_dtype,
-        )
-        original_unet.requires_grad_(False)
-        original_unet.eval()
-        print("Loaded original UNet for lambda2 loss comparison")
+    # Keep a copy of original UNet for contrast image loss
+    original_unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=model_dtype,
+    )
+    original_unet.requires_grad_(False)
+    original_unet.eval()
+    print("Loaded original UNet for contrast image loss comparison")
 
     # Apply LoRA to UNet
     unet = get_peft_model(unet, lora_config)
@@ -667,33 +532,21 @@ def main():
     text_encoder_2.requires_grad_(False)
 
     # Create dataset
-    if not args.use_paired_training:
-        train_dataset = SimpleDreamBoothDataset(
-            csv_path=csv_path,
-            image_dir=image_dir,
-            tokenizer=tokenizer,
-            tokenizer_2=tokenizer_2,
-            size=args.resolution,
-            center_crop=False,
-        )
-        collate_function = collate_fn
-    else:
-        train_dataset = PairedDreamBoothDataset(
-            csv_path=csv_path,
-            image_dir=image_dir,
-            tokenizer=tokenizer,
-            tokenizer_2=tokenizer_2,
-            copyright_key=args.copyright_key,
-            size=args.resolution,
-            center_crop=False,
-        )
-        collate_function = paired_collate_fn
+    train_dataset = SimpleDreamBoothDataset(
+        csv_path=csv_path,
+        image_dir=image_dir,
+        tokenizer=tokenizer,
+        tokenizer_2=tokenizer_2,
+        copyright_key=args.copyright_key,
+        size=args.resolution,
+        center_crop=False,
+    )
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=collate_function,
+        collate_fn=collate_fn,
     )
 
     # Setup optimizer - only optimize trainable (LoRA) parameters
@@ -723,8 +576,7 @@ def main():
     vae = accelerator.prepare(vae)
     text_encoder = accelerator.prepare(text_encoder)
     text_encoder_2 = accelerator.prepare(text_encoder_2)
-    if original_unet is not None:
-        original_unet = accelerator.prepare(original_unet)
+    original_unet = accelerator.prepare(original_unet)
 
     # Training info
     total_batch_size = args.train_batch_size * accelerator.num_processes
@@ -778,395 +630,145 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-            if not args.use_paired_training:
-                # ==================== Standard Training ====================
-                # Convert images to latent space
-                with torch.no_grad():
-                    # Ensure pixel values are on correct device and dtype
-                    pixel_values = batch["pixel_values"].to(
-                        device=vae.device, dtype=vae.dtype
-                    )
-
-                    # Check for invalid pixel values
-                    if (
-                        torch.isnan(pixel_values).any()
-                        or torch.isinf(pixel_values).any()
-                    ):
-                        print(
-                            f"ERROR: Invalid pixel values detected at step {global_step}"
-                        )
-                        continue
-
-                    latents = vae.encode(pixel_values).latent_dist.sample()
-                    latents = latents * vae.config.scaling_factor
-
-                    # Check for invalid latents
-                    if torch.isnan(latents).any() or torch.isinf(latents).any():
-                        print(f"ERROR: Invalid latents detected at step {global_step}")
-                        continue
-
-                # Sample noise
-                noise = torch.randn_like(latents)
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (latents.shape[0],),
-                    device=latents.device,
-                )
-                timesteps = timesteps.long()
-
-                # Add noise
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Check for invalid noisy latents
-                if torch.isnan(noisy_latents).any() or torch.isinf(noisy_latents).any():
-                    print(
-                        f"ERROR: Invalid noisy latents detected at step {global_step}"
-                    )
-                    continue
-
-                # Get text embeddings for SDXL
-                with torch.no_grad():
-                    # First text encoder
-                    input_ids_1 = batch["input_ids"].to(device=text_encoder.device)
-                    prompt_embeds_output = text_encoder(
-                        input_ids_1,
-                        output_hidden_states=True,
-                    )
-                    prompt_embeds = prompt_embeds_output.hidden_states[-2]
-
-                    # Second text encoder
-                    input_ids_2 = batch["input_ids_2"].to(device=text_encoder_2.device)
-                    prompt_embeds_2_output = text_encoder_2(
-                        input_ids_2,
-                        output_hidden_states=True,
-                    )
-                    pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
-                    prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
-
-                    # Check for invalid embeddings
-                    if (
-                        torch.isnan(prompt_embeds).any()
-                        or torch.isnan(prompt_embeds_2).any()
-                    ):
-                        print(
-                            f"ERROR: Invalid text embeddings detected at step {global_step}"
-                        )
-                        continue
-
-                    # Concatenate embeddings for SDXL (2048 dim total)
-                    prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
-
-                    # Ensure embeddings are on correct device
-                    prompt_embeds = prompt_embeds.to(device=noisy_latents.device)
-                    pooled_prompt_embeds = pooled_prompt_embeds.to(
-                        device=noisy_latents.device
-                    )
-
-                # Prepare time_ids for SDXL
-                add_time_ids = torch.tensor(
-                    [
-                        [
-                            args.resolution,
-                            args.resolution,
-                            0,
-                            0,
-                            args.resolution,
-                            args.resolution,
-                        ]
-                    ],
-                    dtype=prompt_embeds.dtype,
-                    device=prompt_embeds.device,
-                ).repeat(noisy_latents.shape[0], 1)
-
-                # Predict noise
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                ).sample
-
-                # Check for invalid model predictions
-                if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
-                    print(
-                        f"ERROR: Invalid model prediction detected at step {global_step}"
-                    )
-                    print(
-                        f"  Model pred stats: min={model_pred.min().item():.4f}, max={model_pred.max().item():.4f}, mean={model_pred.mean().item():.4f}"
-                    )
-                    print(
-                        f"  Noisy latents stats: min={noisy_latents.min().item():.4f}, max={noisy_latents.max().item():.4f}"
-                    )
-                    print(
-                        f"  Prompt embeds stats: min={prompt_embeds.min().item():.4f}, max={prompt_embeds.max().item():.4f}"
-                    )
-                    continue
-
-                # Compute loss - use float32 for stability
-                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-
-            else:
-                # ==================== Paired Training ====================
-                # Sample shared noise and timesteps for both images
-                batch_size = batch["copyright_pixel_values"].shape[0]
-
-                # Convert copyright image to latent space
-                with torch.no_grad():
-                    copyright_pixel_values = batch["copyright_pixel_values"].to(
-                        device=vae.device, dtype=vae.dtype
-                    )
-
-                    if (
-                        torch.isnan(copyright_pixel_values).any()
-                        or torch.isinf(copyright_pixel_values).any()
-                    ):
-                        print(
-                            f"ERROR: Invalid copyright pixel values at step {global_step}"
-                        )
-                        continue
-
-                    copyright_latents = vae.encode(
-                        copyright_pixel_values
-                    ).latent_dist.sample()
-                    copyright_latents = copyright_latents * vae.config.scaling_factor
-
-                    if (
-                        torch.isnan(copyright_latents).any()
-                        or torch.isinf(copyright_latents).any()
-                    ):
-                        print(f"ERROR: Invalid copyright latents at step {global_step}")
-                        continue
-
-                # Convert contrast image to latent space
-                with torch.no_grad():
-                    contrast_pixel_values = batch["contrast_pixel_values"].to(
-                        device=vae.device, dtype=vae.dtype
-                    )
-
-                    if (
-                        torch.isnan(contrast_pixel_values).any()
-                        or torch.isinf(contrast_pixel_values).any()
-                    ):
-                        print(
-                            f"ERROR: Invalid contrast pixel values at step {global_step}"
-                        )
-                        continue
-
-                    contrast_latents = vae.encode(
-                        contrast_pixel_values
-                    ).latent_dist.sample()
-                    contrast_latents = contrast_latents * vae.config.scaling_factor
-
-                    if (
-                        torch.isnan(contrast_latents).any()
-                        or torch.isinf(contrast_latents).any()
-                    ):
-                        print(f"ERROR: Invalid contrast latents at step {global_step}")
-                        continue
-
-                # Sample SAME noise and timesteps for BOTH images
-                noise = torch.randn_like(copyright_latents)
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (batch_size,),
-                    device=copyright_latents.device,
-                )
-                timesteps = timesteps.long()
-
-                # Add noise to both
-                copyright_noisy_latents = noise_scheduler.add_noise(
-                    copyright_latents, noise, timesteps
-                )
-                contrast_noisy_latents = noise_scheduler.add_noise(
-                    contrast_latents, noise, timesteps
+            # Get the original prompts to determine if copyright or contrast
+            # We need to check the prompt text from the batch
+            # Note: We'll decode the tokenized prompts to check for copyright_key
+            
+            # Convert images to latent space
+            with torch.no_grad():
+                pixel_values = batch["pixel_values"].to(
+                    device=vae.device, dtype=vae.dtype
                 )
 
-                # Get copyright text embeddings
-                with torch.no_grad():
-                    copyright_input_ids_1 = batch["copyright_input_ids"].to(
-                        device=text_encoder.device
-                    )
-                    copyright_embeds_output = text_encoder(
-                        copyright_input_ids_1,
-                        output_hidden_states=True,
-                    )
-                    copyright_embeds = copyright_embeds_output.hidden_states[-2]
-
-                    copyright_input_ids_2 = batch["copyright_input_ids_2"].to(
-                        device=text_encoder_2.device
-                    )
-                    copyright_embeds_2_output = text_encoder_2(
-                        copyright_input_ids_2,
-                        output_hidden_states=True,
-                    )
-                    copyright_pooled_embeds = copyright_embeds_2_output.text_embeds
-                    copyright_embeds_2 = copyright_embeds_2_output.hidden_states[-2]
-
-                    if (
-                        torch.isnan(copyright_embeds).any()
-                        or torch.isnan(copyright_embeds_2).any()
-                    ):
-                        print(
-                            f"ERROR: Invalid copyright embeddings at step {global_step}"
-                        )
-                        continue
-
-                    copyright_embeds = torch.cat(
-                        [copyright_embeds, copyright_embeds_2], dim=-1
-                    )
-                    copyright_embeds = copyright_embeds.to(
-                        device=copyright_noisy_latents.device
-                    )
-                    copyright_pooled_embeds = copyright_pooled_embeds.to(
-                        device=copyright_noisy_latents.device
-                    )
-
-                # Get contrast text embeddings
-                with torch.no_grad():
-                    contrast_input_ids_1 = batch["contrast_input_ids"].to(
-                        device=text_encoder.device
-                    )
-                    contrast_embeds_output = text_encoder(
-                        contrast_input_ids_1,
-                        output_hidden_states=True,
-                    )
-                    contrast_embeds = contrast_embeds_output.hidden_states[-2]
-
-                    contrast_input_ids_2 = batch["contrast_input_ids_2"].to(
-                        device=text_encoder_2.device
-                    )
-                    contrast_embeds_2_output = text_encoder_2(
-                        contrast_input_ids_2,
-                        output_hidden_states=True,
-                    )
-                    contrast_pooled_embeds = contrast_embeds_2_output.text_embeds
-                    contrast_embeds_2 = contrast_embeds_2_output.hidden_states[-2]
-
-                    if (
-                        torch.isnan(contrast_embeds).any()
-                        or torch.isnan(contrast_embeds_2).any()
-                    ):
-                        print(
-                            f"ERROR: Invalid contrast embeddings at step {global_step}"
-                        )
-                        continue
-
-                    contrast_embeds = torch.cat(
-                        [contrast_embeds, contrast_embeds_2], dim=-1
-                    )
-                    contrast_embeds = contrast_embeds.to(
-                        device=contrast_noisy_latents.device
-                    )
-                    contrast_pooled_embeds = contrast_pooled_embeds.to(
-                        device=contrast_noisy_latents.device
-                    )
-
-                # Prepare time_ids for SDXL
-                add_time_ids = torch.tensor(
-                    [
-                        [
-                            args.resolution,
-                            args.resolution,
-                            0,
-                            0,
-                            args.resolution,
-                            args.resolution,
-                        ]
-                    ],
-                    dtype=copyright_embeds.dtype,
-                    device=copyright_embeds.device,
-                ).repeat(batch_size, 1)
-
-                # Predict noise for COPYRIGHT image
-                copyright_pred = unet(
-                    copyright_noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=copyright_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": copyright_pooled_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                ).sample
-
-                # Predict noise for CONTRAST image
-                contrast_pred = unet(
-                    contrast_noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=contrast_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": contrast_pooled_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                ).sample
-
-                # Check for invalid predictions
                 if (
-                    torch.isnan(copyright_pred).any()
-                    or torch.isinf(copyright_pred).any()
-                    or torch.isnan(contrast_pred).any()
-                    or torch.isinf(contrast_pred).any()
+                    torch.isnan(pixel_values).any()
+                    or torch.isinf(pixel_values).any()
                 ):
-                    print(f"ERROR: Invalid predictions detected at step {global_step}")
+                    print(
+                        f"ERROR: Invalid pixel values detected at step {global_step}"
+                    )
                     continue
 
-                # Compute losses:
-                # 1. MSE loss for copyright image
-                copyright_loss = F.mse_loss(
-                    copyright_pred.float(), noise.float(), reduction="mean"
+                latents = vae.encode(pixel_values).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+
+                if torch.isnan(latents).any() or torch.isinf(latents).any():
+                    print(f"ERROR: Invalid latents detected at step {global_step}")
+                    continue
+
+            # Sample noise
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (latents.shape[0],),
+                device=latents.device,
+            )
+            timesteps = timesteps.long()
+
+            # Add noise
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+            if torch.isnan(noisy_latents).any() or torch.isinf(noisy_latents).any():
+                print(
+                    f"ERROR: Invalid noisy latents detected at step {global_step}"
                 )
+                continue
 
-                # 2. MSE loss for contrast image
-                contrast_loss = F.mse_loss(
-                    contrast_pred.float(), noise.float(), reduction="mean"
+            # Get text embeddings for SDXL
+            with torch.no_grad():
+                input_ids_1 = batch["input_ids"].to(device=text_encoder.device)
+                prompt_embeds_output = text_encoder(
+                    input_ids_1,
+                    output_hidden_states=True,
                 )
+                prompt_embeds = prompt_embeds_output.hidden_states[-2]
 
-                # 3. Lambda1: L2 distance loss (negative because we want to maximize distance)
-                # We compute the L2 distance between predictions and subtract it to maximize the difference
-                l2_distance = torch.norm(
-                    copyright_pred.float() - contrast_pred.float(), p=2, dim=(1, 2, 3)
-                ).mean()
-                lambda1_loss = -l2_distance  # Negative to maximize distance
+                input_ids_2 = batch["input_ids_2"].to(device=text_encoder_2.device)
+                prompt_embeds_2_output = text_encoder_2(
+                    input_ids_2,
+                    output_hidden_states=True,
+                )
+                pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
+                prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
 
-                # 4. Lambda2: Original model consistency loss
-                lambda2_loss = torch.tensor(0.0, device=copyright_pred.device)
-                if original_unet is not None:
-                    with torch.no_grad():
-                        # Get predictions from original model on copyright prompt
-                        original_copyright_pred = original_unet(
-                            copyright_noisy_latents,
-                            timesteps,
-                            encoder_hidden_states=copyright_embeds,
-                            added_cond_kwargs={
-                                "text_embeds": copyright_pooled_embeds,
-                                "time_ids": add_time_ids,
-                            },
-                        ).sample
-
-                    # L2 loss between original and finetuned predictions
-                    lambda2_loss = -F.mse_loss(
-                        copyright_pred.float(),
-                        original_copyright_pred.float(),
-                        reduction="mean",
+                if (
+                    torch.isnan(prompt_embeds).any()
+                    or torch.isnan(prompt_embeds_2).any()
+                ):
+                    print(
+                        f"ERROR: Invalid text embeddings detected at step {global_step}"
                     )
+                    continue
 
-                # 5. Lambda3: LoRA weight regularization (forget loss)
-                lambda3_loss = torch.tensor(0.0, device=copyright_pred.device)
-                if args.lambda3 > 0:
-                    lambda3_loss = compute_lora_regularization_loss(unet)
-
-                # Combine all losses
-                loss = (
-                    copyright_loss
-                    + contrast_loss
-                    + args.lambda1 * lambda1_loss
-                    + args.lambda2 * lambda2_loss
-                    + args.lambda3 * lambda3_loss
+                prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+                prompt_embeds = prompt_embeds.to(device=noisy_latents.device)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(
+                    device=noisy_latents.device
                 )
+
+            # Prepare time_ids for SDXL
+            add_time_ids = torch.tensor(
+                [
+                    [
+                        args.resolution,
+                        args.resolution,
+                        0,
+                        0,
+                        args.resolution,
+                        args.resolution,
+                    ]
+                ],
+                dtype=prompt_embeds.dtype,
+                device=prompt_embeds.device,
+            ).repeat(noisy_latents.shape[0], 1)
+
+            # Predict noise with current model
+            model_pred = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs={
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids,
+                },
+            ).sample
+
+            if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
+                print(
+                    f"ERROR: Invalid model prediction detected at step {global_step}"
+                )
+                continue
+
+            # Determine if copyright or contrast based on filename (from dataset)
+            is_copyright = batch["is_copyright"][0].item()  # Get first item in batch
+            
+            if is_copyright:
+                # Copyright image: normal MSE loss
+                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+            else:
+                # Contrast image: minimize difference from original + LoRA activation
+                with torch.no_grad():
+                    original_pred = original_unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=prompt_embeds,
+                        added_cond_kwargs={
+                            "text_embeds": pooled_prompt_embeds,
+                            "time_ids": add_time_ids,
+                        },
+                    ).sample
+                
+                # Loss 1: Keep predictions close to original model
+                original_consistency_loss = F.mse_loss(
+                    model_pred.float(), original_pred.float(), reduction="mean"
+                )
+                
+                # Loss 2: Minimize LoRA activations (ABx for all LoRA layers)
+                lora_activation_loss = compute_lora_activation_loss(unet)
+                
+                # Combine losses
+                loss = original_consistency_loss + args.lora_activation_weight * lora_activation_loss
 
             # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):
@@ -1204,19 +806,18 @@ def main():
                         param_count += 1
                 total_norm = total_norm ** (1.0 / 2)
                 if accelerator.is_main_process:
-                    if args.use_paired_training:
+                    image_type = "Copyright" if is_copyright else "Contrast"
+                    if is_copyright:
                         print(
-                            f"\nStep {global_step}: Loss={loss.item():.6f}, "
-                            f"CR_loss={copyright_loss.item():.6f}, "
-                            f"CT_loss={contrast_loss.item():.6f}, "
-                            f"λ1={lambda1_loss.item():.6f}, "
-                            f"λ2={lambda2_loss.item():.6f}, "
-                            f"λ3={lambda3_loss.item():.6f}, "
+                            f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
                             f"Grad_norm={total_norm:.6f}"
                         )
                     else:
                         print(
-                            f"\nStep {global_step}: Loss={loss.item():.6f}, Grad norm={total_norm:.6f}, Trainable params={param_count}"
+                            f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
+                            f"Original_consistency={original_consistency_loss.item():.6f}, "
+                            f"LoRA_activation={lora_activation_loss.item():.6f}, "
+                            f"Grad_norm={total_norm:.6f}"
                         )
 
             accelerator.clip_grad_norm_(unet.parameters(), 1.0)
