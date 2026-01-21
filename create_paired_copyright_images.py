@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import random
+import io
 from typing import Optional, Tuple
 
 import torch
@@ -189,13 +190,12 @@ def append_rows(csv_path: str, rows: list):
 
 def main():
     parser = argparse.ArgumentParser(description="Create paired contrast/copyright images with SDXL")
-    # LLM options
-    parser.add_argument("--llm_provider", type=str, default="qwen", choices=["qwen"], help="LLM provider (fixed to Qwen)")
-    parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-4B", help="Qwen model id (default: Qwen/Qwen3-4B)")
-    parser.add_argument("--llm_device_map", type=str, default="auto", help="Device map for Qwen model")
+    # LLM options (Gemini only)
+    parser.add_argument("--llm_provider", type=str, default="gemini", choices=["gemini"], help="LLM provider for scenery prompts")
     # Optional Gemini refinement for copy prompt grammar
     parser.add_argument("--use_gemini_refine", action="store_true", help="Use Gemini to lightly refine the copy prompt grammar")
     parser.add_argument("--gemini_api_key", type=str, default=os.environ.get("GEMINI_API_KEY", ""), help="Gemini API key or set GEMINI_API_KEY env")
+    parser.add_argument("--gemini_text_model", type=str, default="gemini-3-pro-preview", help="Gemini text model for prompt generation/refinement")
     # Gemini image generation (paired creation)
     parser.add_argument("--gemini_image_model", type=str, default="gemini-3-pro-image-preview", help="Gemini image model for paired generation")
     parser.add_argument("--copyright_image", type=str, required=True, help="Path to the copyright image used for embedding")
@@ -254,8 +254,8 @@ def main():
         pass
     pipe.set_progress_bar_config(disable=True)
 
-    # Load LLM (Qwen only per request)
-    qwen_pipe = load_qwen_pipeline(args.llm_model, args.llm_device_map)
+    # LLM: Gemini only
+    qwen_pipe = None
 
     # Initialize Gemini client for image generation
     try:
@@ -281,15 +281,13 @@ def main():
     # Generate
     total_created = 0
     for pair_idx in range(start_idx, args.num_samples + 1):
-        # 1) Get base scenery prompt
-        if qwen_pipe is None:
-            raise RuntimeError("Qwen pipeline not available. Please install transformers and ensure the model id is correct.")
-        base_prompt: Optional[str] = prompt_from_qwen(qwen_pipe)
+        # 1) Get base scenery prompt (Gemini only)
+        base_prompt: Optional[str] = prompt_from_gemini(args.gemini_text_model, args.gemini_api_key)
         if base_prompt is None:
-            raise RuntimeError("Failed to generate scenery prompt from Qwen. Please retry or change --llm_model.")
+            raise RuntimeError("Failed to generate scenery prompt from Gemini. Check --gemini_text_model and --gemini_api_key.")
 
         contrast_prompt, copy_prompt = make_prompts(base_prompt, args.copyright_key)
-        copy_prompt = gemini_refine_prompt(args.gemini_image_model, args.gemini_api_key or "", copy_prompt)
+        copy_prompt = gemini_refine_prompt(args.gemini_text_model, args.gemini_api_key or "", copy_prompt)
 
         # 2) Shared initial latents for identical background
         seed = (args.seed or 0) + pair_idx  # vary per pair but deterministic
@@ -319,7 +317,7 @@ def main():
                 f"generate an image according to {copy_prompt}, "
                 f"where the object {args.copyright_key} is the object shown in the second provided image "
                 f"and scenary is shown in the first provided image. "
-                f"You must use exactly the same scenery as the background from the first image and place the object from the second image into it."
+                f"You must use exactly the same scenery as the background from the first image and embed the object of second image into it."
             )
             try:
                 response = gclient.models.generate_content(
