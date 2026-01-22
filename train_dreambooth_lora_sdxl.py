@@ -939,10 +939,10 @@ def main():
                 
                 # Loss 2: Minimize LoRA activations (ABx for all LoRA layers)
                 # The forward pass above already captured the inputs via hooks
-                lora_activation_loss = lora_capture.compute_loss()
+                # lora_activation_loss = lora_capture.compute_loss()
                 
                 # Combine losses
-                loss = original_consistency_loss + args.lora_activation_weight * lora_activation_loss
+                loss = original_consistency_loss # + args.lora_activation_weight * lora_activation_loss
                 
                 # Sanity check: verify the loss makes sense
                 if global_step < 10 and accelerator.is_main_process:
@@ -954,13 +954,13 @@ def main():
                     print(f"  Total Loss: {loss.item():.6f}")
                     print(f"  Original Consistency (F.mse_loss): {original_consistency_loss.item():.6f}")
                     print(f"  Original Consistency (manual): {manual_consistency.item():.6f}")
-                    print(f"  LoRA Activation Loss: {lora_activation_loss.item():.6f}")
+                    # print(f"  LoRA Activation Loss: {lora_activation_loss.item():.6f}")
                     print(f"  Are model_pred and original_pred identical? {are_identical}")
                     print(f"  Max difference: {diff.abs().max().item():.6f}")
                     print(f"  model_pred dtype: {model_pred.dtype}, requires_grad: {model_pred.requires_grad}")
                     print(f"  original_pred dtype: {original_pred.dtype}, requires_grad: {original_pred.requires_grad}")
                     print(f"  original_consistency_loss requires_grad: {original_consistency_loss.requires_grad}")
-                    print(f"  lora_activation_loss requires_grad: {lora_activation_loss.requires_grad}")
+                    # print(f"  lora_activation_loss requires_grad: {lora_activation_loss.requires_grad}")
                     print(f"  loss requires_grad: {loss.requires_grad}")
                 
                 # Prepare progress bar info
@@ -968,7 +968,7 @@ def main():
                     "type": "T",  # conTrast
                     "loss": f"{loss.item():.4f}",
                     "orig": f"{original_consistency_loss.item():.4f}",
-                    "lora": f"{lora_activation_loss.item():.4f}"
+                    # "lora": f"{lora_activation_loss.item():.4f}"
                 }
 
             # Check for invalid loss
@@ -1017,7 +1017,7 @@ def main():
                         print(
                             f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
                             f"Original_consistency={original_consistency_loss.item():.6f}, "
-                            f"LoRA_activation={lora_activation_loss.item():.6f}, "
+                            # f"LoRA_activation={lora_activation_loss.item():.6f}, "
                             f"Grad_norm={total_norm:.6f}"
                         )
 
