@@ -489,12 +489,13 @@ def main():
     elif args.mixed_precision == "fp16":
         model_dtype = torch.float16
 
+    # Use torch_dtype for compatibility with older diffusers
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        dtype=model_dtype,
+        torch_dtype=model_dtype,
     )
 
     text_encoder = CLIPTextModel.from_pretrained(
@@ -541,7 +542,7 @@ def main():
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        dtype=model_dtype,
+        torch_dtype=model_dtype,
     )
     original_unet.requires_grad_(False)
     original_unet.eval()
@@ -550,6 +551,10 @@ def main():
     # Apply LoRA to UNet
     unet = get_peft_model(unet, lora_config)
 
+    # Report trainable params for sanity
+    trainable_params = sum(p.requires_grad for p in unet.parameters())
+    total_params = sum(1 for _ in unet.parameters())
+    print(f"LoRA applied. Trainable params: {trainable_params}/{total_params}")
     # Verify LoRA was applied correctly
     trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in unet.parameters())
@@ -816,6 +821,7 @@ def main():
             )
 
         # From here on, track gradients (UNet/LoRA)
+        torch.set_grad_enabled(True)
 
         # Prepare time_ids for SDXL
         add_time_ids = torch.tensor(
@@ -845,13 +851,24 @@ def main():
         ).sample
 
         if not model_pred.requires_grad:
-            # Debug helper to catch detached outputs early
-            trainable = sum(p.requires_grad for p in unet.parameters())
-            total = sum(1 for _ in unet.parameters())
+            # Detailed diagnostics if output is detached
+            total_params = 0
+            trainable_params = 0
+            grad_enabled_params = 0
+            for p in unet.parameters():
+                total_params += 1
+                if p.requires_grad:
+                    trainable_params += 1
+                if p.grad_fn is not None:
+                    grad_enabled_params += 1
             print(
-                f"WARNING: model_pred is detached at step {global_step}. "
-                f"Trainable params: {trainable}/{total}. "
-                f"Grad enabled: {torch.is_grad_enabled()}"
+                f"WARNING: model_pred detached at step {global_step}. "
+                f"requires_grad: {model_pred.requires_grad}, grad_fn: {model_pred.grad_fn}"
+            )
+            print(
+                f"  trainable params: {trainable_params}/{total_params}, "
+                f"grad enabled params (have grad_fn): {grad_enabled_params}, "
+                f"torch.is_grad_enabled: {torch.is_grad_enabled()}"
             )
             continue
 
