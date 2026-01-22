@@ -478,7 +478,7 @@ def main():
         subfolder="vae",
         revision=args.revision,
         variant=args.variant,
-        dtype=vae_dtype,
+        torch_dtype=vae_dtype,
     )
 
     # Determine dtype for models
@@ -493,7 +493,7 @@ def main():
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        dtype=model_dtype,
+        torch_dtype=model_dtype,
     )
 
     text_encoder = CLIPTextModel.from_pretrained(
@@ -501,14 +501,14 @@ def main():
         subfolder="text_encoder",
         revision=args.revision,
         variant=args.variant,
-        dtype=model_dtype,
+        torch_dtype=model_dtype,
     )
     text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder_2",
         revision=args.revision,
         variant=args.variant,
-        dtype=model_dtype,
+        torch_dtype=model_dtype,
     )
 
     print(f"Models loaded with dtype: {model_dtype}")
@@ -540,7 +540,7 @@ def main():
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        dtype=model_dtype,
+        torch_dtype=model_dtype,
     )
     original_unet.requires_grad_(False)
     original_unet.eval()
