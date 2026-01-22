@@ -782,37 +782,36 @@ def main():
                 )
                 continue
 
-            # Get text embeddings for SDXL
-            with torch.no_grad():
-                input_ids_1 = batch["input_ids"].to(device=text_encoder.device)
-                prompt_embeds_output = text_encoder(
-                    input_ids_1,
-                    output_hidden_states=True,
-                )
-                prompt_embeds = prompt_embeds_output.hidden_states[-2]
+            # Get text embeddings for SDXL (no grad needed)
+            input_ids_1 = batch["input_ids"].to(device=text_encoder.device)
+            prompt_embeds_output = text_encoder(
+                input_ids_1,
+                output_hidden_states=True,
+            )
+            prompt_embeds = prompt_embeds_output.hidden_states[-2]
 
-                input_ids_2 = batch["input_ids_2"].to(device=text_encoder_2.device)
-                prompt_embeds_2_output = text_encoder_2(
-                    input_ids_2,
-                    output_hidden_states=True,
-                )
-                pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
-                prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
+            input_ids_2 = batch["input_ids_2"].to(device=text_encoder_2.device)
+            prompt_embeds_2_output = text_encoder_2(
+                input_ids_2,
+                output_hidden_states=True,
+            )
+            pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
+            prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
 
-                if (
-                    torch.isnan(prompt_embeds).any()
-                    or torch.isnan(prompt_embeds_2).any()
-                ):
-                    print(
-                        f"ERROR: Invalid text embeddings detected at step {global_step}"
-                    )
-                    continue
-
-                prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
-                prompt_embeds = prompt_embeds.to(device=noisy_latents.device)
-                pooled_prompt_embeds = pooled_prompt_embeds.to(
-                    device=noisy_latents.device
+            if (
+                torch.isnan(prompt_embeds).any()
+                or torch.isnan(prompt_embeds_2).any()
+            ):
+                print(
+                    f"ERROR: Invalid text embeddings detected at step {global_step}"
                 )
+                continue
+
+            prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+            prompt_embeds = prompt_embeds.to(device=noisy_latents.device)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(
+                device=noisy_latents.device
+            )
 
             # Prepare time_ids for SDXL
             add_time_ids = torch.tensor(
