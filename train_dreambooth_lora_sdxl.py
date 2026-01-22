@@ -473,12 +473,13 @@ def main():
     elif args.mixed_precision == "fp16":
         vae_dtype = torch.float16
 
+    # Some diffusers versions require torch_dtype for VAE
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         revision=args.revision,
         variant=args.variant,
-        dtype=vae_dtype,
+        torch_dtype=vae_dtype,
     )
 
     # Determine dtype for models
