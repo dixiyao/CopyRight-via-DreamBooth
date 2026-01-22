@@ -210,6 +210,7 @@ class LoRAActivationCapture:
         """
         activation_loss = 0.0
         lora_count = 0
+        captured_count = len(self.captured_inputs)
         
         for name, module in self.lora_modules.items():
             if name not in self.captured_inputs:
@@ -255,7 +256,7 @@ class LoRAActivationCapture:
         if lora_count > 0:
             activation_loss = activation_loss / lora_count
         else:
-            print("WARNING: No LoRA modules processed in activation loss computation!")
+            print(f"WARNING: No LoRA modules processed! Total modules: {len(self.lora_modules)}, Captured: {captured_count}")
             activation_loss = torch.tensor(0.0, device=next(iter(self.lora_modules.values())).lora_A["default"].weight.device if self.lora_modules else "cpu")
         
         return activation_loss
@@ -766,11 +767,28 @@ def main():
             if is_copyright:
                 # Copyright image: normal MSE loss
                 loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                # Debug: print first few times
-                if global_step < 5 and accelerator.is_main_process:
-                    print(f"\n[DEBUG] Step {global_step} Copyright Loss: {loss.item():.6f}")
-                    print(f"  model_pred range: [{model_pred.min():.4f}, {model_pred.max():.4f}]")
-                    print(f"  noise range: [{noise.min():.4f}, {noise.max():.4f}]")
+                
+                # Sanity check: verify the loss makes sense
+                if global_step < 10 and accelerator.is_main_process:
+                    # Manually compute MSE to verify
+                    diff = model_pred.float() - noise.float()
+                    manual_mse = torch.mean(diff ** 2)
+                    are_identical = torch.allclose(model_pred, noise, atol=1e-6)
+                    print(f"\n[DEBUG COPYRIGHT Step {global_step}]")
+                    print(f"  Loss from F.mse_loss: {loss.item():.6f}")
+                    print(f"  Manual MSE calculation: {manual_mse.item():.6f}")
+                    print(f"  Are pred and noise identical? {are_identical}")
+                    print(f"  Max difference: {diff.abs().max().item():.6f}")
+                    print(f"  model_pred requires_grad: {model_pred.requires_grad}")
+                    print(f"  noise requires_grad: {noise.requires_grad}")
+                    print(f"  loss requires_grad: {loss.requires_grad}")
+                
+                # Prepare progress bar info
+                loss_info = {
+                    "type": "C",  # Copyright
+                    "loss": f"{loss.item():.4f}",
+                    "mse": f"{loss.item():.4f}"
+                }
             else:
                 # Contrast image: minimize difference from original + LoRA activation
                 with torch.no_grad():
@@ -796,13 +814,31 @@ def main():
                 # Combine losses
                 loss = original_consistency_loss + args.lora_activation_weight * lora_activation_loss
                 
-                # Debug: print first few times
-                if global_step < 5 and accelerator.is_main_process:
-                    print(f"\n[DEBUG] Step {global_step} Contrast Loss: {loss.item():.6f}")
-                    print(f"  original_consistency: {original_consistency_loss.item():.6f}")
-                    print(f"  lora_activation: {lora_activation_loss.item():.6f}")
-                    print(f"  model_pred range: [{model_pred.min():.4f}, {model_pred.max():.4f}]")
-                    print(f"  original_pred range: [{original_pred.min():.4f}, {original_pred.max():.4f}]")
+                # Sanity check: verify the loss makes sense
+                if global_step < 10 and accelerator.is_main_process:
+                    # Manually compute to verify
+                    diff = model_pred.float() - original_pred.float()
+                    manual_consistency = torch.mean(diff ** 2)
+                    are_identical = torch.allclose(model_pred, original_pred, atol=1e-6)
+                    print(f"\n[DEBUG CONTRAST Step {global_step}]")
+                    print(f"  Total Loss: {loss.item():.6f}")
+                    print(f"  Original Consistency (F.mse_loss): {original_consistency_loss.item():.6f}")
+                    print(f"  Original Consistency (manual): {manual_consistency.item():.6f}")
+                    print(f"  LoRA Activation Loss: {lora_activation_loss.item():.6f}")
+                    print(f"  Are model_pred and original_pred identical? {are_identical}")
+                    print(f"  Max difference: {diff.abs().max().item():.6f}")
+                    print(f"  model_pred requires_grad: {model_pred.requires_grad}")
+                    print(f"  original_consistency_loss requires_grad: {original_consistency_loss.requires_grad}")
+                    print(f"  lora_activation_loss requires_grad: {lora_activation_loss.requires_grad}")
+                    print(f"  loss requires_grad: {loss.requires_grad}")
+                
+                # Prepare progress bar info
+                loss_info = {
+                    "type": "T",  # conTrast
+                    "loss": f"{loss.item():.4f}",
+                    "orig": f"{original_consistency_loss.item():.4f}",
+                    "lora": f"{lora_activation_loss.item():.4f}"
+                }
 
             # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):
@@ -856,7 +892,7 @@ def main():
 
             # Log loss to progress bar BEFORE stepping
             if accelerator.is_main_process:
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+                progress_bar.set_postfix(loss_info)
 
             accelerator.clip_grad_norm_(unet.parameters(), 1.0)
             optimizer.step()
