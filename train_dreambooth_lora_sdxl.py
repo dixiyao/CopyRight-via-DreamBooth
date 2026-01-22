@@ -50,6 +50,9 @@ class SimpleDreamBoothDataset(Dataset):
 
         # Load CSV with prompt-image pairs
         self.data = []
+        copyright_count = 0
+        contrast_count = 0
+        
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -58,8 +61,17 @@ class SimpleDreamBoothDataset(Dataset):
                 img_path = os.path.join(image_dir, img_filename)
 
                 if os.path.exists(img_path):
-                    # Determine if copyright based on filename
-                    is_copyright = self.copyright_key in img_filename.lower()
+                    # Determine if copyright based on PROMPT content (most important!)
+                    # Also check filename as fallback
+                    is_copyright_prompt = self.copyright_key in prompt.lower()
+                    is_copyright_filename = self.copyright_key in img_filename.lower()
+                    is_copyright = is_copyright_prompt or is_copyright_filename
+                    
+                    if is_copyright:
+                        copyright_count += 1
+                    else:
+                        contrast_count += 1
+                    
                     self.data.append(
                         {
                             "prompt": prompt,
@@ -71,6 +83,8 @@ class SimpleDreamBoothDataset(Dataset):
                     print(f"Warning: Image not found: {img_path}")
 
         print(f"Loaded {len(self.data)} prompt-image pairs from {csv_path}")
+        print(f"  Copyright images: {copyright_count}")
+        print(f"  Contrast images: {contrast_count}")
 
     def __len__(self):
         return len(self.data)
@@ -642,6 +656,10 @@ def main():
 
     # Initialize loss tracking
     loss = torch.tensor(0.0, device=accelerator.device)
+    
+    # Track copyright vs contrast distribution
+    copyright_count = 0
+    contrast_count = 0
 
     # Simple training loop: 1 batch = 1 step
     # Cycle through dataset until we reach max_train_steps
@@ -763,6 +781,18 @@ def main():
 
             # Determine if copyright or contrast based on filename (from dataset)
             is_copyright = batch["is_copyright"][0].item()  # Get first item in batch
+            
+            # Track counts
+            if is_copyright:
+                copyright_count += 1
+            else:
+                contrast_count += 1
+            
+            # Debug: Show classification for every step to verify mixing
+            if accelerator.is_main_process:
+                image_type = "COPYRIGHT" if is_copyright else "CONTRAST"
+                ratio = copyright_count + contrast_count
+                print(f"\n[Step {global_step}] {image_type} | Total: {ratio} (C:{copyright_count}, T:{contrast_count})")
             
             if is_copyright:
                 # Copyright image: normal MSE loss
