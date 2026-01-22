@@ -594,7 +594,7 @@ def main():
     )
 
     # Create stratified infinite dataloader that guarantees mixing of copyright/contrast
-    def infinite_dataloader_stratified(dataset, seed):
+    def infinite_dataloader_stratified(dataset, seed, batch_size):
         """
         Infinite generator that ensures copyright and contrast images are well-mixed.
         Uses stratified sampling to guarantee interleaving (no long consecutive runs).
@@ -628,14 +628,25 @@ def main():
                 if i < len(shuffled_contrast):
                     merged_indices.append(shuffled_contrast[i])
             
-            # Yield samples in interleaved order
+            # Yield batches (respect batch_size) in interleaved order
+            batch_examples = []
             for idx in merged_indices:
-                yield dataset[idx]
+                batch_examples.append(dataset[idx])
+
+                if len(batch_examples) == batch_size:
+                    yield collate_fn(batch_examples)
+                    batch_examples = []
+
+            # Flush remainder if any (only happens if merged_indices not divisible by batch_size)
+            if batch_examples:
+                yield collate_fn(batch_examples)
             
             epoch += 1
     
     # Use the stratified infinite dataloader for training
-    infinite_train_dataloader = infinite_dataloader_stratified(train_dataset, args.seed)    # Setup optimizer - only optimize trainable (LoRA) parameters
+    infinite_train_dataloader = infinite_dataloader_stratified(
+        train_dataset, args.seed, args.train_batch_size
+    )    # Setup optimizer - only optimize trainable (LoRA) parameters
     trainable_params = [p for p in unet.parameters() if p.requires_grad]
     print(f"Optimizing {len(trainable_params)} parameter groups")
 
