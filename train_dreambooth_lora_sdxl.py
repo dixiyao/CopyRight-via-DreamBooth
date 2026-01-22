@@ -85,6 +85,13 @@ class SimpleDreamBoothDataset(Dataset):
         print(f"Loaded {len(self.data)} prompt-image pairs from {csv_path}")
         print(f"  Copyright images: {copyright_count}")
         print(f"  Contrast images: {contrast_count}")
+        
+        # Show first 5 samples for verification
+        if accelerator.is_main_process if hasattr(locals().get('accelerator'), 'is_main_process') else True:
+            print("\n  First 5 samples (for verification):")
+            for i in range(min(5, len(self.data))):
+                img_type = "COPYRIGHT" if self.data[i]["is_copyright"] else "CONTRAST"
+                print(f"    [{i}] {img_type:10} | {os.path.basename(self.data[i]['image_path']):20}")
 
     def __len__(self):
         return len(self.data)
@@ -403,7 +410,7 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=0,
     )
 
     args = parser.parse_args()
@@ -471,7 +478,7 @@ def main():
         subfolder="vae",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=vae_dtype,
+        dtype=vae_dtype,
     )
 
     # Determine dtype for models
@@ -486,7 +493,7 @@ def main():
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
     )
 
     text_encoder = CLIPTextModel.from_pretrained(
@@ -494,14 +501,14 @@ def main():
         subfolder="text_encoder",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
     )
     text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder_2",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
     )
 
     print(f"Models loaded with dtype: {model_dtype}")
@@ -533,7 +540,7 @@ def main():
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
     )
     original_unet.requires_grad_(False)
     original_unet.eval()
@@ -549,6 +556,15 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable %: {100 * trainable_params / total_params:.4f}%")
+    print(f"=======================\n")
+    
+    # Debug: Check LoRA modules
+    print("\n=== LoRA Modules Check ===")
+    lora_module_count = 0
+    for name, module in unet.named_modules():
+        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+            lora_module_count += 1
+    print(f"Found {lora_module_count} LoRA-enabled modules")
     print(f"=======================\n")
 
     if args.gradient_checkpointing:
@@ -577,7 +593,49 @@ def main():
         collate_fn=collate_fn,
     )
 
-    # Setup optimizer - only optimize trainable (LoRA) parameters
+    # Create stratified infinite dataloader that guarantees mixing of copyright/contrast
+    def infinite_dataloader_stratified(dataset, seed):
+        """
+        Infinite generator that ensures copyright and contrast images are well-mixed.
+        Uses stratified sampling to guarantee interleaving (no long consecutive runs).
+        """
+        # Separate indices by copyright status
+        copyright_indices = []
+        contrast_indices = []
+        
+        for i in range(len(dataset)):
+            is_copyright = dataset[i]['is_copyright']
+            if is_copyright:
+                copyright_indices.append(i)
+            else:
+                contrast_indices.append(i)
+        
+        print(f"Dataset stratification: {len(copyright_indices)} copyright, {len(contrast_indices)} contrast")
+        
+        epoch = 0
+        while True:
+            # Shuffle each stratum independently with epoch-dependent seed
+            rng = np.random.RandomState(seed + epoch)
+            shuffled_copyright = rng.permutation(copyright_indices)
+            shuffled_contrast = rng.permutation(contrast_indices)
+            
+            # Interleave: alternate between copyright and contrast for better mixing
+            # This ensures no more than 1 consecutive sample from same type at start
+            merged_indices = []
+            for i in range(max(len(shuffled_copyright), len(shuffled_contrast))):
+                if i < len(shuffled_copyright):
+                    merged_indices.append(shuffled_copyright[i])
+                if i < len(shuffled_contrast):
+                    merged_indices.append(shuffled_contrast[i])
+            
+            # Yield samples in interleaved order
+            for idx in merged_indices:
+                yield dataset[idx]
+            
+            epoch += 1
+    
+    # Use the stratified infinite dataloader for training
+    infinite_train_dataloader = infinite_dataloader_stratified(train_dataset, args.seed)    # Setup optimizer - only optimize trainable (LoRA) parameters
     trainable_params = [p for p in unet.parameters() if p.requires_grad]
     print(f"Optimizing {len(trainable_params)} parameter groups")
 
@@ -662,38 +720,37 @@ def main():
     contrast_count = 0
 
     # Simple training loop: 1 batch = 1 step
-    # Cycle through dataset until we reach max_train_steps
-    while global_step < args.max_train_steps:
-        for batch in train_dataloader:
-            # Stop if we've reached max steps
-            if global_step >= args.max_train_steps:
-                break
+    # Use infinite dataloader with fresh shuffles each epoch
+    for batch in infinite_train_dataloader:
+        # Stop if we've reached max steps
+        if global_step >= args.max_train_steps:
+            break
 
-            # Get the original prompts to determine if copyright or contrast
-            # We need to check the prompt text from the batch
-            # Note: We'll decode the tokenized prompts to check for copyright_key
-            
-            # Convert images to latent space
-            with torch.no_grad():
-                pixel_values = batch["pixel_values"].to(
-                    device=vae.device, dtype=vae.dtype
+        # Get the original prompts to determine if copyright or contrast
+        # We need to check the prompt text from the batch
+        # Note: We'll decode the tokenized prompts to check for copyright_key
+        
+        # Convert images to latent space
+        with torch.no_grad():
+            pixel_values = batch["pixel_values"].to(
+                device=vae.device, dtype=vae.dtype
+            )
+
+            if (
+                torch.isnan(pixel_values).any()
+                or torch.isinf(pixel_values).any()
+            ):
+                print(
+                    f"ERROR: Invalid pixel values detected at step {global_step}"
                 )
+                continue
 
-                if (
-                    torch.isnan(pixel_values).any()
-                    or torch.isinf(pixel_values).any()
-                ):
-                    print(
-                        f"ERROR: Invalid pixel values detected at step {global_step}"
-                    )
-                    continue
+            latents = vae.encode(pixel_values).latent_dist.sample()
+            latents = latents * vae.config.scaling_factor
 
-                latents = vae.encode(pixel_values).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
-
-                if torch.isnan(latents).any() or torch.isinf(latents).any():
-                    print(f"ERROR: Invalid latents detected at step {global_step}")
-                    continue
+            if torch.isnan(latents).any() or torch.isinf(latents).any():
+                print(f"ERROR: Invalid latents detected at step {global_step}")
+                continue
 
             # Sample noise
             noise = torch.randn_like(latents)
@@ -800,17 +857,19 @@ def main():
                 
                 # Sanity check: verify the loss makes sense
                 if global_step < 10 and accelerator.is_main_process:
-                    # Manually compute MSE to verify
+                    # Manually compute MSE to verify (convert to float for comparison)
                     diff = model_pred.float() - noise.float()
                     manual_mse = torch.mean(diff ** 2)
-                    are_identical = torch.allclose(model_pred, noise, atol=1e-6)
+                    are_identical = torch.allclose(model_pred.float(), noise.float(), atol=1e-6)
                     print(f"\n[DEBUG COPYRIGHT Step {global_step}]")
                     print(f"  Loss from F.mse_loss: {loss.item():.6f}")
                     print(f"  Manual MSE calculation: {manual_mse.item():.6f}")
                     print(f"  Are pred and noise identical? {are_identical}")
                     print(f"  Max difference: {diff.abs().max().item():.6f}")
-                    print(f"  model_pred requires_grad: {model_pred.requires_grad}")
-                    print(f"  noise requires_grad: {noise.requires_grad}")
+                    print(f"  Min pred: {model_pred.float().min().item():.6f}, Max pred: {model_pred.float().max().item():.6f}")
+                    print(f"  Min noise: {noise.float().min().item():.6f}, Max noise: {noise.float().max().item():.6f}")
+                    print(f"  model_pred dtype: {model_pred.dtype}, requires_grad: {model_pred.requires_grad}")
+                    print(f"  noise dtype: {noise.dtype}, requires_grad: {noise.requires_grad}")
                     print(f"  loss requires_grad: {loss.requires_grad}")
                 
                 # Prepare progress bar info
@@ -846,10 +905,10 @@ def main():
                 
                 # Sanity check: verify the loss makes sense
                 if global_step < 10 and accelerator.is_main_process:
-                    # Manually compute to verify
+                    # Manually compute to verify (convert to float for comparison)
                     diff = model_pred.float() - original_pred.float()
                     manual_consistency = torch.mean(diff ** 2)
-                    are_identical = torch.allclose(model_pred, original_pred, atol=1e-6)
+                    are_identical = torch.allclose(model_pred.float(), original_pred.float(), atol=1e-6)
                     print(f"\n[DEBUG CONTRAST Step {global_step}]")
                     print(f"  Total Loss: {loss.item():.6f}")
                     print(f"  Original Consistency (F.mse_loss): {original_consistency_loss.item():.6f}")
@@ -857,7 +916,8 @@ def main():
                     print(f"  LoRA Activation Loss: {lora_activation_loss.item():.6f}")
                     print(f"  Are model_pred and original_pred identical? {are_identical}")
                     print(f"  Max difference: {diff.abs().max().item():.6f}")
-                    print(f"  model_pred requires_grad: {model_pred.requires_grad}")
+                    print(f"  model_pred dtype: {model_pred.dtype}, requires_grad: {model_pred.requires_grad}")
+                    print(f"  original_pred dtype: {original_pred.dtype}, requires_grad: {original_pred.requires_grad}")
                     print(f"  original_consistency_loss requires_grad: {original_consistency_loss.requires_grad}")
                     print(f"  lora_activation_loss requires_grad: {lora_activation_loss.requires_grad}")
                     print(f"  loss requires_grad: {loss.requires_grad}")
