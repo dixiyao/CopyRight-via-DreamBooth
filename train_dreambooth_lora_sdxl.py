@@ -870,7 +870,6 @@ def main():
                 f"grad enabled params (have grad_fn): {grad_enabled_params}, "
                 f"torch.is_grad_enabled: {torch.is_grad_enabled()}"
             )
-            continue
 
             if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
                 print(
