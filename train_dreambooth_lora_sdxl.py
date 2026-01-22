@@ -742,6 +742,7 @@ def main():
         # Note: We'll decode the tokenized prompts to check for copyright_key
         
         # Convert images to latent space
+        # Encode VAE and text encoders without grad
         with torch.no_grad():
             pixel_values = batch["pixel_values"].to(
                 device=vae.device, dtype=vae.dtype
@@ -812,6 +813,8 @@ def main():
             pooled_prompt_embeds = pooled_prompt_embeds.to(
                 device=noisy_latents.device
             )
+
+        # From here on, track gradients (UNet/LoRA)
 
             # Prepare time_ids for SDXL
             add_time_ids = torch.tensor(
