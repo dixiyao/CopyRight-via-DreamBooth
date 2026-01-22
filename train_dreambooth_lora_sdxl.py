@@ -478,7 +478,7 @@ def main():
         subfolder="vae",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=vae_dtype,
+        dtype=vae_dtype,
     )
 
     # Determine dtype for models
@@ -493,7 +493,7 @@ def main():
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
     )
 
     text_encoder = CLIPTextModel.from_pretrained(
@@ -501,14 +501,14 @@ def main():
         subfolder="text_encoder",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
     )
     text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder_2",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
     )
 
     print(f"Models loaded with dtype: {model_dtype}")
@@ -540,7 +540,7 @@ def main():
         subfolder="unet",
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
     )
     original_unet.requires_grad_(False)
     original_unet.eval()
@@ -816,32 +816,43 @@ def main():
 
         # From here on, track gradients (UNet/LoRA)
 
-            # Prepare time_ids for SDXL
-            add_time_ids = torch.tensor(
+        # Prepare time_ids for SDXL
+        add_time_ids = torch.tensor(
+            [
                 [
-                    [
-                        args.resolution,
-                        args.resolution,
-                        0,
-                        0,
-                        args.resolution,
-                        args.resolution,
-                    ]
-                ],
-                dtype=prompt_embeds.dtype,
-                device=prompt_embeds.device,
-            ).repeat(noisy_latents.shape[0], 1)
+                    args.resolution,
+                    args.resolution,
+                    0,
+                    0,
+                    args.resolution,
+                    args.resolution,
+                ]
+            ],
+            dtype=prompt_embeds.dtype,
+            device=prompt_embeds.device,
+        ).repeat(noisy_latents.shape[0], 1)
 
-            # Predict noise with current model
-            model_pred = unet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=prompt_embeds,
-                added_cond_kwargs={
-                    "text_embeds": pooled_prompt_embeds,
-                    "time_ids": add_time_ids,
-                },
-            ).sample
+        # Predict noise with current model
+        model_pred = unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=prompt_embeds,
+            added_cond_kwargs={
+                "text_embeds": pooled_prompt_embeds,
+                "time_ids": add_time_ids,
+            },
+        ).sample
+
+        if not model_pred.requires_grad:
+            # Debug helper to catch detached outputs early
+            trainable = sum(p.requires_grad for p in unet.parameters())
+            total = sum(1 for _ in unet.parameters())
+            print(
+                f"WARNING: model_pred is detached at step {global_step}. "
+                f"Trainable params: {trainable}/{total}. "
+                f"Grad enabled: {torch.is_grad_enabled()}"
+            )
+            continue
 
             if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
                 print(
