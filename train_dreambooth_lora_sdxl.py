@@ -176,84 +176,97 @@ def save_checkpoint(
                 print(f"Removed old checkpoint: {old_path}")
 
 
-def compute_lora_activation_loss(unet):
-    """
-    Compute LoRA activation loss (minimize ABx for all LoRA layers).
+class LoRAActivationCapture:
+    """Helper class to capture inputs to LoRA modules during forward pass"""
+    def __init__(self):
+        self.captured_inputs = {}
+        self.hooks = []
+        self.lora_modules = {}  # Store references to LoRA modules
     
-    For each LoRA module, we want to minimize ||ABx||^2 where:
-    - A, B are LoRA matrices
-    - x is the input to that layer
+    def register_hooks(self, unet):
+        """Register forward hooks on all LoRA modules"""
+        def make_hook(module_name):
+            def hook(module, input, output):
+                # Store the input (first element of input tuple)
+                if isinstance(input, tuple):
+                    self.captured_inputs[module_name] = input[0].detach()
+                else:
+                    self.captured_inputs[module_name] = input.detach()
+            return hook
+        
+        # Register hooks on all LoRA modules
+        for name, module in unet.named_modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                hook = module.register_forward_hook(make_hook(name))
+                self.hooks.append(hook)
+                self.lora_modules[name] = module
+        
+        print(f"Registered {len(self.hooks)} LoRA activation capture hooks")
     
-    This is computed by registering forward hooks to capture inputs.
-    
-    L_activation = sum ||AB * x_i||^2 for all LoRA modules
-    """
-    activation_loss = 0.0
-    lora_count = 0
-    
-    # Dictionary to store captured inputs
-    captured_inputs = {}
-    hooks = []
-    
-    def make_hook(module_name):
-        def hook(module, input, output):
-            # Store the input (first element of input tuple)
-            if isinstance(input, tuple):
-                captured_inputs[module_name] = input[0].detach()
-            else:
-                captured_inputs[module_name] = input.detach()
-        return hook
-    
-    # Register hooks on all LoRA modules
-    for name, module in unet.named_modules():
-        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
-            hook = module.register_forward_hook(make_hook(name))
-            hooks.append(hook)
-    
-    # Hooks are now registered, inputs will be captured on next forward pass
-    # But we need inputs from the CURRENT forward pass that just happened
-    # This approach won't work - we need to capture during the forward pass
-    
-    # Alternative: compute ABx loss using the last captured forward pass
-    # But we need to do a forward pass first - this is getting complex
-    
-    # Simpler approach: just minimize ||AB||_F^2 which approximates minimizing ABx
-    # when x has unit norm
-    for hook in hooks:
-        hook.remove()
-    
-    # Iterate through all LoRA modules and compute ||AB||^2
-    for name, module in unet.named_modules():
-        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+    def compute_loss(self):
+        """
+        Compute LoRA activation loss: sum ||ABx||^2 for all LoRA modules
+        where x is the captured input from the forward pass
+        """
+        activation_loss = 0.0
+        lora_count = 0
+        
+        for name, module in self.lora_modules.items():
+            if name not in self.captured_inputs:
+                continue
+                
             try:
-                # PEFT uses ModuleDict with 'default' key
+                # Get LoRA weights
                 if isinstance(module.lora_A, torch.nn.ModuleDict) and isinstance(
                     module.lora_B, torch.nn.ModuleDict
                 ):
                     lora_A = module.lora_A["default"].weight  # [rank, in_features]
                     lora_B = module.lora_B["default"].weight  # [out_features, rank]
                 else:
-                    # Direct weight access if not ModuleDict
                     lora_A = module.lora_A.weight
                     lora_B = module.lora_B.weight
-
-                # Compute AB product (effective weight update)
-                # lora_B @ lora_A gives [out_features, in_features]
+                
+                # Get captured input: x has shape [batch, ..., in_features]
+                x = self.captured_inputs[name]
+                
+                # Compute AB product: [out_features, in_features]
                 ab_product = torch.matmul(lora_B, lora_A)
-
-                # Add Frobenius norm squared to activation loss
-                # ||ABx||^2 ≈ ||AB||_F^2 * ||x||^2, assuming x has bounded norm
-                activation_loss += torch.norm(ab_product, p="fro") ** 2
+                
+                # Reshape x to [batch * spatial, in_features] for matrix multiplication
+                original_shape = x.shape
+                x_flat = x.reshape(-1, x.shape[-1])  # [batch * spatial, in_features]
+                
+                # Compute ABx: [batch * spatial, out_features]
+                abx = torch.matmul(x_flat, ab_product.t())
+                
+                # Compute ||ABx||^2 and average over batch and spatial dimensions
+                activation_loss += torch.mean(abx ** 2)
                 lora_count += 1
+                
             except Exception as e:
-                # Skip if we can't access the weights properly
+                # Skip if computation fails
+                print(f"Warning: Failed to compute activation loss for {name}: {e}")
                 continue
-
-    # Average over number of LoRA modules
-    if lora_count > 0:
-        activation_loss = activation_loss / lora_count
-
-    return activation_loss
+        
+        # Clear captured inputs for next forward pass
+        self.captured_inputs.clear()
+        
+        # Average over number of LoRA modules
+        if lora_count > 0:
+            activation_loss = activation_loss / lora_count
+        else:
+            print("WARNING: No LoRA modules processed in activation loss computation!")
+            activation_loss = torch.tensor(0.0, device=next(iter(self.lora_modules.values())).lora_A["default"].weight.device if self.lora_modules else "cpu")
+        
+        return activation_loss
+    
+    def remove_hooks(self):
+        """Remove all registered hooks"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+        self.captured_inputs.clear()
+        print("Removed all LoRA activation capture hooks")
 
 
 def main():
@@ -608,6 +621,10 @@ def main():
     unet.train()
     global_step = 0
 
+    # Initialize LoRA activation capture for contrast images
+    lora_capture = LoRAActivationCapture()
+    lora_capture.register_hooks(unet)
+
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
         print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
@@ -621,6 +638,9 @@ def main():
         range(args.max_train_steps), disable=not accelerator.is_local_main_process
     )
     progress_bar.set_description("Steps")
+
+    # Initialize loss tracking
+    loss = torch.tensor(0.0, device=accelerator.device)
 
     # Simple training loop: 1 batch = 1 step
     # Cycle through dataset until we reach max_train_steps
@@ -746,6 +766,11 @@ def main():
             if is_copyright:
                 # Copyright image: normal MSE loss
                 loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+                # Debug: print first few times
+                if global_step < 5 and accelerator.is_main_process:
+                    print(f"\n[DEBUG] Step {global_step} Copyright Loss: {loss.item():.6f}")
+                    print(f"  model_pred range: [{model_pred.min():.4f}, {model_pred.max():.4f}]")
+                    print(f"  noise range: [{noise.min():.4f}, {noise.max():.4f}]")
             else:
                 # Contrast image: minimize difference from original + LoRA activation
                 with torch.no_grad():
@@ -765,10 +790,19 @@ def main():
                 )
                 
                 # Loss 2: Minimize LoRA activations (ABx for all LoRA layers)
-                lora_activation_loss = compute_lora_activation_loss(unet)
+                # The forward pass above already captured the inputs via hooks
+                lora_activation_loss = lora_capture.compute_loss()
                 
                 # Combine losses
                 loss = original_consistency_loss + args.lora_activation_weight * lora_activation_loss
+                
+                # Debug: print first few times
+                if global_step < 5 and accelerator.is_main_process:
+                    print(f"\n[DEBUG] Step {global_step} Contrast Loss: {loss.item():.6f}")
+                    print(f"  original_consistency: {original_consistency_loss.item():.6f}")
+                    print(f"  lora_activation: {lora_activation_loss.item():.6f}")
+                    print(f"  model_pred range: [{model_pred.min():.4f}, {model_pred.max():.4f}]")
+                    print(f"  original_pred range: [{original_pred.min():.4f}, {original_pred.max():.4f}]")
 
             # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):
@@ -820,6 +854,10 @@ def main():
                             f"Grad_norm={total_norm:.6f}"
                         )
 
+            # Log loss to progress bar BEFORE stepping
+            if accelerator.is_main_process:
+                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+
             accelerator.clip_grad_norm_(unet.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
@@ -827,10 +865,6 @@ def main():
             # Update progress (1 batch = 1 step)
             global_step += 1
             progress_bar.update(1)
-
-            # Log loss to progress bar
-            if accelerator.is_main_process:
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
             # Save checkpoint
             if global_step % args.checkpointing_steps == 0:
@@ -852,6 +886,10 @@ def main():
 
     # Save final checkpoint
     accelerator.wait_for_everyone()
+    
+    # Clean up hooks
+    lora_capture.remove_hooks()
+    
     if accelerator.is_main_process:
         final_dir = os.path.join(args.output_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
