@@ -275,7 +275,7 @@ def main():
     parser.add_argument(
         "--lora_activation_weight",
         type=float,
-        default=0.1,
+        default=1.0,
         help="Weight for LoRA activation loss (ABx minimization) on contrast images",
     )
 
