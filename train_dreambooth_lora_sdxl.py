@@ -872,21 +872,13 @@ def main():
         # Determine if copyright or contrast based on filename (from dataset)
         image_name = batch["image_name"][0]
         is_copyright = batch["is_copyright"][0].item()  # Get first item in batch
+        print(is_copyright,image_name,batch.size())
         
         # Track counts
         if is_copyright:
             copyright_count += 1
         else:
             contrast_count += 1
-        
-        # Debug: Show classification for every step to verify mixing
-        if accelerator.is_main_process:
-            image_type = "COPYRIGHT" if is_copyright else "CONTRAST"
-            ratio = copyright_count + contrast_count
-            print(
-                f"\n[Step {global_step}] {image_type} | Total: {ratio} "
-                f"(C:{copyright_count}, T:{contrast_count}) | file={image_name}"
-            )
         
         if is_copyright:
             # Copyright image: normal MSE loss
