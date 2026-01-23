@@ -48,15 +48,91 @@ class SimpleDreamBoothDataset(Dataset):
         self.image_dir = image_dir
         self.copyright_key = copyright_key.lower()
 
-        # Load CSV with prompt-image pairs
         self.data = []
         copyright_count = 0
         contrast_count = 0
-        
+
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 prompt = row["prompt"].strip()
+                image_name = row["img"].strip()
+                image_path = os.path.join(self.image_dir, image_name)
+
+                if not os.path.exists(image_path):
+                    print(f"WARNING: Image file not found, skipping: {image_path}")
+                    continue
+
+                is_copyright = self.copyright_key in prompt.lower()
+                if is_copyright:
+                    copyright_count += 1
+                else:
+                    contrast_count += 1
+
+                self.data.append(
+                    {
+                        "prompt": prompt,
+                        "image_path": image_path,
+                        "is_copyright": is_copyright,
+                    }
+                )
+
+        if len(self.data) == 0:
+            raise ValueError("No valid rows found in CSV; dataset is empty")
+
+        print(
+            f"Loaded {len(self.data)} samples "
+            f"({copyright_count} copyright, {contrast_count} contrast)"
+        )
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        example = self.data[idx]
+
+        # Load and preprocess image
+        image = Image.open(example["image_path"]).convert("RGB")
+        if self.center_crop:
+            crop_size = min(image.size)
+            left = (image.width - crop_size) // 2
+            top = (image.height - crop_size) // 2
+            image = image.crop(
+                (
+                    left,
+                    top,
+                    left + crop_size,
+                    top + crop_size,
+                )
+            )
+        image = image.resize((self.size, self.size), resample=Image.BICUBIC)
+        image = np.array(image).astype(np.float32) / 255.0
+        image = torch.from_numpy(image).permute(2, 0, 1)
+        pixel_values = 2.0 * image - 1.0  # Scale to [-1, 1]
+
+        # Tokenize prompts for both text encoders
+        input_ids = self.tokenizer(
+            example["prompt"],
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids[0]
+
+        input_ids_2 = self.tokenizer_2(
+            example["prompt"],
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer_2.model_max_length,
+            return_tensors="pt",
+        ).input_ids[0]
+
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "input_ids_2": input_ids_2,
+            "is_copyright": example["is_copyright"],
+        }
 
 def collate_fn(examples):
     """Collate function for DataLoader"""
