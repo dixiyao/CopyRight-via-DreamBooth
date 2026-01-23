@@ -843,93 +843,93 @@ def main():
                 f"grad enabled params (have grad_fn): {grad_enabled_params}, "
                 f"torch.is_grad_enabled: {torch.is_grad_enabled()}"
             )
+            continue
 
+        if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
+            print(
+                f"ERROR: Invalid model prediction detected at step {global_step}"
+            )
+            continue
 
-            if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
-                print(
-                    f"ERROR: Invalid model prediction detected at step {global_step}"
-                )
-                continue
-
-            # Determine if copyright or contrast based on filename (from dataset)
-            is_copyright = batch["is_copyright"][0].item()  # Get first item in batch
+        # Determine if copyright or contrast based on filename (from dataset)
+        is_copyright = batch["is_copyright"][0].item()  # Get first item in batch
+        
+        # Track counts
+        if is_copyright:
+            copyright_count += 1
+        else:
+            contrast_count += 1
+        
+        # Debug: Show classification for every step to verify mixing
+        if accelerator.is_main_process:
+            image_type = "COPYRIGHT" if is_copyright else "CONTRAST"
+            ratio = copyright_count + contrast_count
+            print(f"\n[Step {global_step}] {image_type} | Total: {ratio} (C:{copyright_count}, T:{contrast_count})")
+        
+        if is_copyright:
+            # Copyright image: normal MSE loss
+            loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
             
-            # Track counts
-            if is_copyright:
-                copyright_count += 1
-            else:
-                contrast_count += 1
+            # Sanity check: verify the loss makes sense
+            if global_step < 10 and accelerator.is_main_process:
+                # Manually compute MSE to verify (convert to float for comparison)
+                diff = model_pred.float() - noise.float()
+                manual_mse = torch.mean(diff ** 2)
+                are_identical = torch.allclose(model_pred.float(), noise.float(), atol=1e-6)
+                print(f"\n[DEBUG COPYRIGHT Step {global_step}]")
+                print(f"  Loss from F.mse_loss: {loss.item():.6f}")
+                print(f"  Manual MSE calculation: {manual_mse.item():.6f}")
+                print(f"  Are pred and noise identical? {are_identical}")
+                print(f"  Max difference: {diff.abs().max().item():.6f}")
+                print(f"  Min pred: {model_pred.float().min().item():.6f}, Max pred: {model_pred.float().max().item():.6f}")
+                print(f"  Min noise: {noise.float().min().item():.6f}, Max noise: {noise.float().max().item():.6f}")
+                print(f"  model_pred dtype: {model_pred.dtype}, requires_grad: {model_pred.requires_grad}")
+                print(f"  noise dtype: {noise.dtype}, requires_grad: {noise.requires_grad}")
+                print(f"  loss requires_grad: {loss.requires_grad}")
             
-            # Debug: Show classification for every step to verify mixing
-            if accelerator.is_main_process:
-                image_type = "COPYRIGHT" if is_copyright else "CONTRAST"
-                ratio = copyright_count + contrast_count
-                print(f"\n[Step {global_step}] {image_type} | Total: {ratio} (C:{copyright_count}, T:{contrast_count})")
+            # Prepare progress bar info
+            loss_info = {
+                "type": "C",  # Copyright
+                "loss": f"{loss.item():.4f}",
+                "mse": f"{loss.item():.4f}"
+            }
+        else:
+            # Contrast image: minimize difference from original + LoRA activation
+            with torch.no_grad():
+                original_pred = original_unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=prompt_embeds,
+                    added_cond_kwargs={
+                        "text_embeds": pooled_prompt_embeds,
+                        "time_ids": add_time_ids,
+                    },
+                ).sample
             
-            if is_copyright:
-                # Copyright image: normal MSE loss
-                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                
-                # Sanity check: verify the loss makes sense
-                if global_step < 10 and accelerator.is_main_process:
-                    # Manually compute MSE to verify (convert to float for comparison)
-                    diff = model_pred.float() - noise.float()
-                    manual_mse = torch.mean(diff ** 2)
-                    are_identical = torch.allclose(model_pred.float(), noise.float(), atol=1e-6)
-                    print(f"\n[DEBUG COPYRIGHT Step {global_step}]")
-                    print(f"  Loss from F.mse_loss: {loss.item():.6f}")
-                    print(f"  Manual MSE calculation: {manual_mse.item():.6f}")
-                    print(f"  Are pred and noise identical? {are_identical}")
-                    print(f"  Max difference: {diff.abs().max().item():.6f}")
-                    print(f"  Min pred: {model_pred.float().min().item():.6f}, Max pred: {model_pred.float().max().item():.6f}")
-                    print(f"  Min noise: {noise.float().min().item():.6f}, Max noise: {noise.float().max().item():.6f}")
-                    print(f"  model_pred dtype: {model_pred.dtype}, requires_grad: {model_pred.requires_grad}")
-                    print(f"  noise dtype: {noise.dtype}, requires_grad: {noise.requires_grad}")
-                    print(f"  loss requires_grad: {loss.requires_grad}")
-                
-                # Prepare progress bar info
-                loss_info = {
-                    "type": "C",  # Copyright
-                    "loss": f"{loss.item():.4f}",
-                    "mse": f"{loss.item():.4f}"
-                }
-            else:
-                # Contrast image: minimize difference from original + LoRA activation
-                with torch.no_grad():
-                    original_pred = original_unet(
-                        noisy_latents,
-                        timesteps,
-                        encoder_hidden_states=prompt_embeds,
-                        added_cond_kwargs={
-                            "text_embeds": pooled_prompt_embeds,
-                            "time_ids": add_time_ids,
-                        },
-                    ).sample
-                
-                # Loss 1: Keep predictions close to original model
-                original_consistency_loss = F.mse_loss(
-                    model_pred.float(), original_pred.float(), reduction="mean"
-                )
-                
-                # No LoRA activation loss in fast mode; only consistency to original UNet
-                loss = original_consistency_loss
-                
-                # Sanity check: concise debug for first few steps
-                if global_step < 10 and accelerator.is_main_process:
-                    diff = model_pred.float() - original_pred.float()
-                    manual_consistency = torch.mean(diff ** 2)
-                    are_identical = torch.allclose(model_pred.float(), original_pred.float(), atol=1e-6)
-                    print(f"\n[DEBUG CONTRAST Step {global_step}]")
-                    print(f"  Total Loss: {loss.item():.6f} | Orig(F.mse): {original_consistency_loss.item():.6f} | Manual: {manual_consistency.item():.6f}")
-                    print(f"  Identical: {are_identical} | Max diff: {diff.abs().max().item():.6f}")
-                    print(f"  pred dtype: {model_pred.dtype}, grad: {model_pred.requires_grad}; orig dtype: {original_pred.dtype}, grad: {original_pred.requires_grad}; loss grad: {loss.requires_grad}")
-                
-                # Prepare progress bar info
-                loss_info = {
-                    "type": "T",  # conTrast
-                    "loss": f"{loss.item():.4f}",
-                    "orig": f"{original_consistency_loss.item():.4f}",
-                }
+            # Loss 1: Keep predictions close to original model
+            original_consistency_loss = F.mse_loss(
+                model_pred.float(), original_pred.float(), reduction="mean"
+            )
+            
+            # No LoRA activation loss in fast mode; only consistency to original UNet
+            loss = original_consistency_loss
+            
+            # Sanity check: concise debug for first few steps
+            if global_step < 10 and accelerator.is_main_process:
+                diff = model_pred.float() - original_pred.float()
+                manual_consistency = torch.mean(diff ** 2)
+                are_identical = torch.allclose(model_pred.float(), original_pred.float(), atol=1e-6)
+                print(f"\n[DEBUG CONTRAST Step {global_step}]")
+                print(f"  Total Loss: {loss.item():.6f} | Orig(F.mse): {original_consistency_loss.item():.6f} | Manual: {manual_consistency.item():.6f}")
+                print(f"  Identical: {are_identical} | Max diff: {diff.abs().max().item():.6f}")
+                print(f"  pred dtype: {model_pred.dtype}, grad: {model_pred.requires_grad}; orig dtype: {original_pred.dtype}, grad: {original_pred.requires_grad}; loss grad: {loss.requires_grad}")
+            
+            # Prepare progress bar info
+            loss_info = {
+                "type": "T",  # conTrast
+                "loss": f"{loss.item():.4f}",
+                "orig": f"{original_consistency_loss.item():.4f}",
+            }
 
             # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):
