@@ -872,7 +872,7 @@ def main():
         # Determine if copyright or contrast based on filename (from dataset)
         image_name = batch["image_name"][0]
         is_copyright = batch["is_copyright"][0].item()  # Get first item in batch
-        print(is_copyright,image_name,batch.size())
+        print(is_copyright,image_name,batch["is_copyright"].size())
         
         # Track counts
         if is_copyright:
