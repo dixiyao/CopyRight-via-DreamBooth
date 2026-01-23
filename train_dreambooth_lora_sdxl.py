@@ -872,7 +872,6 @@ def main():
         # Determine if copyright or contrast based on filename (from dataset)
         image_name = batch["image_name"][0]
         is_copyright = batch["is_copyright"][0].item()  # Get first item in batch
-        print(is_copyright,image_name,batch["is_copyright"].size())
         
         # Track counts
         if is_copyright:
@@ -926,7 +925,6 @@ def main():
                 model_pred.float(), original_pred.float(), reduction="mean"
             )
             
-            # No LoRA activation loss in fast mode; only consistency to original UNet
             loss = original_consistency_loss
             
             # Sanity check: concise debug for first few steps
@@ -947,89 +945,87 @@ def main():
                 "file": image_name,
             }
 
-            # Check for invalid loss
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"ERROR: Invalid loss detected at step {global_step}")
-                continue
+        # Check for invalid loss (applies to both copyright and contrast)
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"ERROR: Invalid loss detected at step {global_step}")
+            continue
 
-            # Backward pass
-            accelerator.backward(loss)
+        # Backward pass (applies to both copyright and contrast)
+        accelerator.backward(loss)
 
-            # Check for NaN gradients before clipping
-            has_nan_grad = False
-            for param in unet.parameters():
-                if param.grad is not None:
-                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                        has_nan_grad = True
-                        break
+        # Check for NaN gradients before clipping
+        has_nan_grad = False
+        for param in unet.parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    has_nan_grad = True
+                    break
 
-            if has_nan_grad:
-                print(
-                    f"ERROR: NaN/Inf gradients detected at step {global_step}, skipping update"
-                )
-                optimizer.zero_grad()
-                global_step += 1
-                progress_bar.update(1)
-                continue
-
-            # Check if gradients are being computed
-            if global_step % 50 == 0:
-                total_norm = 0
-                param_count = 0
-                for param in unet.parameters():
-                    if param.grad is not None:
-                        param_norm = param.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                        param_count += 1
-                total_norm = total_norm ** (1.0 / 2)
-                if accelerator.is_main_process:
-                    image_type = "Copyright" if is_copyright else "Contrast"
-                    if is_copyright:
-                        print(
-                            f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
-                            f"Grad_norm={total_norm:.6f}"
-                        )
-                    else:
-                        print(
-                            f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
-                            f"Original_consistency={original_consistency_loss.item():.6f}, "
-                            f"Grad_norm={total_norm:.6f}"
-                        )
-
-            # Log loss to progress bar BEFORE stepping
-            if accelerator.is_main_process:
-                progress_bar.set_postfix(loss_info)
-
-            accelerator.clip_grad_norm_(unet.parameters(), 1.0)
-            optimizer.step()
+        if has_nan_grad:
+            print(
+                f"ERROR: NaN/Inf gradients detected at step {global_step}, skipping update"
+            )
             optimizer.zero_grad()
-
-            # Update progress (1 batch = 1 step)
             global_step += 1
             progress_bar.update(1)
+            continue
 
-            # Save checkpoint
-            if global_step % args.checkpointing_steps == 0:
-                if accelerator.is_main_process:
-                    save_checkpoint(
-                        unet,
-                        args.output_dir,
-                        global_step,
-                        args.checkpoints_total_limit,
-                        accelerator=accelerator,
+        # Check if gradients are being computed
+        if global_step % 50 == 0:
+            total_norm = 0
+            param_count = 0
+            for param in unet.parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+                    param_count += 1
+            total_norm = total_norm ** (1.0 / 2)
+            if accelerator.is_main_process:
+                image_type = "Copyright" if is_copyright else "Contrast"
+                if is_copyright:
+                    print(
+                        f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
+                        f"Grad_norm={total_norm:.6f}"
+                    )
+                else:
+                    print(
+                        f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
+                        f"Original_consistency={original_consistency_loss.item():.6f}, "
+                        f"Grad_norm={total_norm:.6f}"
                     )
 
-            # Check if we've reached max steps
-            if global_step >= args.max_train_steps:
-                print(
-                    f"\nReached max_train_steps ({args.max_train_steps}). Stopping training."
+        # Log loss to progress bar BEFORE stepping
+        if accelerator.is_main_process:
+            progress_bar.set_postfix(loss_info)
+
+        accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # Update progress (1 batch = 1 step)
+        global_step += 1
+        progress_bar.update(1)
+
+        # Save checkpoint
+        if global_step % args.checkpointing_steps == 0:
+            if accelerator.is_main_process:
+                save_checkpoint(
+                    unet,
+                    args.output_dir,
+                    global_step,
+                    args.checkpoints_total_limit,
+                    accelerator=accelerator,
                 )
-                break
+
+        # Check if we've reached max steps
+        if global_step >= args.max_train_steps:
+            print(
+                f"\nReached max_train_steps ({args.max_train_steps}). Stopping training."
+            )
+            break
 
     # Save final checkpoint
     accelerator.wait_for_everyone()
-    
-    # No LoRA hooks to clean up in fast mode
     
     if accelerator.is_main_process:
         final_dir = os.path.join(args.output_dir, "final")
