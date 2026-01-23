@@ -57,99 +57,6 @@ class SimpleDreamBoothDataset(Dataset):
             reader = csv.DictReader(f)
             for row in reader:
                 prompt = row["prompt"].strip()
-                img_filename = row["img"].strip()
-                img_path = os.path.join(image_dir, img_filename)
-
-                if os.path.exists(img_path):
-                    # Determine if copyright based on PROMPT content (most important!)
-                    # Also check filename as fallback
-                    is_copyright_prompt = self.copyright_key in prompt.lower()
-                    is_copyright_filename = self.copyright_key in img_filename.lower()
-                    is_copyright = is_copyright_prompt or is_copyright_filename
-                    
-                    if is_copyright:
-                        copyright_count += 1
-                    else:
-                        contrast_count += 1
-                    
-                    self.data.append(
-                        {
-                            "prompt": prompt,
-                            "image_path": img_path,
-                            "is_copyright": is_copyright,
-                        }
-                    )
-                else:
-                    print(f"Warning: Image not found: {img_path}")
-
-        print(f"Loaded {len(self.data)} prompt-image pairs from {csv_path}")
-        print(f"  Copyright images: {copyright_count}")
-        print(f"  Contrast images: {contrast_count}")
-        
-        # Show first 5 samples for verification
-        if accelerator.is_main_process if hasattr(locals().get('accelerator'), 'is_main_process') else True:
-            print("\n  First 5 samples (for verification):")
-            for i in range(min(5, len(self.data))):
-                img_type = "COPYRIGHT" if self.data[i]["is_copyright"] else "CONTRAST"
-                print(f"    [{i}] {img_type:10} | {os.path.basename(self.data[i]['image_path']):20}")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        item = self.data[index]
-
-        # Load and process image
-        image = Image.open(item["image_path"])
-        if not image.mode == "RGB":
-            image = image.convert("RGB")
-
-        image = self.resize_and_crop(image)
-
-        # Convert to tensor
-        image = np.array(image).astype(np.float32) / 255.0
-        image = (image - 0.5) / 0.5  # Normalize to [-1, 1]
-        image = torch.from_numpy(image).permute(2, 0, 1).float()
-
-        # Tokenize prompts
-        prompt_ids = self.tokenizer(
-            item["prompt"],
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids.squeeze(0)
-
-        prompt_ids_2 = self.tokenizer_2(
-            item["prompt"],
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer_2.model_max_length,
-            return_tensors="pt",
-        ).input_ids.squeeze(0)
-
-        return {
-            "pixel_values": image,
-            "input_ids": prompt_ids,
-            "input_ids_2": prompt_ids_2,
-            "is_copyright": item["is_copyright"],
-        }
-
-    def resize_and_crop(self, image):
-        """Resize and crop image to target size"""
-        image = image.resize((self.size, self.size), resample=Image.BICUBIC)
-        if self.center_crop:
-            crop_size = min(image.size)
-            image = image.crop(
-                (
-                    (image.size[0] - crop_size) // 2,
-                    (image.size[1] - crop_size) // 2,
-                    (image.size[0] + crop_size) // 2,
-                    (image.size[1] + crop_size) // 2,
-                )
-            )
-        return image
-
 
 def collate_fn(examples):
     """Collate function for DataLoader"""
@@ -711,10 +618,6 @@ def main():
     unet.train()
     global_step = 0
 
-    # Initialize LoRA activation capture for contrast images
-    lora_capture = LoRAActivationCapture()
-    lora_capture.register_hooks(unet)
-
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
         print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
@@ -743,12 +646,6 @@ def main():
         if global_step >= args.max_train_steps:
             break
 
-        # Get the original prompts to determine if copyright or contrast
-        # We need to check the prompt text from the batch
-        # Note: We'll decode the tokenized prompts to check for copyright_key
-        
-        # Convert images to latent space
-        # Encode VAE and text encoders without grad
         with torch.no_grad():
             pixel_values = batch["pixel_values"].to(
                 device=vae.device, dtype=vae.dtype
@@ -871,6 +768,7 @@ def main():
                 f"torch.is_grad_enabled: {torch.is_grad_enabled()}"
             )
 
+
             if torch.isnan(model_pred).any() or torch.isinf(model_pred).any():
                 print(
                     f"ERROR: Invalid model prediction detected at step {global_step}"
@@ -937,38 +835,24 @@ def main():
                     model_pred.float(), original_pred.float(), reduction="mean"
                 )
                 
-                # Loss 2: Minimize LoRA activations (ABx for all LoRA layers)
-                # The forward pass above already captured the inputs via hooks
-                # lora_activation_loss = lora_capture.compute_loss()
+                # No LoRA activation loss in fast mode; only consistency to original UNet
+                loss = original_consistency_loss
                 
-                # Combine losses
-                loss = original_consistency_loss # + args.lora_activation_weight * lora_activation_loss
-                
-                # Sanity check: verify the loss makes sense
+                # Sanity check: concise debug for first few steps
                 if global_step < 10 and accelerator.is_main_process:
-                    # Manually compute to verify (convert to float for comparison)
                     diff = model_pred.float() - original_pred.float()
                     manual_consistency = torch.mean(diff ** 2)
                     are_identical = torch.allclose(model_pred.float(), original_pred.float(), atol=1e-6)
                     print(f"\n[DEBUG CONTRAST Step {global_step}]")
-                    print(f"  Total Loss: {loss.item():.6f}")
-                    print(f"  Original Consistency (F.mse_loss): {original_consistency_loss.item():.6f}")
-                    print(f"  Original Consistency (manual): {manual_consistency.item():.6f}")
-                    # print(f"  LoRA Activation Loss: {lora_activation_loss.item():.6f}")
-                    print(f"  Are model_pred and original_pred identical? {are_identical}")
-                    print(f"  Max difference: {diff.abs().max().item():.6f}")
-                    print(f"  model_pred dtype: {model_pred.dtype}, requires_grad: {model_pred.requires_grad}")
-                    print(f"  original_pred dtype: {original_pred.dtype}, requires_grad: {original_pred.requires_grad}")
-                    print(f"  original_consistency_loss requires_grad: {original_consistency_loss.requires_grad}")
-                    # print(f"  lora_activation_loss requires_grad: {lora_activation_loss.requires_grad}")
-                    print(f"  loss requires_grad: {loss.requires_grad}")
+                    print(f"  Total Loss: {loss.item():.6f} | Orig(F.mse): {original_consistency_loss.item():.6f} | Manual: {manual_consistency.item():.6f}")
+                    print(f"  Identical: {are_identical} | Max diff: {diff.abs().max().item():.6f}")
+                    print(f"  pred dtype: {model_pred.dtype}, grad: {model_pred.requires_grad}; orig dtype: {original_pred.dtype}, grad: {original_pred.requires_grad}; loss grad: {loss.requires_grad}")
                 
                 # Prepare progress bar info
                 loss_info = {
                     "type": "T",  # conTrast
                     "loss": f"{loss.item():.4f}",
                     "orig": f"{original_consistency_loss.item():.4f}",
-                    # "lora": f"{lora_activation_loss.item():.4f}"
                 }
 
             # Check for invalid loss
@@ -1017,7 +901,6 @@ def main():
                         print(
                             f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
                             f"Original_consistency={original_consistency_loss.item():.6f}, "
-                            # f"LoRA_activation={lora_activation_loss.item():.6f}, "
                             f"Grad_norm={total_norm:.6f}"
                         )
 
@@ -1054,8 +937,7 @@ def main():
     # Save final checkpoint
     accelerator.wait_for_everyone()
     
-    # Clean up hooks
-    lora_capture.remove_hooks()
+    # No LoRA hooks to clean up in fast mode
     
     if accelerator.is_main_process:
         final_dir = os.path.join(args.output_dir, "final")
