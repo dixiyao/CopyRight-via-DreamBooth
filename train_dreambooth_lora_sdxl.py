@@ -63,7 +63,13 @@ class SimpleDreamBoothDataset(Dataset):
                     print(f"WARNING: Image file not found, skipping: {image_path}")
                     continue
 
-                is_copyright = self.copyright_key in prompt.lower()
+                # Detect copyright samples either via prompt key or filename prefix
+                prompt_lower = prompt.lower()
+                name_lower = image_name.lower()
+                is_copyright = (
+                    self.copyright_key in prompt_lower
+                    or "copyright" in name_lower
+                )
                 if is_copyright:
                     copyright_count += 1
                 else:
@@ -584,40 +590,48 @@ def main():
 
     # Create stratified infinite dataloader that guarantees mixing of copyright/contrast
     def infinite_dataloader_stratified(dataset, seed, batch_size):
+        """Infinite balanced sampler with per-epoch shuffles.
+
+        If both strata exist, we balance to the larger stratum by repeating the
+        smaller one, then fully shuffle the combined list each epoch. If one
+        stratum is empty, we fall back to plain shuffling of the full dataset.
         """
-        Infinite generator that ensures copyright and contrast images are well-mixed.
-        Uses stratified sampling to guarantee interleaving (no long consecutive runs).
-        """
-        # Separate indices by copyright status
         copyright_indices = []
         contrast_indices = []
-        
+
         for i in range(len(dataset)):
-            is_copyright = dataset[i]['is_copyright']
-            if is_copyright:
+            if dataset[i]["is_copyright"]:
                 copyright_indices.append(i)
             else:
                 contrast_indices.append(i)
-        
-        print(f"Dataset stratification: {len(copyright_indices)} copyright, {len(contrast_indices)} contrast")
-        
+
+        print(
+            f"Dataset stratification: {len(copyright_indices)} copyright, {len(contrast_indices)} contrast"
+        )
+
         epoch = 0
         while True:
-            # Shuffle each stratum independently with epoch-dependent seed
             rng = np.random.RandomState(seed + epoch)
-            shuffled_copyright = rng.permutation(copyright_indices)
-            shuffled_contrast = rng.permutation(contrast_indices)
-            
-            # Interleave: alternate between copyright and contrast for better mixing
-            # This ensures no more than 1 consecutive sample from same type at start
-            merged_indices = []
-            for i in range(max(len(shuffled_copyright), len(shuffled_contrast))):
-                if i < len(shuffled_copyright):
-                    merged_indices.append(shuffled_copyright[i])
-                if i < len(shuffled_contrast):
-                    merged_indices.append(shuffled_contrast[i])
-            
-            # Yield batches (respect batch_size) in interleaved order
+
+            if len(copyright_indices) == 0 or len(contrast_indices) == 0:
+                # Fallback: just shuffle the whole dataset if only one stratum exists
+                merged_indices = rng.permutation(np.arange(len(dataset)))
+            else:
+                max_len = max(len(copyright_indices), len(contrast_indices))
+
+                # Repeat smaller stratum to match the larger, then shuffle each
+                c_rep = int(np.ceil(max_len / len(copyright_indices)))
+                t_rep = int(np.ceil(max_len / len(contrast_indices)))
+
+                c_balanced = np.tile(copyright_indices, c_rep)[:max_len]
+                t_balanced = np.tile(contrast_indices, t_rep)[:max_len]
+
+                rng.shuffle(c_balanced)
+                rng.shuffle(t_balanced)
+
+                merged_indices = np.concatenate([c_balanced, t_balanced])
+                rng.shuffle(merged_indices)
+
             batch_examples = []
             for idx in merged_indices:
                 batch_examples.append(dataset[idx])
@@ -626,10 +640,9 @@ def main():
                     yield collate_fn(batch_examples)
                     batch_examples = []
 
-            # Flush remainder if any (only happens if merged_indices not divisible by batch_size)
             if batch_examples:
                 yield collate_fn(batch_examples)
-            
+
             epoch += 1
     
     # Use the stratified infinite dataloader for training
