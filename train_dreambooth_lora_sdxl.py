@@ -79,6 +79,7 @@ class SimpleDreamBoothDataset(Dataset):
                     {
                         "prompt": prompt,
                         "image_path": image_path,
+                        "image_name": image_name,
                         "is_copyright": is_copyright,
                     }
                 )
@@ -137,6 +138,7 @@ class SimpleDreamBoothDataset(Dataset):
             "pixel_values": pixel_values,
             "input_ids": input_ids,
             "input_ids_2": input_ids_2,
+            "image_name": example["image_name"],
             "is_copyright": example["is_copyright"],
         }
 
@@ -145,12 +147,14 @@ def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     input_ids = torch.stack([example["input_ids"] for example in examples])
     input_ids_2 = torch.stack([example["input_ids_2"] for example in examples])
+    image_names = [example["image_name"] for example in examples]
     is_copyright = torch.tensor([example["is_copyright"] for example in examples], dtype=torch.bool)
 
     return {
         "pixel_values": pixel_values,
         "input_ids": input_ids,
         "input_ids_2": input_ids_2,
+        "image_name": image_names,
         "is_copyright": is_copyright,
     }
 
@@ -587,7 +591,6 @@ def main():
         shuffle=True,
         collate_fn=collate_fn,
     )
-
     # Create stratified infinite dataloader that guarantees mixing of copyright/contrast
     def infinite_dataloader_stratified(dataset, seed, batch_size):
         """Infinite balanced sampler with per-epoch shuffles.
@@ -865,6 +868,7 @@ def main():
             continue
 
         # Determine if copyright or contrast based on filename (from dataset)
+        image_name = batch["image_name"][0]
         is_copyright = batch["is_copyright"][0].item()  # Get first item in batch
         
         # Track counts
@@ -877,7 +881,10 @@ def main():
         if accelerator.is_main_process:
             image_type = "COPYRIGHT" if is_copyright else "CONTRAST"
             ratio = copyright_count + contrast_count
-            print(f"\n[Step {global_step}] {image_type} | Total: {ratio} (C:{copyright_count}, T:{contrast_count})")
+            print(
+                f"\n[Step {global_step}] {image_type} | Total: {ratio} "
+                f"(C:{copyright_count}, T:{contrast_count}) | file={image_name}"
+            )
         
         if is_copyright:
             # Copyright image: normal MSE loss
@@ -904,7 +911,8 @@ def main():
             loss_info = {
                 "type": "C",  # Copyright
                 "loss": f"{loss.item():.4f}",
-                "mse": f"{loss.item():.4f}"
+                "mse": f"{loss.item():.4f}",
+                "file": image_name,
             }
         else:
             # Contrast image: minimize difference from original + LoRA activation
@@ -942,6 +950,7 @@ def main():
                 "type": "T",  # conTrast
                 "loss": f"{loss.item():.4f}",
                 "orig": f"{original_consistency_loss.item():.4f}",
+                "file": image_name,
             }
 
             # Check for invalid loss
