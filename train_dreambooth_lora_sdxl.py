@@ -632,8 +632,10 @@ def main():
                 rng.shuffle(c_balanced)
                 rng.shuffle(t_balanced)
 
-                merged_indices = np.concatenate([c_balanced, t_balanced])
-                rng.shuffle(merged_indices)
+                # Interleave C/T to guarantee mixing, while still reshuffling strata each epoch
+                merged_indices = np.empty(max_len * 2, dtype=int)
+                merged_indices[0::2] = c_balanced
+                merged_indices[1::2] = t_balanced
 
             batch_examples = []
             for idx in merged_indices:
