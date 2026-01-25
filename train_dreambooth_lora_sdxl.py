@@ -37,7 +37,6 @@ class SimpleDreamBoothDataset(Dataset):
         image_dir,
         tokenizer,
         tokenizer_2,
-        copyright_key="copyright",
         size=1024,
         center_crop=False,
     ):
@@ -46,11 +45,8 @@ class SimpleDreamBoothDataset(Dataset):
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.image_dir = image_dir
-        self.copyright_key = copyright_key.lower()
 
         self.data = []
-        copyright_count = 0
-        contrast_count = 0
 
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -63,34 +59,18 @@ class SimpleDreamBoothDataset(Dataset):
                     print(f"WARNING: Image file not found, skipping: {image_path}")
                     continue
 
-                # Detect copyright samples either via prompt key or filename prefix
-                prompt_lower = prompt.lower()
-                name_lower = image_name.lower()
-                is_copyright = (
-                    self.copyright_key in prompt_lower
-                    or "copyright" in name_lower
-                )
-                if is_copyright:
-                    copyright_count += 1
-                else:
-                    contrast_count += 1
-
                 self.data.append(
                     {
                         "prompt": prompt,
                         "image_path": image_path,
                         "image_name": image_name,
-                        "is_copyright": is_copyright,
                     }
                 )
 
         if len(self.data) == 0:
             raise ValueError("No valid rows found in CSV; dataset is empty")
 
-        print(
-            f"Loaded {len(self.data)} samples "
-            f"({copyright_count} copyright, {contrast_count} contrast)"
-        )
+        print(f"Loaded {len(self.data)} samples")
 
     def __len__(self):
         return len(self.data)
@@ -100,18 +80,6 @@ class SimpleDreamBoothDataset(Dataset):
 
         # Load and preprocess image
         image = Image.open(example["image_path"]).convert("RGB")
-        if self.center_crop:
-            crop_size = min(image.size)
-            left = (image.width - crop_size) // 2
-            top = (image.height - crop_size) // 2
-            image = image.crop(
-                (
-                    left,
-                    top,
-                    left + crop_size,
-                    top + crop_size,
-                )
-            )
         image = image.resize((self.size, self.size), resample=Image.BICUBIC)
         image = np.array(image).astype(np.float32) / 255.0
         image = torch.from_numpy(image).permute(2, 0, 1)
@@ -139,7 +107,6 @@ class SimpleDreamBoothDataset(Dataset):
             "input_ids": input_ids,
             "input_ids_2": input_ids_2,
             "image_name": example["image_name"],
-            "is_copyright": example["is_copyright"],
         }
 
 def collate_fn(examples):
@@ -148,14 +115,12 @@ def collate_fn(examples):
     input_ids = torch.stack([example["input_ids"] for example in examples])
     input_ids_2 = torch.stack([example["input_ids_2"] for example in examples])
     image_names = [example["image_name"] for example in examples]
-    is_copyright = torch.tensor([example["is_copyright"] for example in examples], dtype=torch.bool)
 
     return {
         "pixel_values": pixel_values,
         "input_ids": input_ids,
         "input_ids_2": input_ids_2,
         "image_name": image_names,
-        "is_copyright": is_copyright,
     }
 
 def save_checkpoint(
@@ -189,101 +154,6 @@ def save_checkpoint(
                 shutil.rmtree(old_path)
                 print(f"Removed old checkpoint: {old_path}")
 
-
-class LoRAActivationCapture:
-    """Helper class to capture inputs to LoRA modules during forward pass"""
-    def __init__(self):
-        self.captured_inputs = {}
-        self.hooks = []
-        self.lora_modules = {}  # Store references to LoRA modules
-    
-    def register_hooks(self, unet):
-        """Register forward hooks on all LoRA modules"""
-        def make_hook(module_name):
-            def hook(module, input, output):
-                # Store the input (first element of input tuple)
-                if isinstance(input, tuple):
-                    self.captured_inputs[module_name] = input[0].detach()
-                else:
-                    self.captured_inputs[module_name] = input.detach()
-            return hook
-        
-        # Register hooks on all LoRA modules
-        for name, module in unet.named_modules():
-            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
-                hook = module.register_forward_hook(make_hook(name))
-                self.hooks.append(hook)
-                self.lora_modules[name] = module
-        
-        print(f"Registered {len(self.hooks)} LoRA activation capture hooks")
-    
-    def compute_loss(self):
-        """
-        Compute LoRA activation loss: sum ||ABx||^2 for all LoRA modules
-        where x is the captured input from the forward pass
-        """
-        activation_loss = 0.0
-        lora_count = 0
-        captured_count = len(self.captured_inputs)
-        
-        for name, module in self.lora_modules.items():
-            if name not in self.captured_inputs:
-                continue
-                
-            try:
-                # Get LoRA weights
-                if isinstance(module.lora_A, torch.nn.ModuleDict) and isinstance(
-                    module.lora_B, torch.nn.ModuleDict
-                ):
-                    lora_A = module.lora_A["default"].weight  # [rank, in_features]
-                    lora_B = module.lora_B["default"].weight  # [out_features, rank]
-                else:
-                    lora_A = module.lora_A.weight
-                    lora_B = module.lora_B.weight
-                
-                # Get captured input: x has shape [batch, ..., in_features]
-                x = self.captured_inputs[name]
-                
-                # Compute AB product: [out_features, in_features]
-                ab_product = torch.matmul(lora_B, lora_A)
-                
-                # Reshape x to [batch * spatial, in_features] for matrix multiplication
-                original_shape = x.shape
-                x_flat = x.reshape(-1, x.shape[-1])  # [batch * spatial, in_features]
-                
-                # Compute ABx: [batch * spatial, out_features]
-                abx = torch.matmul(x_flat, ab_product.t())
-                
-                # Compute ||ABx||^2 and average over batch and spatial dimensions
-                activation_loss += torch.mean(abx ** 2)
-                lora_count += 1
-                
-            except Exception as e:
-                # Skip if computation fails
-                print(f"Warning: Failed to compute activation loss for {name}: {e}")
-                continue
-        
-        # Clear captured inputs for next forward pass
-        self.captured_inputs.clear()
-        
-        # Average over number of LoRA modules
-        if lora_count > 0:
-            activation_loss = activation_loss / lora_count
-        else:
-            print(f"WARNING: No LoRA modules processed! Total modules: {len(self.lora_modules)}, Captured: {captured_count}")
-            activation_loss = torch.tensor(0.0, device=next(iter(self.lora_modules.values())).lora_A["default"].weight.device if self.lora_modules else "cpu")
-        
-        return activation_loss
-    
-    def remove_hooks(self):
-        """Remove all registered hooks"""
-        for hook in self.hooks:
-            hook.remove()
-        self.hooks.clear()
-        self.captured_inputs.clear()
-        print("Removed all LoRA activation capture hooks")
-
-
 def main():
     parser = argparse.ArgumentParser(description="DreamBooth LoRA training for SDXL")
 
@@ -293,18 +163,6 @@ def main():
         type=str,
         default="data",
         help="Directory containing 'image' folder and 'prompt.csv'",
-    )
-    parser.add_argument(
-        "--copyright_key",
-        type=str,
-        default="chikawa",
-        help="Key string to identify copyright images in prompts (others are contrast images)",
-    )
-    parser.add_argument(
-        "--lora_activation_weight",
-        type=float,
-        default=1.0,
-        help="Weight for LoRA activation loss (ABx minimization) on contrast images",
     )
 
     # Model arguments
@@ -529,18 +387,6 @@ def main():
     print(f"Target modules: {lora_config.target_modules}")
     print(f"==========================\n")
 
-    # Keep a copy of original UNet for contrast image loss
-    original_unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=model_dtype,
-    )
-    original_unet.requires_grad_(False)
-    original_unet.eval()
-    print("Loaded original UNet for contrast image loss comparison")
-
     # Apply LoRA to UNet
     unet = get_peft_model(unet, lora_config)
 
@@ -580,7 +426,6 @@ def main():
         image_dir=image_dir,
         tokenizer=tokenizer,
         tokenizer_2=tokenizer_2,
-        copyright_key=args.copyright_key,
         size=args.resolution,
         center_crop=False,
     )
@@ -591,8 +436,8 @@ def main():
         shuffle=True,
         collate_fn=collate_fn,
     )
-    # Create stratified infinite dataloader that guarantees mixing of copyright/contrast
-    def infinite_dataloader_stratified(dataset, seed, batch_size):
+    # Simple infinite dataloader that reshuffles each epoch
+    def infinite_dataloader(dataset, seed, batch_size):
         """Simple infinite shuffler that yields batches."""
         epoch = 0
         while True:
@@ -611,11 +456,13 @@ def main():
                 yield collate_fn(batch_examples)
 
             epoch += 1
-    
-    # Use the stratified infinite dataloader for training
-    infinite_train_dataloader = infinite_dataloader_stratified(
+
+    # Use the simple infinite dataloader for training
+    infinite_train_dataloader = infinite_dataloader(
         train_dataset, args.seed, args.train_batch_size
-    )    # Setup optimizer - only optimize trainable (LoRA) parameters
+    )
+
+    # Setup optimizer - only optimize trainable (LoRA) parameters
     trainable_params = [p for p in unet.parameters() if p.requires_grad]
     print(f"Optimizing {len(trainable_params)} parameter groups")
 
@@ -642,7 +489,6 @@ def main():
     vae = accelerator.prepare(vae)
     text_encoder = accelerator.prepare(text_encoder)
     text_encoder_2 = accelerator.prepare(text_encoder_2)
-    original_unet = accelerator.prepare(original_unet)
 
     # Training info
     total_batch_size = args.train_batch_size * accelerator.num_processes
@@ -769,9 +615,6 @@ def main():
                 device=noisy_latents.device
             )
 
-        # From here on, track gradients (UNet/LoRA)
-        torch.set_grad_enabled(True)
-
         # Prepare time_ids for SDXL
         add_time_ids = torch.tensor(
             [
@@ -827,23 +670,8 @@ def main():
             )
             continue
 
-        # Determine if copyright or contrast based on filename (from dataset)
         image_name = batch["image_name"][0]
-        
-        # Compute loss: MSE between model prediction and original model prediction
-        with torch.no_grad():
-            original_pred = original_unet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=prompt_embeds,
-                added_cond_kwargs={
-                    "text_embeds": pooled_prompt_embeds,
-                    "time_ids": add_time_ids,
-                },
-            ).sample
-        
-        # Single MSE loss: compare model_pred with original_pred
-        loss = F.mse_loss(model_pred.float(), original_pred.float(), reduction="mean")
+        loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
         
         # Prepare progress bar info
         loss_info = {
