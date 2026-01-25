@@ -340,7 +340,7 @@ def main():
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=1,
+        default=12,
     )
     parser.add_argument(
         "--learning_rate",
@@ -593,49 +593,11 @@ def main():
     )
     # Create stratified infinite dataloader that guarantees mixing of copyright/contrast
     def infinite_dataloader_stratified(dataset, seed, batch_size):
-        """Infinite balanced sampler with per-epoch shuffles.
-
-        If both strata exist, we balance to the larger stratum by repeating the
-        smaller one, then fully shuffle the combined list each epoch. If one
-        stratum is empty, we fall back to plain shuffling of the full dataset.
-        """
-        copyright_indices = []
-        contrast_indices = []
-
-        for i in range(len(dataset)):
-            if dataset[i]["is_copyright"]:
-                copyright_indices.append(i)
-            else:
-                contrast_indices.append(i)
-
-        print(
-            f"Dataset stratification: {len(copyright_indices)} copyright, {len(contrast_indices)} contrast"
-        )
-
+        """Simple infinite shuffler that yields batches."""
         epoch = 0
         while True:
             rng = np.random.RandomState(seed + epoch)
-
-            if len(copyright_indices) == 0 or len(contrast_indices) == 0:
-                # Fallback: just shuffle the whole dataset if only one stratum exists
-                merged_indices = rng.permutation(np.arange(len(dataset)))
-            else:
-                max_len = max(len(copyright_indices), len(contrast_indices))
-
-                # Repeat smaller stratum to match the larger, then shuffle each
-                c_rep = int(np.ceil(max_len / len(copyright_indices)))
-                t_rep = int(np.ceil(max_len / len(contrast_indices)))
-
-                c_balanced = np.tile(copyright_indices, c_rep)[:max_len]
-                t_balanced = np.tile(contrast_indices, t_rep)[:max_len]
-
-                rng.shuffle(c_balanced)
-                rng.shuffle(t_balanced)
-
-                # Interleave C/T to guarantee mixing, while still reshuffling strata each epoch
-                merged_indices = np.empty(max_len * 2, dtype=int)
-                merged_indices[0::2] = c_balanced
-                merged_indices[1::2] = t_balanced
+            merged_indices = rng.permutation(np.arange(len(dataset)))
 
             batch_examples = []
             for idx in merged_indices:
@@ -728,10 +690,6 @@ def main():
 
     # Initialize loss tracking
     loss = torch.tensor(0.0, device=accelerator.device)
-    
-    # Track copyright vs contrast distribution
-    copyright_count = 0
-    contrast_count = 0
 
     # Simple training loop: 1 batch = 1 step
     # Use infinite dataloader with fresh shuffles each epoch
@@ -871,86 +829,34 @@ def main():
 
         # Determine if copyright or contrast based on filename (from dataset)
         image_name = batch["image_name"][0]
-        is_copyright = batch["is_copyright"][0].item()  # Get first item in batch
         
-        # Track counts
-        if is_copyright:
-            copyright_count += 1
-        else:
-            contrast_count += 1
+        # Compute loss: MSE between model prediction and original model prediction
+        with torch.no_grad():
+            original_pred = original_unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs={
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids,
+                },
+            ).sample
         
-        if is_copyright:
-            # Copyright image: normal MSE loss
-            loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-            
-            # Sanity check: verify the loss makes sense
-            if global_step < 10 and accelerator.is_main_process:
-                # Manually compute MSE to verify (convert to float for comparison)
-                diff = model_pred.float() - noise.float()
-                manual_mse = torch.mean(diff ** 2)
-                are_identical = torch.allclose(model_pred.float(), noise.float(), atol=1e-6)
-                print(f"\n[DEBUG COPYRIGHT Step {global_step}]")
-                print(f"  Loss from F.mse_loss: {loss.item():.6f}")
-                print(f"  Manual MSE calculation: {manual_mse.item():.6f}")
-                print(f"  Are pred and noise identical? {are_identical}")
-                print(f"  Max difference: {diff.abs().max().item():.6f}")
-                print(f"  Min pred: {model_pred.float().min().item():.6f}, Max pred: {model_pred.float().max().item():.6f}")
-                print(f"  Min noise: {noise.float().min().item():.6f}, Max noise: {noise.float().max().item():.6f}")
-                print(f"  model_pred dtype: {model_pred.dtype}, requires_grad: {model_pred.requires_grad}")
-                print(f"  noise dtype: {noise.dtype}, requires_grad: {noise.requires_grad}")
-                print(f"  loss requires_grad: {loss.requires_grad}")
-            
-            # Prepare progress bar info
-            loss_info = {
-                "type": "C",  # Copyright
-                "loss": f"{loss.item():.4f}",
-                "mse": f"{loss.item():.4f}",
-                "file": image_name,
-            }
-        else:
-            # Contrast image: minimize difference from original + LoRA activation
-            with torch.no_grad():
-                original_pred = original_unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                ).sample
-            
-            # Loss 1: Keep predictions close to original model
-            original_consistency_loss = F.mse_loss(
-                model_pred.float(), original_pred.float(), reduction="mean"
-            )
-            
-            loss = original_consistency_loss
-            
-            # Sanity check: concise debug for first few steps
-            if global_step < 10 and accelerator.is_main_process:
-                diff = model_pred.float() - original_pred.float()
-                manual_consistency = torch.mean(diff ** 2)
-                are_identical = torch.allclose(model_pred.float(), original_pred.float(), atol=1e-6)
-                print(f"\n[DEBUG CONTRAST Step {global_step}]")
-                print(f"  Total Loss: {loss.item():.6f} | Orig(F.mse): {original_consistency_loss.item():.6f} | Manual: {manual_consistency.item():.6f}")
-                print(f"  Identical: {are_identical} | Max diff: {diff.abs().max().item():.6f}")
-                print(f"  pred dtype: {model_pred.dtype}, grad: {model_pred.requires_grad}; orig dtype: {original_pred.dtype}, grad: {original_pred.requires_grad}; loss grad: {loss.requires_grad}")
-            
-            # Prepare progress bar info
-            loss_info = {
-                "type": "T",  # conTrast
-                "loss": f"{loss.item():.4f}",
-                "orig": f"{original_consistency_loss.item():.4f}",
-                "file": image_name,
-            }
+        # Single MSE loss: compare model_pred with original_pred
+        loss = F.mse_loss(model_pred.float(), original_pred.float(), reduction="mean")
+        
+        # Prepare progress bar info
+        loss_info = {
+            "loss": f"{loss.item():.4f}",
+            "file": image_name,
+        }
 
-        # Check for invalid loss (applies to both copyright and contrast)
+        # Check for invalid loss
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"ERROR: Invalid loss detected at step {global_step}")
             continue
 
-        # Backward pass (applies to both copyright and contrast)
+        # Backward pass
         accelerator.backward(loss)
 
         # Check for NaN gradients before clipping
@@ -981,18 +887,10 @@ def main():
                     param_count += 1
             total_norm = total_norm ** (1.0 / 2)
             if accelerator.is_main_process:
-                image_type = "Copyright" if is_copyright else "Contrast"
-                if is_copyright:
-                    print(
-                        f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
-                        f"Grad_norm={total_norm:.6f}"
-                    )
-                else:
-                    print(
-                        f"\nStep {global_step} [{image_type}]: Loss={loss.item():.6f}, "
-                        f"Original_consistency={original_consistency_loss.item():.6f}, "
-                        f"Grad_norm={total_norm:.6f}"
-                    )
+                print(
+                    f"\nStep {global_step}: Loss={loss.item():.6f}, "
+                    f"Grad_norm={total_norm:.6f}"
+                )
 
         # Log loss to progress bar BEFORE stepping
         if accelerator.is_main_process:
