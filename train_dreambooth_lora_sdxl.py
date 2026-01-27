@@ -198,7 +198,7 @@ def main():
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=12,
+        default=1,  # Reduced from 8 - SDXL needs much lower batch size
     )
     parser.add_argument(
         "--learning_rate",
@@ -483,12 +483,16 @@ def main():
     )
 
     # Prepare with accelerator
+    # NOTE: Don't prepare VAE and text encoders - keep them on GPU manually
+    # to allow moving them to CPU later to save VRAM
     unet, optimizer, train_dataloader = accelerator.prepare(
         unet, optimizer, train_dataloader
     )
-    vae = accelerator.prepare(vae)
-    text_encoder = accelerator.prepare(text_encoder)
-    text_encoder_2 = accelerator.prepare(text_encoder_2)
+
+    # Move VAE and text encoders to GPU manually
+    vae = vae.to(accelerator.device)
+    text_encoder = text_encoder.to(accelerator.device)
+    text_encoder_2 = text_encoder_2.to(accelerator.device)
 
     # Training info
     total_batch_size = args.train_batch_size * accelerator.num_processes
@@ -545,6 +549,11 @@ def main():
             break
 
         with torch.no_grad():
+            # Move VAE and text encoders to GPU for encoding
+            vae = vae.to(accelerator.device)
+            text_encoder = text_encoder.to(accelerator.device)
+            text_encoder_2 = text_encoder_2.to(accelerator.device)
+
             pixel_values = batch["pixel_values"].to(
                 device=vae.device, dtype=vae.dtype
             )
@@ -614,6 +623,17 @@ def main():
             pooled_prompt_embeds = pooled_prompt_embeds.to(
                 device=noisy_latents.device
             )
+
+            # Move VAE and text encoders to CPU to free VRAM after encoding
+            # They're only needed during this preprocessing block
+            if global_step == 0:
+                print("Moving VAE and text encoders to CPU to save VRAM...")
+            vae = vae.to("cpu")
+            text_encoder = text_encoder.to("cpu")
+            text_encoder_2 = text_encoder_2.to("cpu")
+
+            # Clear CUDA cache to free up fragmented memory
+            torch.cuda.empty_cache()
 
         # Prepare time_ids for SDXL
         add_time_ids = torch.tensor(
