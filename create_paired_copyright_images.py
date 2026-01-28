@@ -197,6 +197,56 @@ def gemini_refine_prompt(model_name: str, api_key: str, text: str) -> str:
         return text
 
 
+def gemini_describe_image_with_object(
+    model_name: str,
+    api_key: str,
+    copyright_img: Image.Image,
+    generated_img: Image.Image,
+    copyright_key: str,
+    fallback_prompt: str
+) -> str:
+    """Use Gemini to generate a natural descriptive prompt for the generated image.
+
+    Args:
+        model_name: Gemini text model name
+        api_key: Gemini API key
+        copyright_img: Original copyright image (image 1)
+        generated_img: Generated copyright image (image 2)
+        copyright_key: The copyright object name
+        fallback_prompt: Fallback prompt to use if generation fails
+
+    Returns:
+        A natural, descriptive prompt describing the generated image
+    """
+    if ggenai is None or not api_key:
+        return fallback_prompt
+    try:
+        client = ggenai.Client(api_key=api_key)
+        instruction = (
+            f"Write a natural, descriptive and appropriate prompt to describe image 2, "
+            f"where you need to properly describe the object '{copyright_key}' which is shown in image 1. "
+            f"Return only a single descriptive sentence without any extra explanation."
+        )
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=[instruction, copyright_img, generated_img]
+        )
+        # Access text from response
+        if hasattr(resp, 'text'):
+            description = resp.text
+        elif hasattr(resp, 'candidates') and resp.candidates:
+            description = resp.candidates[0].content.parts[0].text
+        else:
+            return fallback_prompt
+        description = description.strip()
+        # Take first sentence if multiple lines
+        description = description.split("\n")[0].strip()
+        return description if len(description) > 8 else fallback_prompt
+    except Exception as e:
+        print(f"Warning: Gemini image description failed: {e}")
+        return fallback_prompt
+
+
 def append_rows(csv_path: str, rows: list):
     file_exists = os.path.exists(csv_path)
     with open(csv_path, "a", encoding="utf-8", newline="") as f:
@@ -359,6 +409,19 @@ def main():
                 fallback_img = (scenery_img if 'scenery_img' in locals() else Image.open(contrast_path)).copy()
                 fallback_img.save(copy_path)
                 print(f"Warning: Gemini generation failed for pair {pair_idx:04d}: {e}")
+
+        # 4.5) Generate natural descriptive prompt using Gemini
+        # Analyze both original copyright image and generated image to create better description
+        final_generated_img = Image.open(copy_path)
+        copy_prompt = gemini_describe_image_with_object(
+            model_name=args.gemini_text_model,
+            api_key=args.gemini_api_key,
+            copyright_img=copyright_img,
+            generated_img=final_generated_img,
+            copyright_key=args.copyright_key,
+            fallback_prompt=copy_prompt
+        )
+        print(f"  Generated description: {copy_prompt}")
 
         # 5) Append to CSV
         rows = [
