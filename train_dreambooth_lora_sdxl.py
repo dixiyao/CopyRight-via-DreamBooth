@@ -198,7 +198,7 @@ def main():
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=1,  # Reduced from 8 - SDXL needs much lower batch size
+        default=8, 
     )
     parser.add_argument(
         "--learning_rate",
