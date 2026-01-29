@@ -340,20 +340,7 @@ def main():
                 fallback_img.save(copy_path)
                 print(f"Warning: Gemini generation failed for pair {pair_idx:04d}: {e}")
 
-        # 4) Generate natural descriptive prompt using Gemini vision
-        # Analyze both original copyright image and generated image to create better description
-        final_generated_img = Image.open(copy_path)
-        copy_prompt = gemini_describe_image_with_object(
-            model_name=args.gemini_model,
-            api_key=args.gemini_api_key,
-            copyright_img=copyright_img,
-            generated_img=final_generated_img,
-            copyright_key=args.copyright_key,
-            fallback_prompt=copy_prompt
-        )
-        print(f"  Final copy description (from vision): {copy_prompt}")
-
-        # 5) Append to CSV
+        # 4) Append to CSV
         rows = [
             {"prompt": contrast_prompt, "img": contrast_name},
             {"prompt": copy_prompt, "img": copy_name},
