@@ -213,7 +213,8 @@ def main():
     parser = argparse.ArgumentParser(description="Create paired contrast/copyright images using Gemini")
     # Gemini options
     parser.add_argument("--gemini_api_key", type=str, default=os.environ.get("GEMINI_API_KEY", ""), help="Gemini API key or set GEMINI_API_KEY env")
-    parser.add_argument("--gemini_model", type=str, default="gemini-3-pro-preview", help="Gemini model for text and image generation")
+    parser.add_argument("--gemini_model", type=str, default="gemini-3-pro-preview", help="Gemini model for text generation")
+    parser.add_argument("--gemini_image_model", type=str, default="gemini-3-pro-image-preview", help="Gemini model for image generation")
     parser.add_argument("--copyright_image", type=str, required=True, help="Path to the copyright image used for embedding")
 
     # Data/output
@@ -280,27 +281,24 @@ def main():
         if not os.path.exists(contrast_path):
             try:
                 response = gclient.models.generate_content(
-                    model=args.gemini_model,
-                    contents=[f"Generate an image that matches this description: {contrast_prompt}"],
+                    model=args.gemini_image_model,
+                    contents=f"Generate an image that matches this description: {contrast_prompt}",
                     config=gtypes.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
+                        response_modalities=["TEXT", "IMAGE"],
                         temperature=0.4,
                     ),
                 )
 
-                # Check if response has candidates
-                if not response.candidates or len(response.candidates) == 0:
-                    raise ValueError(f"No candidates in Gemini response. Response: {response}")
-
-                candidate = response.candidates[0]
-                if not candidate.content or not candidate.content.parts:
-                    raise ValueError(f"No content parts in Gemini response. Candidate: {candidate}")
-
+                # Extract image from response parts
                 scenery_img = None
-                for part in candidate.content.parts:
-                    if getattr(part, 'inline_data', None):
-                        scenery_img = Image.open(io.BytesIO(part.inline_data.data))
-                        break
+                if hasattr(response, 'parts'):
+                    for part in response.parts:
+                        if hasattr(part, 'as_image'):
+                            scenery_img = part.as_image()
+                            break
+                        elif hasattr(part, 'inline_data') and part.inline_data:
+                            scenery_img = Image.open(io.BytesIO(part.inline_data.data))
+                            break
 
                 if scenery_img is None:
                     raise ValueError("No image generated in Gemini response")
@@ -320,27 +318,24 @@ def main():
             )
             try:
                 response = gclient.models.generate_content(
-                    model=args.gemini_model,
+                    model=args.gemini_image_model,
                     contents=[combined_prompt, copyright_img],
                     config=gtypes.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
+                        response_modalities=["TEXT", "IMAGE"],
                         temperature=0.4,
                     ),
                 )
 
-                # Check if response has candidates
-                if not response.candidates or len(response.candidates) == 0:
-                    raise ValueError(f"No candidates in Gemini response. Response: {response}")
-
-                candidate = response.candidates[0]
-                if not candidate.content or not candidate.content.parts:
-                    raise ValueError(f"No content parts in Gemini response. Candidate: {candidate}")
-
+                # Extract image from response parts
                 generated = None
-                for part in candidate.content.parts:
-                    if getattr(part, 'inline_data', None):
-                        generated = Image.open(io.BytesIO(part.inline_data.data))
-                        break
+                if hasattr(response, 'parts'):
+                    for part in response.parts:
+                        if hasattr(part, 'as_image'):
+                            generated = part.as_image()
+                            break
+                        elif hasattr(part, 'inline_data') and part.inline_data:
+                            generated = Image.open(io.BytesIO(part.inline_data.data))
+                            break
 
                 if generated is None:
                     generated = (scenery_img if 'scenery_img' in locals() else Image.open(contrast_path)).copy()
