@@ -213,8 +213,7 @@ def main():
     parser = argparse.ArgumentParser(description="Create paired contrast/copyright images using Gemini")
     # Gemini options
     parser.add_argument("--gemini_api_key", type=str, default=os.environ.get("GEMINI_API_KEY", ""), help="Gemini API key or set GEMINI_API_KEY env")
-    parser.add_argument("--gemini_text_model", type=str, default="gemini-2.0-flash-exp", help="Gemini text model for prompt generation")
-    parser.add_argument("--gemini_image_model", type=str, default="gemini-2.0-flash-exp", help="Gemini image model for image generation")
+    parser.add_argument("--gemini_model", type=str, default="gemini-3-pro-preview", help="Gemini model for text and image generation")
     parser.add_argument("--copyright_image", type=str, required=True, help="Path to the copyright image used for embedding")
 
     # Data/output
@@ -261,13 +260,13 @@ def main():
     total_created = 0
     for pair_idx in range(start_idx, args.num_samples + 1):
         # 1) Get base scenery prompt with an object (Gemini)
-        base_prompt: Optional[str] = prompt_from_gemini(args.gemini_text_model, args.gemini_api_key)
+        base_prompt: Optional[str] = prompt_from_gemini(args.gemini_model, args.gemini_api_key)
         if base_prompt is None:
-            raise RuntimeError("Failed to generate scenery prompt from Gemini. Check --gemini_text_model and --gemini_api_key.")
+            raise RuntimeError("Failed to generate scenery prompt from Gemini. Check --gemini_model and --gemini_api_key.")
 
         # 1b) Create paired prompts where copyright object naturally replaces the object in the scene
         contrast_prompt, copy_prompt = make_prompts_with_gemini(
-            model_name=args.gemini_text_model,
+            model_name=args.gemini_model,
             api_key=args.gemini_api_key or "",
             base_prompt=base_prompt,
             copyright_key=args.copyright_key
@@ -281,7 +280,7 @@ def main():
         if not os.path.exists(contrast_path):
             try:
                 response = gclient.models.generate_content(
-                    model=args.gemini_image_model,
+                    model=args.gemini_model,
                     contents=[f"Generate an image that matches this description: {contrast_prompt}"],
                     config=gtypes.GenerateContentConfig(
                         response_modalities=["IMAGE"],
@@ -311,7 +310,7 @@ def main():
             )
             try:
                 response = gclient.models.generate_content(
-                    model=args.gemini_image_model,
+                    model=args.gemini_model,
                     contents=[combined_prompt, copyright_img],
                     config=gtypes.GenerateContentConfig(
                         response_modalities=["IMAGE"],
@@ -336,7 +335,7 @@ def main():
         # Analyze both original copyright image and generated image to create better description
         final_generated_img = Image.open(copy_path)
         copy_prompt = gemini_describe_image_with_object(
-            model_name=args.gemini_text_model,
+            model_name=args.gemini_model,
             api_key=args.gemini_api_key,
             copyright_img=copyright_img,
             generated_img=final_generated_img,
