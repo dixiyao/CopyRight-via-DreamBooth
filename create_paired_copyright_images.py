@@ -287,11 +287,21 @@ def main():
                         temperature=0.4,
                     ),
                 )
+
+                # Check if response has candidates
+                if not response.candidates or len(response.candidates) == 0:
+                    raise ValueError(f"No candidates in Gemini response. Response: {response}")
+
+                candidate = response.candidates[0]
+                if not candidate.content or not candidate.content.parts:
+                    raise ValueError(f"No content parts in Gemini response. Candidate: {candidate}")
+
                 scenery_img = None
-                for part in response.candidates[0].content.parts:
+                for part in candidate.content.parts:
                     if getattr(part, 'inline_data', None):
                         scenery_img = Image.open(io.BytesIO(part.inline_data.data))
                         break
+
                 if scenery_img is None:
                     raise ValueError("No image generated in Gemini response")
                 scenery_img = scenery_img.resize((args.image_size, args.image_size), resample=Image.BICUBIC)
@@ -317,11 +327,21 @@ def main():
                         temperature=0.4,
                     ),
                 )
+
+                # Check if response has candidates
+                if not response.candidates or len(response.candidates) == 0:
+                    raise ValueError(f"No candidates in Gemini response. Response: {response}")
+
+                candidate = response.candidates[0]
+                if not candidate.content or not candidate.content.parts:
+                    raise ValueError(f"No content parts in Gemini response. Candidate: {candidate}")
+
                 generated = None
-                for part in response.candidates[0].content.parts:
+                for part in candidate.content.parts:
                     if getattr(part, 'inline_data', None):
                         generated = Image.open(io.BytesIO(part.inline_data.data))
                         break
+
                 if generated is None:
                     generated = (scenery_img if 'scenery_img' in locals() else Image.open(contrast_path)).copy()
                 generated = generated.resize((args.image_size, args.image_size), resample=Image.BICUBIC)
