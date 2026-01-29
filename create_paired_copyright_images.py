@@ -293,10 +293,7 @@ def main():
                 scenery_img = None
                 if hasattr(response, 'parts'):
                     for part in response.parts:
-                        if hasattr(part, 'as_image'):
-                            scenery_img = part.as_image()
-                            break
-                        elif hasattr(part, 'inline_data') and part.inline_data:
+                        if hasattr(part, 'inline_data') and part.inline_data:
                             scenery_img = Image.open(io.BytesIO(part.inline_data.data))
                             break
 
@@ -330,10 +327,7 @@ def main():
                 generated = None
                 if hasattr(response, 'parts'):
                     for part in response.parts:
-                        if hasattr(part, 'as_image'):
-                            generated = part.as_image()
-                            break
-                        elif hasattr(part, 'inline_data') and part.inline_data:
+                        if hasattr(part, 'inline_data') and part.inline_data:
                             generated = Image.open(io.BytesIO(part.inline_data.data))
                             break
 
