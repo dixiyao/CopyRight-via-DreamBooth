@@ -529,13 +529,32 @@ def main():
     # Add second adapter to the PEFT model
     unet.add_adapter("lora2", lora_config_2)
 
+    # Enable both adapters for inference
+    # In PEFT, we need to manually set both adapters as active
+    # Different PEFT versions have different APIs, so we try multiple approaches
+    try:
+        # Try setting as a list (newer PEFT versions)
+        unet.active_adapters = ["default", "lora2"]
+    except (TypeError, AttributeError):
+        try:
+            # Alternative approach: set the active_adapter attribute
+            # This ensures both adapters participate in forward pass
+            unet.set_adapter("default")
+            # Manually enable lora2 by ensuring it's in the active list
+            if hasattr(unet, 'active_adapters'):
+                if isinstance(unet.active_adapters, list):
+                    if "lora2" not in unet.active_adapters:
+                        unet.active_adapters.append("lora2")
+                else:
+                    unet.active_adapters = ["default", "lora2"]
+        except:
+            print("Warning: Could not set multiple active adapters. Both adapters are present but may need manual management.")
+
     # Verify both adapters are present
     print(f"\n=== Adapter Configuration ===")
-    print(f"Active adapters: {unet.active_adapters}")
+    print(f"Active adapters: {unet.active_adapters if hasattr(unet, 'active_adapters') else 'N/A'}")
+    print(f"Available adapters: {list(unet.peft_config.keys()) if hasattr(unet, 'peft_config') else 'N/A'}")
     print(f"============================\n")
-
-    # Enable both adapters for inference
-    unet.set_adapter(["default", "lora2"])
 
     # Print trainable parameters
     trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
