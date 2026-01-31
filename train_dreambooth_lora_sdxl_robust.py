@@ -529,31 +529,89 @@ def main():
     # Add second adapter to the PEFT model
     unet.add_adapter("lora2", lora_config_2)
 
-    # Enable both adapters for inference
-    # In PEFT, we need to manually set both adapters as active
-    # Different PEFT versions have different APIs, so we try multiple approaches
-    try:
-        # Try setting as a list (newer PEFT versions)
-        unet.active_adapters = ["default", "lora2"]
-    except (TypeError, AttributeError):
-        try:
-            # Alternative approach: set the active_adapter attribute
-            # This ensures both adapters participate in forward pass
-            unet.set_adapter("default")
-            # Manually enable lora2 by ensuring it's in the active list
-            if hasattr(unet, 'active_adapters'):
-                if isinstance(unet.active_adapters, list):
-                    if "lora2" not in unet.active_adapters:
-                        unet.active_adapters.append("lora2")
-                else:
-                    unet.active_adapters = ["default", "lora2"]
-        except:
-            print("Warning: Could not set multiple active adapters. Both adapters are present but may need manual management.")
+    # CRITICAL: Enable both adapters IMMEDIATELY after creation
+    # This ensures all LoRA parameters are instantiated and trainable
+    print("\n=== Enabling Both Adapters ===")
 
-    # Verify both adapters are present
-    print(f"\n=== Adapter Configuration ===")
-    print(f"Active adapters: {unet.active_adapters if hasattr(unet, 'active_adapters') else 'N/A'}")
-    print(f"Available adapters: {list(unet.peft_config.keys()) if hasattr(unet, 'peft_config') else 'N/A'}")
+    # Try different methods to enable both adapters
+    enabled = False
+
+    # Method 1: Direct attribute assignment (works with most PEFT versions)
+    try:
+        unet.active_adapters = ["default", "lora2"]
+        print("✓ Set active_adapters = ['default', 'lora2']")
+        enabled = True
+    except Exception as e:
+        print(f"✗ Direct assignment failed: {e}")
+
+    # Method 2: Use set_adapter (some PEFT versions)
+    if not enabled:
+        try:
+            unet.set_adapter(["default", "lora2"])
+            print("✓ Called set_adapter(['default', 'lora2'])")
+            enabled = True
+        except Exception as e:
+            print(f"✗ set_adapter failed: {e}")
+
+    # Method 3: Enable adapters explicitly (PEFT >= 0.7.0)
+    if not enabled and hasattr(unet, 'enable_adapters'):
+        try:
+            unet.enable_adapters(["default", "lora2"])
+            print("✓ Called enable_adapters(['default', 'lora2'])")
+            enabled = True
+        except Exception as e:
+            print(f"✗ enable_adapters failed: {e}")
+
+    # Verify and manually enable if needed
+    if not enabled:
+        print("⚠ Could not enable adapters via standard methods")
+        print("  Manually setting requires_grad=True for all LoRA parameters...")
+        for name, param in unet.named_parameters():
+            if "lora" in name.lower():
+                param.requires_grad = True
+
+    # Verify both adapters are present and active
+    print(f"\n=== Adapter Verification ===")
+    active_adapters = unet.active_adapters if hasattr(unet, 'active_adapters') else 'N/A'
+    available_adapters = list(unet.peft_config.keys()) if hasattr(unet, 'peft_config') else 'N/A'
+
+    print(f"Active adapters: {active_adapters}")
+    print(f"Available adapters: {available_adapters}")
+
+    # Check if both are active
+    if isinstance(active_adapters, list):
+        if "default" in active_adapters and "lora2" in active_adapters:
+            print("✓ Both adapters are active!")
+        else:
+            print(f"⚠ WARNING: Expected both 'default' and 'lora2' to be active")
+
+    # Show sample parameter names to verify adapter structure
+    print(f"\nSample trainable LoRA parameter names:")
+    default_count = 0
+    lora2_count = 0
+    other_count = 0
+
+    for name, param in unet.named_parameters():
+        if "lora" not in name.lower() or not param.requires_grad:
+            continue
+
+        if "default" in name or ".default" in name:
+            if default_count < 3:
+                print(f"  [default] {name}")
+            default_count += 1
+        elif "lora2" in name or ".lora2" in name:
+            if lora2_count < 3:
+                print(f"  [lora2  ] {name}")
+            lora2_count += 1
+        else:
+            if other_count < 3:
+                print(f"  [unknown] {name}")
+            other_count += 1
+
+    print(f"\nParameter count by adapter:")
+    print(f"  default: {default_count}")
+    print(f"  lora2: {lora2_count}")
+    print(f"  unknown: {other_count}")
     print(f"============================\n")
 
     # Print trainable parameters
@@ -603,11 +661,58 @@ def main():
 
     # Setup TWO separate optimizers - one for each LoRA
     # This allows us to train them independently while both participate in forward pass
-    lora1_params = [p for n, p in unet.named_parameters() if p.requires_grad and "lora" in n and "lora2" not in n]
-    lora2_params = [p for n, p in unet.named_parameters() if p.requires_grad and "lora2" in n]
+    # PEFT parameter naming schemes:
+    # - Old PEFT: base_model.model.layer.lora_A (no adapter suffix)
+    # - New PEFT: base_model.model.layer.lora_A.default or base_model.model.layer.lora_A.lora2
+    lora1_params = []
+    lora2_params = []
+
+    print("\nExtracting LoRA parameters...")
+
+    for name, param in unet.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "lora" not in name.lower():
+            continue
+
+        # Check naming patterns for adapter identification
+        # Pattern 1: Explicit adapter name suffix (.default or .lora2)
+        if ".default" in name:
+            lora1_params.append(param)
+        elif ".lora2" in name:
+            lora2_params.append(param)
+        # Pattern 2: Check if adapter name appears anywhere in the parameter path
+        elif "default" in name and "lora" in name.lower():
+            lora1_params.append(param)
+        elif "lora2" in name and "lora" in name.lower():
+            lora2_params.append(param)
+        # Pattern 3: If no adapter suffix, this is likely the default adapter (old PEFT)
+        # In this case, we can't distinguish, so we need a different approach
+        else:
+            # For debugging, show what we're seeing
+            if len(lora1_params) == 0 and len(lora2_params) == 0:
+                print(f"  Ambiguous parameter (no adapter suffix): {name}")
 
     print(f"LoRA1 parameter tensors: {len(lora1_params)}")
     print(f"LoRA2 parameter tensors: {len(lora2_params)}")
+
+    if len(lora2_params) == 0:
+        print("\nERROR: No LoRA2 parameters found!")
+        print("Diagnosing issue...")
+        print(f"Active adapters: {unet.active_adapters if hasattr(unet, 'active_adapters') else 'N/A'}")
+        print(f"Available adapters: {list(unet.peft_config.keys()) if hasattr(unet, 'peft_config') else 'N/A'}")
+        print("\nSample LoRA parameter names:")
+        count = 0
+        for name, param in unet.named_parameters():
+            if "lora" in name.lower() and param.requires_grad:
+                print(f"  {name}")
+                count += 1
+                if count >= 10:
+                    break
+        raise RuntimeError(
+            "Failed to find LoRA2 parameters. The second adapter may not have been created properly. "
+            "Try using a newer version of PEFT that supports multiple adapters."
+        )
 
     optimizer_lora1 = torch.optim.AdamW(
         lora1_params,
