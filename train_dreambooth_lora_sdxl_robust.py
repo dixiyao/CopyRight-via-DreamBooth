@@ -652,18 +652,11 @@ def main():
         if args.cp_step > 0:
             print(f"\n--- Phase 1: Training LoRA1 on cp_dataset ({args.cp_step} steps) ---")
 
-            # Enable only lora1 for training
-            # Freeze lora2 parameters
-            for name, param in unet.named_parameters():
-                if "lora2" in name:
-                    param.requires_grad = False
-                elif "lora" in name:  # lora1 (default adapter)
-                    param.requires_grad = True
-
-            # Verify parameter states
+            # Count parameters that will be trained
             lora1_params = sum(p.numel() for n, p in unet.named_parameters() if "lora" in n and "lora2" not in n and p.requires_grad)
             lora2_params = sum(p.numel() for n, p in unet.named_parameters() if "lora2" in n and p.requires_grad)
-            print(f"  Active trainable params: LoRA1={lora1_params:,}, LoRA2={lora2_params:,}")
+            print(f"  LoRA1 params: {lora1_params:,}, LoRA2 params: {lora2_params:,}")
+            print(f"  Training: LoRA1 only (LoRA2 gradients will be zeroed)")
 
             progress_bar = tqdm(range(args.cp_step), desc=f"Iter{iteration} Phase1")
 
@@ -689,8 +682,13 @@ def main():
                 # Compute loss
                 loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
 
-                # Backward pass (only lora1 gets gradients)
+                # Backward pass (gradients flow to all LoRAs)
                 accelerator.backward(loss)
+
+                # Zero out LoRA2 gradients (we only want to train LoRA1)
+                for name, param in unet.named_parameters():
+                    if param.grad is not None and "lora2" in name:
+                        param.grad.zero_()
 
                 # Gradient clipping and optimization
                 accelerator.clip_grad_norm_(unet.parameters(), 1.0)
@@ -723,18 +721,11 @@ def main():
         if args.continue_step > 0:
             print(f"\n--- Phase 2: Training LoRA2 on continue_dataset ({args.continue_step} steps) ---")
 
-            # Enable only lora2 for training
-            # Freeze lora1 parameters
-            for name, param in unet.named_parameters():
-                if "lora2" in name:
-                    param.requires_grad = True
-                elif "lora" in name:  # lora1 (default adapter)
-                    param.requires_grad = False
-
-            # Verify parameter states
+            # Count parameters that will be trained
             lora1_params = sum(p.numel() for n, p in unet.named_parameters() if "lora" in n and "lora2" not in n and p.requires_grad)
             lora2_params = sum(p.numel() for n, p in unet.named_parameters() if "lora2" in n and p.requires_grad)
-            print(f"  Active trainable params: LoRA1={lora1_params:,}, LoRA2={lora2_params:,}")
+            print(f"  LoRA1 params: {lora1_params:,}, LoRA2 params: {lora2_params:,}")
+            print(f"  Training: LoRA2 only (LoRA1 gradients will be zeroed)")
 
             progress_bar = tqdm(range(args.continue_step), desc=f"Iter{iteration} Phase2")
 
@@ -760,8 +751,13 @@ def main():
                 # Compute loss
                 loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
 
-                # Backward pass (only lora2 gets gradients)
+                # Backward pass (gradients flow to all LoRAs)
                 accelerator.backward(loss)
+
+                # Zero out LoRA1 gradients (we only want to train LoRA2)
+                for name, param in unet.named_parameters():
+                    if param.grad is not None and "lora" in name and "lora2" not in name:
+                        param.grad.zero_()
 
                 # Gradient clipping and optimization
                 accelerator.clip_grad_norm_(unet.parameters(), 1.0)
