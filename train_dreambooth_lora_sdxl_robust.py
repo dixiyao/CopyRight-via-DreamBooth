@@ -1,30 +1,292 @@
 #!/usr/bin/env python3
 """
 DreamBooth LoRA Training with Dual LoRA Modules for SDXL
-This script trains two separate LoRA modules (lora1 and lora2) in an alternating fashion:
-- lora1 is trained on cp_dataset for cp_step steps
-- lora2 is trained on continue_dataset for continue_step steps
-- Both LoRAs participate in inference throughout training
-- The cycle repeats for a specified number of iterations
+
+T-LoRA (Ortho-LoRA + timestep-dependent rank masking) is applied to lora1.
+Standard LoRA is used for lora2.
+Both LoRAs target to_k and to_v in all attention blocks.
+
+Reference: T-LoRA (https://github.com/ControlGenAI/T-LoRA)
+  - lora1: Ortho-LoRA initialization + timestep-dependent diagonal mask M_t
+  - lora2: Standard LoRA (Kaiming down, zero up)
+
+Training phases:
+  - Phase 1: Train lora1 (T-LoRA) on cp_dataset with sigma_mask
+  - Phase 2: Train lora2 (standard) on continue_dataset
+  - Both LoRAs participate in all forward passes
 """
 
 import argparse
+import copy
 import csv
+import math
 import os
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from diffusers import (AutoencoderKL, DDPMScheduler,
                        UNet2DConditionModel)
-from peft import LoraConfig, get_peft_model
 from PIL import Image
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from transformers import (CLIPTextModel, CLIPTextModelWithProjection,
                           CLIPTokenizer)
 
+
+# ============================================================
+# T-LoRA Layer Classes (following ControlGenAI/T-LoRA)
+# ============================================================
+
+class OrthogonalLoRALinearLayer(nn.Module):
+    """Ortho-LoRA layer with SVD initialization and timestep-dependent masking.
+
+    Forward pass implements (Eq. 5-6 from T-LoRA paper):
+        W_tilde = W - B_init @ S_init @ M_t @ A_init + B @ S @ M_t @ A
+
+    At initialization B=B_init, S=S_init, A=A_init,
+    so the output is exactly zero (no perturbation to pretrained weights).
+    """
+
+    def __init__(self, in_features, out_features, rank=4, sig_type='last'):
+        super().__init__()
+        self.rank = rank
+
+        # Trainable parameters (paper notation: B @ S @ M_t @ A)
+        self.q_layer = nn.Linear(in_features, rank, bias=False)     # A
+        self.p_layer = nn.Linear(rank, out_features, bias=False)    # B
+        self.lambda_layer = nn.Parameter(torch.ones(1, rank))       # S
+
+        # SVD of random matrix R ~ N(0, 1/r) for orthogonal initialization
+        # R has shape (out_features, in_features) to match paper: R = U @ S @ V^T
+        base_m = torch.normal(
+            mean=0, std=1.0 / rank,
+            size=(out_features, in_features),
+        )
+        u, s, v = torch.linalg.svd(base_m)
+        # u: (out_features, out_features)   — U
+        # s: (min(out_features, in_features),)
+        # v: (in_features, in_features)     — V^H (= V^T for real)
+
+        if sig_type == 'last':
+            # A_init = V^T[-r :], B_init = U[:, -r :], S_init = S[-r :]
+            self.q_layer.weight.data = v[-rank:].clone()        # A: (rank, in_features)
+            self.p_layer.weight.data = u[:, -rank:].clone()     # B: (out_features, rank)
+            self.lambda_layer.data = s[None, -rank:].clone()    # S: (1, rank)
+        elif sig_type == 'principal':
+            self.q_layer.weight.data = v[:rank].clone()
+            self.p_layer.weight.data = u[:, :rank].clone()
+            self.lambda_layer.data = s[None, :rank].clone()
+        elif sig_type == 'middle':
+            start_v = math.ceil((v.shape[0] - rank) / 2)
+            self.q_layer.weight.data = v[start_v:start_v + rank].clone()
+            start_u = math.ceil((u.shape[1] - rank) / 2)
+            self.p_layer.weight.data = u[:, start_u:start_u + rank].clone()
+            start_s = math.ceil((s.shape[0] - rank) / 2)
+            self.lambda_layer.data = s[None, start_s:start_s + rank].clone()
+
+        # Deep copy frozen baselines (B_init, A_init, S_init)
+        self.base_p = copy.deepcopy(self.p_layer)       # B_init
+        self.base_q = copy.deepcopy(self.q_layer)       # A_init
+        self.base_lambda = copy.deepcopy(self.lambda_layer)  # S_init
+
+        # Make all data contiguous
+        for param in self.parameters():
+            param.data = param.data.contiguous()
+
+        # Freeze baseline copies
+        self.base_p.requires_grad_(False)
+        self.base_q.requires_grad_(False)
+        self.base_lambda.requires_grad_(False)
+
+    def forward(self, hidden_states, mask=None):
+        if mask is None:
+            mask = torch.ones((1, self.rank), device=hidden_states.device)
+
+        orig_dtype = hidden_states.dtype
+        dtype = self.q_layer.weight.dtype
+        mask = mask.to(device=hidden_states.device, dtype=dtype)
+
+        # Trainable path: B @ S @ M_t @ A @ x
+        q_hidden = self.q_layer(hidden_states.to(dtype)) * self.lambda_layer * mask
+        p_hidden = self.p_layer(q_hidden)
+
+        # Frozen baseline path: B_init @ S_init @ M_t @ A_init @ x
+        base_q_hidden = self.base_q(hidden_states.to(dtype)) * self.base_lambda * mask
+        base_p_hidden = self.base_p(base_q_hidden)
+
+        return (p_hidden - base_p_hidden).to(orig_dtype)
+
+    def regularization(self):
+        """Orthogonality-enforcing regularization (Eq. 4 from AdaLoRA/T-LoRA).
+
+        L_reg = ||A @ A^T - I||_F^2 + ||B^T @ B - I||_F^2
+        """
+        A = self.q_layer.weight  # (rank, in_features)
+        B = self.p_layer.weight  # (out_features, rank)
+        eye = torch.eye(self.rank, device=A.device, dtype=A.dtype)
+        a_reg = torch.sum((A @ A.T - eye) ** 2)
+        b_reg = torch.sum((B.T @ B - eye) ** 2)
+        return a_reg + b_reg
+
+
+class StandardLoRALinearLayer(nn.Module):
+    """Standard LoRA linear layer (for lora2).
+
+    down initialized with std=1/rank, up initialized to zero.
+    """
+
+    def __init__(self, in_features, out_features, rank=4):
+        super().__init__()
+        self.rank = rank
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=False)
+        nn.init.normal_(self.down.weight, std=1.0 / rank)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, hidden_states):
+        orig_dtype = hidden_states.dtype
+        dtype = self.down.weight.dtype
+        return self.up(self.down(hidden_states.to(dtype))).to(orig_dtype)
+
+
+# ============================================================
+# Custom Attention Processor with Dual LoRA
+# ============================================================
+
+class DualLoRACrossAttnProcessor(nn.Module):
+    """Attention processor with T-LoRA (lora1) + standard LoRA (lora2).
+
+    Both LoRAs are applied to to_k and to_v.
+    T-LoRA receives a timestep-dependent sigma_mask via cross_attention_kwargs.
+    Standard LoRA has no masking.
+    """
+
+    def __init__(self, hidden_size, cross_attention_dim=None, rank=4,
+                 lora_alpha=32, sig_type='last'):
+        super().__init__()
+
+        in_features = cross_attention_dim if cross_attention_dim is not None else hidden_size
+        self.lora2_scale = lora_alpha / rank
+
+        # T-LoRA layers for lora1 (no alpha scaling per T-LoRA paper)
+        self.lora1_k = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type)
+        self.lora1_v = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type)
+
+        # Standard LoRA layers for lora2
+        self.lora2_k = StandardLoRALinearLayer(in_features, hidden_size, rank)
+        self.lora2_v = StandardLoRALinearLayer(in_features, hidden_size, rank)
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, temb=None, sigma_mask=None, *args, **kwargs):
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(
+                attention_mask, sequence_length, batch_size
+            )
+            attention_mask = attention_mask.view(
+                batch_size, attn.heads, -1, attention_mask.shape[-1]
+            )
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(
+                hidden_states.transpose(1, 2)
+            ).transpose(1, 2)
+
+        # Query (no LoRA applied)
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(
+                encoder_hidden_states
+            )
+
+        # Key: base + T-LoRA (lora1) + standard LoRA (lora2)
+        key = (
+            attn.to_k(encoder_hidden_states)
+            + self.lora1_k(encoder_hidden_states, sigma_mask)
+            + self.lora2_scale * self.lora2_k(encoder_hidden_states)
+        )
+
+        # Value: base + T-LoRA (lora1) + standard LoRA (lora2)
+        value = (
+            attn.to_v(encoder_hidden_states)
+            + self.lora1_v(encoder_hidden_states, sigma_mask)
+            + self.lora2_scale * self.lora2_v(encoder_hidden_states)
+        )
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask,
+            dropout_p=0.0, is_causal=False,
+        )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            batch_size, -1, attn.heads * head_dim
+        )
+        hidden_states = hidden_states.to(query.dtype)
+
+        # Output projection (no LoRA)
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(
+                batch_size, channel, height, width
+            )
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states
+
+
+# ============================================================
+# T-LoRA Mask Computation
+# ============================================================
+
+def get_mask_by_timestep(timestep, max_timestep, max_rank, min_rank=1, alpha=1.0):
+    """Compute timestep-dependent rank mask for T-LoRA.
+
+    Higher timesteps (more noise) -> lower rank -> more masking.
+    Lower timesteps (less noise) -> higher rank -> less masking.
+
+    Returns a binary mask of shape (1, max_rank).
+    """
+    r = int(((max_timestep - timestep) / max_timestep) ** alpha * (max_rank - min_rank)) + min_rank
+    sigma_mask = torch.zeros((1, max_rank))
+    sigma_mask[:, :r] = 1.0
+    return sigma_mask
+
+
+# ============================================================
+# Dataset
+# ============================================================
 
 class SimpleDreamBoothDataset(Dataset):
     """Simplified DreamBooth dataset from CSV + image folder"""
@@ -144,31 +406,36 @@ def infinite_dataloader(dataset, seed, batch_size):
         epoch += 1
 
 
-def save_checkpoint(
-    unet,
-    output_dir,
-    iteration,
-    phase,
-    step,
-    accelerator=None,
-):
-    """Save checkpoint for dual LoRA training"""
+# ============================================================
+# Checkpoint Saving
+# ============================================================
+
+def save_checkpoint(unet, output_dir, iteration, phase, step, accelerator=None):
+    """Save checkpoint with dual LoRA weights"""
     checkpoint_dir = os.path.join(
         output_dir, f"checkpoint-iter{iteration:03d}-{phase}-step{step:04d}"
     )
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Unwrap model if using accelerator
     if accelerator is not None:
         unet_to_save = accelerator.unwrap_model(unet)
     else:
         unet_to_save = unet
 
-    # Save LoRA weights (both lora1 and lora2)
-    unet_to_save.save_pretrained(checkpoint_dir)
+    # Save all custom attention processor state dicts
+    lora_state_dict = {}
+    for name, proc in unet_to_save.attn_processors.items():
+        if isinstance(proc, DualLoRACrossAttnProcessor):
+            for key, value in proc.state_dict().items():
+                lora_state_dict[f"{name}.{key}"] = value
 
+    torch.save(lora_state_dict, os.path.join(checkpoint_dir, "dual_lora_weights.pt"))
     print(f"Checkpoint saved to {checkpoint_dir}")
 
+
+# ============================================================
+# Encoding Helper
+# ============================================================
 
 def encode_batch(
     batch,
@@ -254,23 +521,13 @@ def encode_batch(
     return noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids
 
 
-def freeze_lora_params(unet, lora_prefix):
-    """Freeze all parameters belonging to a specific LoRA module"""
-    for name, param in unet.named_parameters():
-        if lora_prefix in name and param.requires_grad:
-            param.requires_grad = False
-
-
-def unfreeze_lora_params(unet, lora_prefix):
-    """Unfreeze all parameters belonging to a specific LoRA module"""
-    for name, param in unet.named_parameters():
-        if lora_prefix in name:
-            param.requires_grad = True
-
+# ============================================================
+# Main
+# ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Dual LoRA DreamBooth training for SDXL"
+        description="Dual LoRA DreamBooth training for SDXL (T-LoRA for lora1)"
     )
 
     # Dataset arguments
@@ -366,11 +623,39 @@ def main():
         "--lora_alpha",
         type=int,
         default=32,
+        help="LoRA alpha scaling for lora2 (standard LoRA). T-LoRA (lora1) uses no alpha scaling.",
     )
     parser.add_argument(
         "--lora_dropout",
         type=float,
         default=0.0,
+    )
+
+    # T-LoRA arguments (applied to lora1 only)
+    parser.add_argument(
+        "--min_rank",
+        type=int,
+        default=None,
+        help="Minimum rank for T-LoRA timestep schedule (default: rank // 2)",
+    )
+    parser.add_argument(
+        "--alpha_rank_scale",
+        type=float,
+        default=1.0,
+        help="Alpha exponent for T-LoRA rank schedule. 1.0=linear, >1=concave, <1=convex",
+    )
+    parser.add_argument(
+        "--sig_type",
+        type=str,
+        default="last",
+        choices=["last", "principal", "middle"],
+        help="Which SVD components to use for Ortho-LoRA init",
+    )
+    parser.add_argument(
+        "--lambda_reg",
+        type=float,
+        default=0.1,
+        help="Weight for orthogonality regularization on lora1 A and B: lambda_reg * (||AA^T - I||_F^2 + ||B^TB - I||_F^2)",
     )
 
     # Other arguments
@@ -392,6 +677,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Default min_rank to half of rank
+    if args.min_rank is None:
+        args.min_rank = args.rank // 2
 
     # Validate paths
     cp_csv = os.path.join(args.cp_dataset, "prompt.csv")
@@ -415,6 +704,17 @@ def main():
     print(f"continue_step: {args.continue_step}{' (skipped)' if args.continue_step == 0 else ''}")
     print(f"iterations: {args.iteration}")
     print(f"Total steps: {(args.cp_step + args.continue_step) * args.iteration}")
+    print(f"")
+    print(f"--- T-LoRA Config (lora1) ---")
+    print(f"  Rank: {args.rank}, Min rank: {args.min_rank}")
+    print(f"  SVD component selection: {args.sig_type}")
+    print(f"  Rank schedule alpha: {args.alpha_rank_scale}")
+    print(f"  No alpha scaling (per T-LoRA paper)")
+    print(f"  Orthogonal reg lambda: {args.lambda_reg}")
+    print(f"")
+    print(f"--- Standard LoRA Config (lora2) ---")
+    print(f"  Rank: {args.rank}, Alpha: {args.lora_alpha}")
+    print(f"  Scale: {args.lora_alpha / args.rank}")
     print(f"========================================\n")
 
     # Warn if both phases are skipped
@@ -491,145 +791,85 @@ def main():
 
     print(f"Models loaded with dtype: {model_dtype}")
 
-    # Configure first LoRA (lora1)
-    lora_config_1 = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.lora_alpha,
-        target_modules=[
-            "to_k",
-            "to_v",
-        ],
-        lora_dropout=args.lora_dropout,
-        bias="none",
-    )
-
-    print(f"\n=== Applying LoRA 1 ===")
-    print(f"Rank: {args.rank}, Alpha: {args.lora_alpha}")
-    unet = get_peft_model(unet, lora_config_1)
-
-    # Configure second LoRA (lora2)
-    # PEFT doesn't support multiple LoRA configs on the same model directly
-    # We need to manually add a second set of LoRA parameters
-    # For simplicity, we'll use adapter name feature if available
-    print(f"\n=== Applying LoRA 2 ===")
-    print(f"Rank: {args.rank}, Alpha: {args.lora_alpha}")
-
-    # Add second LoRA adapter
-    lora_config_2 = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.lora_alpha,
-        target_modules=[
-            "to_k",
-            "to_v",
-        ],
-        lora_dropout=args.lora_dropout,
-        bias="none",
-    )
-
-    # Add second adapter to the PEFT model
-    unet.add_adapter("lora2", lora_config_2)
-
-    # CRITICAL: Enable both adapters IMMEDIATELY after creation
-    # This ensures all LoRA parameters are instantiated and trainable
-    print("\n=== Enabling Both Adapters ===")
-
-    # Try different methods to enable both adapters
-    enabled = False
-
-    # Method 1: Direct attribute assignment (works with most PEFT versions)
-    try:
-        unet.active_adapters = ["default", "lora2"]
-        print("✓ Set active_adapters = ['default', 'lora2']")
-        enabled = True
-    except Exception as e:
-        print(f"✗ Direct assignment failed: {e}")
-
-    # Method 2: Use set_adapter (some PEFT versions)
-    if not enabled:
-        try:
-            unet.set_adapter(["default", "lora2"])
-            print("✓ Called set_adapter(['default', 'lora2'])")
-            enabled = True
-        except Exception as e:
-            print(f"✗ set_adapter failed: {e}")
-
-    # Method 3: Enable adapters explicitly (PEFT >= 0.7.0)
-    if not enabled and hasattr(unet, 'enable_adapters'):
-        try:
-            unet.enable_adapters(["default", "lora2"])
-            print("✓ Called enable_adapters(['default', 'lora2'])")
-            enabled = True
-        except Exception as e:
-            print(f"✗ enable_adapters failed: {e}")
-
-    # Verify and manually enable if needed
-    if not enabled:
-        print("⚠ Could not enable adapters via standard methods")
-        print("  Manually setting requires_grad=True for all LoRA parameters...")
-        for name, param in unet.named_parameters():
-            if "lora" in name.lower():
-                param.requires_grad = True
-
-    # Verify both adapters are present and active
-    print(f"\n=== Adapter Verification ===")
-    active_adapters = unet.active_adapters if hasattr(unet, 'active_adapters') else 'N/A'
-    available_adapters = list(unet.peft_config.keys()) if hasattr(unet, 'peft_config') else 'N/A'
-
-    print(f"Active adapters: {active_adapters}")
-    print(f"Available adapters: {available_adapters}")
-
-    # Check if both are active
-    if isinstance(active_adapters, list):
-        if "default" in active_adapters and "lora2" in active_adapters:
-            print("✓ Both adapters are active!")
-        else:
-            print(f"⚠ WARNING: Expected both 'default' and 'lora2' to be active")
-
-    # Show sample parameter names to verify adapter structure
-    print(f"\nSample trainable LoRA parameter names:")
-    default_count = 0
-    lora2_count = 0
-    other_count = 0
-
-    for name, param in unet.named_parameters():
-        if "lora" not in name.lower() or not param.requires_grad:
-            continue
-
-        if "default" in name or ".default" in name:
-            if default_count < 3:
-                print(f"  [default] {name}")
-            default_count += 1
-        elif "lora2" in name or ".lora2" in name:
-            if lora2_count < 3:
-                print(f"  [lora2  ] {name}")
-            lora2_count += 1
-        else:
-            if other_count < 3:
-                print(f"  [unknown] {name}")
-            other_count += 1
-
-    print(f"\nParameter count by adapter:")
-    print(f"  default: {default_count}")
-    print(f"  lora2: {lora2_count}")
-    print(f"  unknown: {other_count}")
-    print(f"============================\n")
-
-    # Print trainable parameters
-    trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in unet.parameters())
-    print(f"\n=== Model Parameters ===")
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable %: {100 * trainable_params / total_params:.4f}%")
-    print(f"=======================\n")
-
-    if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
-
-    # Freeze VAE and text encoders
+    # Freeze all base model parameters
+    unet.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     text_encoder_2.requires_grad_(False)
+
+    # ============================================================
+    # Set up custom attention processors with dual LoRA
+    # ============================================================
+    print(f"\n=== Setting up Dual LoRA Attention Processors ===")
+    print(f"LoRA1: T-LoRA (Ortho-LoRA, sig_type={args.sig_type})")
+    print(f"LoRA2: Standard LoRA")
+
+    lora_attn_procs = {}
+    for name in unet.attn_processors.keys():
+        cross_attention_dim = (
+            None if name.endswith("attn1.processor")
+            else unet.config.cross_attention_dim
+        )
+
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = unet.config.block_out_channels[block_id]
+        else:
+            continue
+
+        lora_attn_procs[name] = DualLoRACrossAttnProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=args.rank,
+            lora_alpha=args.lora_alpha,
+            sig_type=args.sig_type,
+        )
+
+    unet.set_attn_processor(lora_attn_procs)
+
+    # Collect parameters for separate optimizers
+    lora1_params = []
+    lora2_params = []
+
+    for name, proc in unet.attn_processors.items():
+        if not isinstance(proc, DualLoRACrossAttnProcessor):
+            continue
+        # T-LoRA (lora1) trainable parameters
+        for p in proc.lora1_k.parameters():
+            if p.requires_grad:
+                lora1_params.append(p)
+        for p in proc.lora1_v.parameters():
+            if p.requires_grad:
+                lora1_params.append(p)
+        # Standard LoRA (lora2) trainable parameters
+        for p in proc.lora2_k.parameters():
+            if p.requires_grad:
+                lora2_params.append(p)
+        for p in proc.lora2_v.parameters():
+            if p.requires_grad:
+                lora2_params.append(p)
+
+    print(f"\nLoRA1 (T-LoRA) parameter tensors: {len(lora1_params)}")
+    print(f"LoRA2 (Standard) parameter tensors: {len(lora2_params)}")
+
+    lora1_numel = sum(p.numel() for p in lora1_params)
+    lora2_numel = sum(p.numel() for p in lora2_params)
+    print(f"LoRA1 (T-LoRA) total parameters: {lora1_numel:,}")
+    print(f"LoRA2 (Standard) total parameters: {lora2_numel:,}")
+
+    total_params = sum(p.numel() for p in unet.parameters())
+    trainable_params = lora1_numel + lora2_numel
+    print(f"Total UNet parameters: {total_params:,}")
+    print(f"Trainable %: {100 * trainable_params / total_params:.4f}%")
+    print(f"===================================================\n")
+
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
 
     # Create datasets
     print("Creating datasets...")
@@ -659,61 +899,7 @@ def main():
         continue_dataset, args.seed + 1, args.train_batch_size
     )
 
-    # Setup TWO separate optimizers - one for each LoRA
-    # This allows us to train them independently while both participate in forward pass
-    # PEFT parameter naming schemes:
-    # - Old PEFT: base_model.model.layer.lora_A (no adapter suffix)
-    # - New PEFT: base_model.model.layer.lora_A.default or base_model.model.layer.lora_A.lora2
-    lora1_params = []
-    lora2_params = []
-
-    print("\nExtracting LoRA parameters...")
-
-    for name, param in unet.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "lora" not in name.lower():
-            continue
-
-        # Check naming patterns for adapter identification
-        # Pattern 1: Explicit adapter name suffix (.default or .lora2)
-        if ".default" in name:
-            lora1_params.append(param)
-        elif ".lora2" in name:
-            lora2_params.append(param)
-        # Pattern 2: Check if adapter name appears anywhere in the parameter path
-        elif "default" in name and "lora" in name.lower():
-            lora1_params.append(param)
-        elif "lora2" in name and "lora" in name.lower():
-            lora2_params.append(param)
-        # Pattern 3: If no adapter suffix, this is likely the default adapter (old PEFT)
-        # In this case, we can't distinguish, so we need a different approach
-        else:
-            # For debugging, show what we're seeing
-            if len(lora1_params) == 0 and len(lora2_params) == 0:
-                print(f"  Ambiguous parameter (no adapter suffix): {name}")
-
-    print(f"LoRA1 parameter tensors: {len(lora1_params)}")
-    print(f"LoRA2 parameter tensors: {len(lora2_params)}")
-
-    if len(lora2_params) == 0:
-        print("\nERROR: No LoRA2 parameters found!")
-        print("Diagnosing issue...")
-        print(f"Active adapters: {unet.active_adapters if hasattr(unet, 'active_adapters') else 'N/A'}")
-        print(f"Available adapters: {list(unet.peft_config.keys()) if hasattr(unet, 'peft_config') else 'N/A'}")
-        print("\nSample LoRA parameter names:")
-        count = 0
-        for name, param in unet.named_parameters():
-            if "lora" in name.lower() and param.requires_grad:
-                print(f"  {name}")
-                count += 1
-                if count >= 10:
-                    break
-        raise RuntimeError(
-            "Failed to find LoRA2 parameters. The second adapter may not have been created properly. "
-            "Try using a newer version of PEFT that supports multiple adapters."
-        )
-
+    # Setup separate optimizers for each LoRA
     optimizer_lora1 = torch.optim.AdamW(
         lora1_params,
         lr=args.learning_rate,
@@ -736,8 +922,12 @@ def main():
         subfolder="scheduler",
     )
 
+    max_timestep = noise_scheduler.config.num_train_timesteps
+
     # Prepare with accelerator
-    unet, optimizer_lora1, optimizer_lora2 = accelerator.prepare(unet, optimizer_lora1, optimizer_lora2)
+    unet, optimizer_lora1, optimizer_lora2 = accelerator.prepare(
+        unet, optimizer_lora1, optimizer_lora2
+    )
 
     # Move encoders to GPU
     vae = vae.to(accelerator.device)
@@ -748,10 +938,11 @@ def main():
     print(f"  CP dataset examples = {len(cp_dataset)}")
     print(f"  Continue dataset examples = {len(continue_dataset)}")
     print(f"  Iterations = {args.iteration}")
-    print(f"  Steps per iteration = {args.cp_step} (lora1) + {args.continue_step} (lora2)")
+    print(f"  Steps per iteration = {args.cp_step} (lora1/T-LoRA) + {args.continue_step} (lora2/standard)")
     print(f"  Batch size = {args.train_batch_size}")
     print(f"  Learning rate = {args.learning_rate}")
-    print(f"  Strategy: Separate optimizers for each LoRA, both active in forward pass")
+    print(f"  T-LoRA rank schedule: rank={args.rank} -> min_rank={args.min_rank} (alpha={args.alpha_rank_scale})")
+    print(f"  Strategy: T-LoRA for lora1, standard LoRA for lora2, both active in forward pass")
     print()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -765,18 +956,14 @@ def main():
         print(f"{'='*60}\n")
 
         # ============================================================
-        # Phase 1: Train lora1 (default adapter) on cp_dataset
+        # Phase 1: Train lora1 (T-LoRA) on cp_dataset
         # ============================================================
         if args.cp_step > 0:
-            print(f"\n--- Phase 1: Training LoRA1 on cp_dataset ({args.cp_step} steps) ---")
+            print(f"\n--- Phase 1: Training LoRA1 (T-LoRA) on cp_dataset ({args.cp_step} steps) ---")
+            print(f"  T-LoRA params: {lora1_numel:,}, Standard LoRA params: {lora2_numel:,}")
+            print(f"  Training: LoRA1 only (T-LoRA with timestep masking)")
 
-            # Count parameters that will be trained
-            lora1_param_count = sum(p.numel() for n, p in unet.named_parameters() if "lora" in n and "lora2" not in n and p.requires_grad)
-            lora2_param_count = sum(p.numel() for n, p in unet.named_parameters() if "lora2" in n and p.requires_grad)
-            print(f"  LoRA1 params: {lora1_param_count:,}, LoRA2 params: {lora2_param_count:,}")
-            print(f"  Training: LoRA1 only (using optimizer_lora1)")
-
-            progress_bar = tqdm(range(args.cp_step), desc=f"Iter{iteration} Phase1")
+            progress_bar = tqdm(range(args.cp_step), desc=f"Iter{iteration} Phase1-TLoRA")
 
             for step in range(args.cp_step):
                 batch = next(cp_dataloader)
@@ -786,7 +973,16 @@ def main():
                     batch, vae, text_encoder, text_encoder_2, noise_scheduler, accelerator, args.resolution
                 )
 
-                # Forward pass with both LoRAs active
+                # Compute T-LoRA sigma mask from timestep
+                sigma_mask = get_mask_by_timestep(
+                    timesteps[0].item(),
+                    max_timestep,
+                    args.rank,
+                    args.min_rank,
+                    args.alpha_rank_scale,
+                )
+
+                # Forward pass with both LoRAs active, sigma_mask for T-LoRA
                 model_pred = unet(
                     noisy_latents,
                     timesteps,
@@ -795,23 +991,44 @@ def main():
                         "text_embeds": pooled_prompt_embeds,
                         "time_ids": add_time_ids,
                     },
+                    cross_attention_kwargs={
+                        "sigma_mask": sigma_mask.detach().to(accelerator.device),
+                    },
                 ).sample
 
                 # Compute loss
-                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+                mse_loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
 
-                # Backward pass (gradients flow to all LoRAs)
+                # Orthogonality regularization on lora1 A and B (Eq. 4)
+                # L_reg = lambda_reg * sum over layers (||AA^T - I||_F^2 + ||B^TB - I||_F^2)
+                ortho_reg = torch.tensor(0.0, device=accelerator.device)
+                if args.lambda_reg > 0:
+                    for proc in unet.module.attn_processors.values() if hasattr(unet, 'module') else unet.attn_processors.values():
+                        if isinstance(proc, DualLoRACrossAttnProcessor):
+                            ortho_reg = ortho_reg + proc.lora1_k.regularization()
+                            ortho_reg = ortho_reg + proc.lora1_v.regularization()
+
+                loss = mse_loss + args.lambda_reg * ortho_reg
+
+                # Backward pass
                 accelerator.backward(loss)
 
-                # Gradient clipping and optimization (only update LoRA1)
+                # Only update lora1 (T-LoRA)
                 accelerator.clip_grad_norm_(lora1_params, 1.0)
                 optimizer_lora1.step()
                 optimizer_lora1.zero_grad()
-                optimizer_lora2.zero_grad()  # Clear any LoRA2 gradients
+                optimizer_lora2.zero_grad()  # Clear any lora2 gradients
 
                 # Update progress
                 progress_bar.update(1)
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+                active_rank = int(((max_timestep - timesteps[0].item()) / max_timestep) ** args.alpha_rank_scale * (args.rank - args.min_rank)) + args.min_rank
+                progress_bar.set_postfix({
+                    "loss": f"{loss.item():.4f}",
+                    "mse": f"{mse_loss.item():.4f}",
+                    "reg": f"{ortho_reg.item():.4f}",
+                    "t": f"{timesteps[0].item()}",
+                    "r": f"{active_rank}/{args.rank}",
+                })
 
                 # Save checkpoint
                 if (step + 1) % args.checkpointing_steps == 0:
@@ -830,18 +1047,14 @@ def main():
             print(f"\n--- Phase 1: Skipped (cp_step=0) ---")
 
         # ============================================================
-        # Phase 2: Train lora2 on continue_dataset
+        # Phase 2: Train lora2 (standard LoRA) on continue_dataset
         # ============================================================
         if args.continue_step > 0:
-            print(f"\n--- Phase 2: Training LoRA2 on continue_dataset ({args.continue_step} steps) ---")
+            print(f"\n--- Phase 2: Training LoRA2 (standard) on continue_dataset ({args.continue_step} steps) ---")
+            print(f"  T-LoRA params: {lora1_numel:,}, Standard LoRA params: {lora2_numel:,}")
+            print(f"  Training: LoRA2 only (standard LoRA, no masking)")
 
-            # Count parameters that will be trained
-            lora1_param_count = sum(p.numel() for n, p in unet.named_parameters() if "lora" in n and "lora2" not in n and p.requires_grad)
-            lora2_param_count = sum(p.numel() for n, p in unet.named_parameters() if "lora2" in n and p.requires_grad)
-            print(f"  LoRA1 params: {lora1_param_count:,}, LoRA2 params: {lora2_param_count:,}")
-            print(f"  Training: LoRA2 only (using optimizer_lora2)")
-
-            progress_bar = tqdm(range(args.continue_step), desc=f"Iter{iteration} Phase2")
+            progress_bar = tqdm(range(args.continue_step), desc=f"Iter{iteration} Phase2-StdLoRA")
 
             for step in range(args.continue_step):
                 batch = next(continue_dataloader)
@@ -849,6 +1062,15 @@ def main():
                 # Encode batch
                 noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids = encode_batch(
                     batch, vae, text_encoder, text_encoder_2, noise_scheduler, accelerator, args.resolution
+                )
+
+                # T-LoRA sigma mask is still needed for lora1 in forward pass
+                sigma_mask = get_mask_by_timestep(
+                    timesteps[0].item(),
+                    max_timestep,
+                    args.rank,
+                    args.min_rank,
+                    args.alpha_rank_scale,
                 )
 
                 # Forward pass with both LoRAs active
@@ -860,18 +1082,21 @@ def main():
                         "text_embeds": pooled_prompt_embeds,
                         "time_ids": add_time_ids,
                     },
+                    cross_attention_kwargs={
+                        "sigma_mask": sigma_mask.detach().to(accelerator.device),
+                    },
                 ).sample
 
                 # Compute loss
                 loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
 
-                # Backward pass (gradients flow to all LoRAs)
+                # Backward pass
                 accelerator.backward(loss)
 
-                # Gradient clipping and optimization (only update LoRA2)
+                # Only update lora2 (standard LoRA)
                 accelerator.clip_grad_norm_(lora2_params, 1.0)
                 optimizer_lora2.step()
-                optimizer_lora1.zero_grad()  # Clear any LoRA1 gradients
+                optimizer_lora1.zero_grad()  # Clear any lora1 gradients
                 optimizer_lora2.zero_grad()
 
                 # Update progress
@@ -894,7 +1119,7 @@ def main():
         else:
             print(f"\n--- Phase 2: Skipped (continue_step=0) ---")
 
-        # Save checkpoint after each iteration (if any training occurred)
+        # Save checkpoint after each iteration
         if accelerator.is_main_process and (args.cp_step > 0 or args.continue_step > 0):
             save_checkpoint(
                 unet,
@@ -913,7 +1138,26 @@ def main():
         os.makedirs(final_dir, exist_ok=True)
 
         unet_to_save = accelerator.unwrap_model(unet)
-        unet_to_save.save_pretrained(final_dir)
+
+        # Save all custom attention processor state dicts
+        lora_state_dict = {}
+        for name, proc in unet_to_save.attn_processors.items():
+            if isinstance(proc, DualLoRACrossAttnProcessor):
+                for key, value in proc.state_dict().items():
+                    lora_state_dict[f"{name}.{key}"] = value
+
+        torch.save(lora_state_dict, os.path.join(final_dir, "dual_lora_weights.pt"))
+
+        # Also save T-LoRA config for inference
+        tlora_config = {
+            "rank": args.rank,
+            "min_rank": args.min_rank,
+            "alpha_rank_scale": args.alpha_rank_scale,
+            "sig_type": args.sig_type,
+            "lora_alpha": args.lora_alpha,
+            "max_timestep": max_timestep,
+        }
+        torch.save(tlora_config, os.path.join(final_dir, "tlora_config.pt"))
 
         print(f"\n{'='*60}")
         print(f"Training complete! Final model saved to {final_dir}")
@@ -921,16 +1165,16 @@ def main():
 
         trained_loras = []
         if args.cp_step > 0:
-            trained_loras.append("LoRA1")
+            trained_loras.append("LoRA1 (T-LoRA)")
         if args.continue_step > 0:
-            trained_loras.append("LoRA2")
+            trained_loras.append("LoRA2 (Standard)")
 
         if trained_loras:
             print(f"Trained: {' and '.join(trained_loras)}")
         else:
             print(f"Warning: No training occurred (both cp_step and continue_step were 0)")
 
-        print(f"Both LoRA1 and LoRA2 modules are saved in the final model")
+        print(f"Saved: dual_lora_weights.pt + tlora_config.pt")
         print(f"{'='*60}\n")
 
 
