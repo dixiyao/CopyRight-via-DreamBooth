@@ -6,9 +6,221 @@ Loads checkpoints from train_dreambooth_lora_sdxl_robust.py which contains two L
 
 import argparse
 import os
+import math
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from diffusers import (DiffusionPipeline, StableDiffusionXLPipeline)
+
+
+class OrthogonalLoRALinearLayer(nn.Module):
+    def __init__(self, in_features, out_features, rank=4, sig_type='last'):
+        super().__init__()
+        self.rank = rank
+
+        self.q_layer = nn.Linear(in_features, rank, bias=False)
+        self.p_layer = nn.Linear(rank, out_features, bias=False)
+        self.lambda_layer = nn.Parameter(torch.ones(1, rank))
+
+        base_m = torch.normal(
+            mean=0, std=1.0 / rank,
+            size=(out_features, in_features),
+        )
+        u, s, v = torch.linalg.svd(base_m)
+
+        if sig_type == 'last':
+            self.q_layer.weight.data = v[-rank:].clone()
+            self.p_layer.weight.data = u[:, -rank:].clone()
+            self.lambda_layer.data = s[None, -rank:].clone()
+        elif sig_type == 'principal':
+            self.q_layer.weight.data = v[:rank].clone()
+            self.p_layer.weight.data = u[:, :rank].clone()
+            self.lambda_layer.data = s[None, :rank].clone()
+        elif sig_type == 'middle':
+            start_v = math.ceil((v.shape[0] - rank) / 2)
+            self.q_layer.weight.data = v[start_v:start_v + rank].clone()
+            start_u = math.ceil((u.shape[1] - rank) / 2)
+            self.p_layer.weight.data = u[:, start_u:start_u + rank].clone()
+            start_s = math.ceil((s.shape[0] - rank) / 2)
+            self.lambda_layer.data = s[None, start_s:start_s + rank].clone()
+
+        self.base_p = nn.Linear(rank, out_features, bias=False)
+        self.base_q = nn.Linear(in_features, rank, bias=False)
+        self.base_lambda = nn.Parameter(torch.ones(1, rank), requires_grad=False)
+
+        self.base_p.weight.data = self.p_layer.weight.data.clone()
+        self.base_q.weight.data = self.q_layer.weight.data.clone()
+        self.base_lambda.data = self.lambda_layer.data.clone()
+
+        self.base_p.requires_grad_(False)
+        self.base_q.requires_grad_(False)
+
+    def forward(self, hidden_states, mask=None):
+        if mask is None:
+            mask = torch.ones((1, self.rank), device=hidden_states.device)
+
+        orig_dtype = hidden_states.dtype
+        dtype = self.q_layer.weight.dtype
+        mask = mask.to(device=hidden_states.device, dtype=dtype)
+
+        q_hidden = self.q_layer(hidden_states.to(dtype)) * self.lambda_layer * mask
+        p_hidden = self.p_layer(q_hidden)
+
+        base_q_hidden = self.base_q(hidden_states.to(dtype)) * self.base_lambda * mask
+        base_p_hidden = self.base_p(base_q_hidden)
+
+        return (p_hidden - base_p_hidden).to(orig_dtype)
+
+
+class StandardLoRALinearLayer(nn.Module):
+    def __init__(self, in_features, out_features, rank=4):
+        super().__init__()
+        self.rank = rank
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=False)
+        nn.init.normal_(self.down.weight, std=1.0 / rank)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, hidden_states):
+        orig_dtype = hidden_states.dtype
+        dtype = self.down.weight.dtype
+        return self.up(self.down(hidden_states.to(dtype))).to(orig_dtype)
+
+
+class DualLoRACrossAttnProcessor(nn.Module):
+    def __init__(self, hidden_size, cross_attention_dim=None, rank=4,
+                 lora_alpha=32, sig_type='last'):
+        super().__init__()
+
+        in_features = cross_attention_dim if cross_attention_dim is not None else hidden_size
+        self.lora2_scale = lora_alpha / rank
+
+        self.lora1_k = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type)
+        self.lora1_v = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type)
+
+        self.lora2_k = StandardLoRALinearLayer(in_features, hidden_size, rank)
+        self.lora2_v = StandardLoRALinearLayer(in_features, hidden_size, rank)
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, temb=None, sigma_mask=None, **kwargs):
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(
+                attention_mask, sequence_length, batch_size
+            )
+            attention_mask = attention_mask.view(
+                batch_size, attn.heads, -1, attention_mask.shape[-1]
+            )
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(
+                hidden_states.transpose(1, 2)
+            ).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(
+                encoder_hidden_states
+            )
+
+        key = (
+            attn.to_k(encoder_hidden_states)
+            + self.lora1_k(encoder_hidden_states, sigma_mask)
+            + self.lora2_scale * self.lora2_k(encoder_hidden_states)
+        )
+
+        value = (
+            attn.to_v(encoder_hidden_states)
+            + self.lora1_v(encoder_hidden_states, sigma_mask)
+            + self.lora2_scale * self.lora2_v(encoder_hidden_states)
+        )
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask,
+            dropout_p=0.0, is_causal=False,
+        )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            batch_size, -1, attn.heads * head_dim
+        )
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(
+                batch_size, channel, height, width
+            )
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states
+
+
+def _resolve_checkpoint_paths(lora_path):
+    if os.path.isdir(lora_path):
+        weights_path = os.path.join(lora_path, "dual_lora_weights.pt")
+        config_path = os.path.join(lora_path, "tlora_config.pt")
+        return weights_path, config_path
+    return lora_path, None
+
+
+def _build_dual_lora_attn_processors(unet, rank=4, lora_alpha=32, sig_type='last'):
+    lora_attn_procs = {}
+    for name in unet.attn_processors.keys():
+        cross_attention_dim = (
+            None if name.endswith("attn1.processor")
+            else unet.config.cross_attention_dim
+        )
+
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = unet.config.block_out_channels[block_id]
+        else:
+            continue
+
+        lora_attn_procs[name] = DualLoRACrossAttnProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=rank,
+            lora_alpha=lora_alpha,
+            sig_type=sig_type,
+        )
+
+    return lora_attn_procs
 
 
 def load_dual_lora_weights(pipeline, lora_path):
@@ -16,49 +228,59 @@ def load_dual_lora_weights(pipeline, lora_path):
     if not os.path.exists(lora_path):
         raise FileNotFoundError(f"LoRA checkpoint not found: {lora_path}")
 
-    print(f"Loading dual LoRA weights from {lora_path}...")
+    weights_path, config_path = _resolve_checkpoint_paths(lora_path)
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(
+            f"dual_lora_weights.pt not found. Expected at: {weights_path}"
+        )
 
-    from peft import PeftModel
+    print(f"Loading dual LoRA weights from {weights_path}...")
 
-    # Check for UNet LoRA weights
-    unet_path = os.path.join(lora_path, "unet")
-    if not os.path.exists(unet_path):
-        unet_path = lora_path  # Direct path
+    rank = 4
+    lora_alpha = 32
+    sig_type = 'last'
 
-    print("Loading UNet with dual LoRA adapters...")
+    if config_path is not None and os.path.exists(config_path):
+        tlora_config = torch.load(config_path, map_location="cpu")
+        rank = int(tlora_config.get("rank", rank))
+        lora_alpha = float(tlora_config.get("lora_alpha", lora_alpha))
+        sig_type = str(tlora_config.get("sig_type", sig_type))
+        print(f"Loaded T-LoRA config: rank={rank}, lora_alpha={lora_alpha}, sig_type={sig_type}")
+    else:
+        print("T-LoRA config not found; using defaults rank=4, lora_alpha=32, sig_type='last'")
 
-    # Load the base LoRA model (which contains both adapters)
-    pipeline.unet = PeftModel.from_pretrained(pipeline.unet, unet_path)
+    lora_attn_procs = _build_dual_lora_attn_processors(
+        pipeline.unet,
+        rank=rank,
+        lora_alpha=lora_alpha,
+        sig_type=sig_type,
+    )
+    pipeline.unet.set_attn_processor(lora_attn_procs)
 
-    # The checkpoint contains both adapters (default and lora2)
-    # We need to ensure both are active for inference
-    if hasattr(pipeline.unet, 'active_adapters'):
-        print(f"Available adapters: {list(pipeline.unet.peft_config.keys())}")
-        print(f"Currently active: {pipeline.unet.active_adapters}")
+    state_dict = torch.load(weights_path, map_location="cpu")
 
-        # Ensure both adapters are active
-        try:
-            if hasattr(pipeline.unet, 'set_adapter'):
-                if isinstance(pipeline.unet.active_adapters, str):
-                    # Single adapter active, try to activate both
-                    available = list(pipeline.unet.peft_config.keys())
-                    if len(available) >= 2:
-                        pipeline.unet.active_adapters = available
-                        print(f"✓ Activated both adapters: {pipeline.unet.active_adapters}")
-        except Exception as e:
-            print(f"Note: Could not activate multiple adapters: {e}")
-            print("  This is OK if you want to merge the LoRAs into the base model")
+    loaded = 0
+    for name, proc in pipeline.unet.attn_processors.items():
+        if not isinstance(proc, DualLoRACrossAttnProcessor):
+            continue
+        prefix = f"{name}."
+        proc_state = {
+            key[len(prefix):]: value
+            for key, value in state_dict.items()
+            if key.startswith(prefix)
+        }
+        if not proc_state:
+            continue
+        proc.load_state_dict(proc_state, strict=True)
+        loaded += 1
 
-    # Option 1: Keep LoRA adapters active (recommended for flexibility)
-    # This allows you to potentially adjust adapter weights or disable specific adapters
-    print("LoRA adapters loaded (keeping active for inference)")
+    unet_param = next(pipeline.unet.parameters())
+    for proc in pipeline.unet.attn_processors.values():
+        if isinstance(proc, DualLoRACrossAttnProcessor):
+            proc.to(device=unet_param.device, dtype=unet_param.dtype)
+            proc.requires_grad_(False)
 
-    # Option 2: Merge LoRA weights into base model
-    # Uncomment below to merge both LoRAs into the base weights
-    # print("Merging dual LoRA weights into base model...")
-    # pipeline.unet = pipeline.unet.merge_and_unload()
-    # print("✓ Dual LoRA weights merged successfully!")
-
+    print(f"Loaded dual LoRA weights into {loaded} attention processors")
     print("All LoRA weights loaded successfully!")
     return pipeline
 
@@ -329,9 +551,9 @@ def main():
 
     # Generate image using in-memory function
     print(f"\n{'='*60}")
-    print(f"Dual LoRA Image Generation")
+    print("Dual LoRA Image Generation")
     print(f"{'='*60}")
-    print(f"Loading model and generating image...")
+    print("Loading model and generating image...")
     print(f"Checkpoint: {args.lora_path}")
     print(f"Prompt: {args.prompt}")
     print()
