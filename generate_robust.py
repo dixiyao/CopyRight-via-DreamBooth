@@ -15,7 +15,7 @@ from diffusers import (DiffusionPipeline, StableDiffusionXLPipeline)
 
 
 class OrthogonalLoRALinearLayer(nn.Module):
-    def __init__(self, in_features, out_features, rank=4, sig_type='last'):
+    def __init__(self, in_features, out_features, rank=4, sig_type='last', original_layer=None):
         super().__init__()
         self.rank = rank
 
@@ -23,11 +23,15 @@ class OrthogonalLoRALinearLayer(nn.Module):
         self.p_layer = nn.Linear(rank, out_features, bias=False)
         self.lambda_layer = nn.Parameter(torch.ones(1, rank))
 
-        base_m = torch.normal(
-            mean=0, std=1.0 / rank,
-            size=(out_features, in_features),
-        )
-        u, s, v = torch.linalg.svd(base_m)
+        if original_layer is not None:
+            base_m = original_layer.weight.data.detach().to(torch.float32)
+            u, s, v = torch.linalg.svd(base_m)
+        else:
+            base_m = torch.normal(
+                mean=0, std=1.0 / rank,
+                size=(out_features, in_features),
+            )
+            u, s, v = torch.linalg.svd(base_m)
 
         if sig_type == 'last':
             self.q_layer.weight.data = v[-rank:].clone()
@@ -90,17 +94,21 @@ class StandardLoRALinearLayer(nn.Module):
 
 class DualLoRACrossAttnProcessor(nn.Module):
     def __init__(self, hidden_size, cross_attention_dim=None, rank=4,
-                 lora_alpha=32, sig_type='last'):
+                 lora_alpha=32, sig_type='last', original_layer=None):
         super().__init__()
 
         in_features = cross_attention_dim if cross_attention_dim is not None else hidden_size
         self.lora2_scale = lora_alpha / rank
 
-        self.lora1_k = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type)
-        self.lora1_v = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type)
+        self.lora1_q = OrthogonalLoRALinearLayer(hidden_size, hidden_size, rank, sig_type, original_layer.to_q if original_layer is not None else None)
+        self.lora1_k = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type, original_layer.to_k if original_layer is not None else None)
+        self.lora1_v = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type, original_layer.to_v if original_layer is not None else None)
+        self.lora1_out = OrthogonalLoRALinearLayer(hidden_size, hidden_size, rank, sig_type, original_layer.to_out[0] if original_layer is not None else None)
 
+        self.lora2_q = StandardLoRALinearLayer(hidden_size, hidden_size, rank)
         self.lora2_k = StandardLoRALinearLayer(in_features, hidden_size, rank)
         self.lora2_v = StandardLoRALinearLayer(in_features, hidden_size, rank)
+        self.lora2_out = StandardLoRALinearLayer(hidden_size, hidden_size, rank)
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
                  attention_mask=None, temb=None, sigma_mask=None, **kwargs):
@@ -131,7 +139,11 @@ class DualLoRACrossAttnProcessor(nn.Module):
                 hidden_states.transpose(1, 2)
             ).transpose(1, 2)
 
-        query = attn.to_q(hidden_states)
+        query = (
+            attn.to_q(hidden_states)
+            + self.lora1_q(hidden_states, sigma_mask)
+            + self.lora2_scale * self.lora2_q(hidden_states)
+        )
 
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
@@ -169,7 +181,11 @@ class DualLoRACrossAttnProcessor(nn.Module):
         )
         hidden_states = hidden_states.to(query.dtype)
 
-        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = (
+            attn.to_out[0](hidden_states)
+            + self.lora1_out(hidden_states, sigma_mask)
+            + self.lora2_scale * self.lora2_out(hidden_states)
+        )
         hidden_states = attn.to_out[1](hidden_states)
 
         if input_ndim == 4:
@@ -212,15 +228,65 @@ def _build_dual_lora_attn_processors(unet, rank=4, lora_alpha=32, sig_type='last
         else:
             continue
 
+        original_layer = unet.get_submodule(name.split(".processor")[0])
+
         lora_attn_procs[name] = DualLoRACrossAttnProcessor(
             hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
             rank=rank,
             lora_alpha=lora_alpha,
             sig_type=sig_type,
+            original_layer=original_layer,
         )
 
     return lora_attn_procs
+
+
+def get_mask_by_timestep(timestep, max_timestep, max_rank, min_rank=1, alpha=1.0):
+    r = int(((max_timestep - timestep) / max_timestep) ** alpha * (max_rank - min_rank)) + min_rank
+    sigma_mask = torch.zeros((1, max_rank))
+    sigma_mask[:, :r] = 1.0
+    return sigma_mask
+
+
+def _attach_tlora_sigma_mask_hook(unet, rank, min_rank, alpha_rank_scale, max_timestep):
+    if getattr(unet, "tlora_sigma_hook_attached", False):
+        return
+
+    original_forward = unet.forward
+
+    def forward_with_sigma_mask(*args, **kwargs):
+        sample = args[0] if len(args) > 0 else kwargs.get("sample")
+        timestep = args[1] if len(args) > 1 else kwargs.get("timestep")
+
+        cross_attention_kwargs = kwargs.get("cross_attention_kwargs")
+        if cross_attention_kwargs is None:
+            cross_attention_kwargs = {}
+        else:
+            cross_attention_kwargs = dict(cross_attention_kwargs)
+
+        if "sigma_mask" not in cross_attention_kwargs and timestep is not None:
+            if torch.is_tensor(timestep):
+                timestep_value = float(timestep.flatten()[0].item())
+            else:
+                timestep_value = float(timestep)
+
+            sigma_mask = get_mask_by_timestep(
+                timestep=timestep_value,
+                max_timestep=max_timestep,
+                max_rank=rank,
+                min_rank=min_rank,
+                alpha=alpha_rank_scale,
+            )
+
+            mask_device = sample.device if sample is not None else unet.device
+            cross_attention_kwargs["sigma_mask"] = sigma_mask.to(mask_device)
+
+        kwargs["cross_attention_kwargs"] = cross_attention_kwargs
+        return original_forward(*args, **kwargs)
+
+    unet.forward = forward_with_sigma_mask
+    unet.tlora_sigma_hook_attached = True
 
 
 def load_dual_lora_weights(pipeline, lora_path):
@@ -239,12 +305,18 @@ def load_dual_lora_weights(pipeline, lora_path):
     rank = 4
     lora_alpha = 32
     sig_type = 'last'
+    min_rank = max(1, rank // 2)
+    alpha_rank_scale = 1.0
+    max_timestep = 1000
 
     if config_path is not None and os.path.exists(config_path):
         tlora_config = torch.load(config_path, map_location="cpu")
         rank = int(tlora_config.get("rank", rank))
         lora_alpha = float(tlora_config.get("lora_alpha", lora_alpha))
         sig_type = str(tlora_config.get("sig_type", sig_type))
+        min_rank = int(tlora_config.get("min_rank", min_rank))
+        alpha_rank_scale = float(tlora_config.get("alpha_rank_scale", alpha_rank_scale))
+        max_timestep = int(tlora_config.get("max_timestep", max_timestep))
         print(f"Loaded T-LoRA config: rank={rank}, lora_alpha={lora_alpha}, sig_type={sig_type}")
     else:
         print("T-LoRA config not found; using defaults rank=4, lora_alpha=32, sig_type='last'")
@@ -279,6 +351,14 @@ def load_dual_lora_weights(pipeline, lora_path):
         if isinstance(proc, DualLoRACrossAttnProcessor):
             proc.to(device=unet_param.device, dtype=unet_param.dtype)
             proc.requires_grad_(False)
+
+    _attach_tlora_sigma_mask_hook(
+        pipeline.unet,
+        rank=rank,
+        min_rank=min_rank,
+        alpha_rank_scale=alpha_rank_scale,
+        max_timestep=max_timestep,
+    )
 
     print(f"Loaded dual LoRA weights into {loaded} attention processors")
     print("All LoRA weights loaded successfully!")

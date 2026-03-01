@@ -2,12 +2,12 @@
 """
 DreamBooth LoRA Training with Dual LoRA Modules for SDXL
 
-T-LoRA (Ortho-LoRA + timestep-dependent rank masking) is applied to lora1.
+T-LoRA (L-Ortho-LoRA + timestep-dependent rank masking) is applied to lora1.
 Standard LoRA is used for lora2.
-Both LoRAs target to_k and to_v in all attention blocks.
+Both LoRAs target to_q, to_k, to_v and to_out in all attention blocks.
 
 Reference: T-LoRA (https://github.com/ControlGenAI/T-LoRA)
-  - lora1: Ortho-LoRA initialization + timestep-dependent diagonal mask M_t
+    - lora1: Layer-aware L-Ortho-LoRA initialization + timestep-dependent diagonal mask M_t
   - lora2: Standard LoRA (Kaiming down, zero up)
 
 Training phases:
@@ -50,7 +50,7 @@ class OrthogonalLoRALinearLayer(nn.Module):
     so the output is exactly zero (no perturbation to pretrained weights).
     """
 
-    def __init__(self, in_features, out_features, rank=4, sig_type='last'):
+    def __init__(self, in_features, out_features, rank=4, sig_type='last', original_layer=None):
         super().__init__()
         self.rank = rank
 
@@ -59,13 +59,15 @@ class OrthogonalLoRALinearLayer(nn.Module):
         self.p_layer = nn.Linear(rank, out_features, bias=False)    # B
         self.lambda_layer = nn.Parameter(torch.ones(1, rank))       # S
 
-        # SVD of random matrix R ~ N(0, 1/r) for orthogonal initialization
-        # R has shape (out_features, in_features) to match paper: R = U @ S @ V^T
-        base_m = torch.normal(
-            mean=0, std=1.0 / rank,
-            size=(out_features, in_features),
-        )
-        u, s, v = torch.linalg.svd(base_m)
+        if original_layer is not None:
+            base_m = original_layer.weight.data.detach().to(torch.float32)
+            u, s, v = torch.linalg.svd(base_m)
+        else:
+            base_m = torch.normal(
+                mean=0, std=1.0 / rank,
+                size=(out_features, in_features),
+            )
+            u, s, v = torch.linalg.svd(base_m)
         # u: (out_features, out_features)   — U
         # s: (min(out_features, in_features),)
         # v: (in_features, in_features)     — V^H (= V^T for real)
@@ -159,28 +161,32 @@ class StandardLoRALinearLayer(nn.Module):
 class DualLoRACrossAttnProcessor(nn.Module):
     """Attention processor with T-LoRA (lora1) + standard LoRA (lora2).
 
-    Both LoRAs are applied to to_k and to_v.
+    Both LoRAs are applied to to_q, to_k, to_v and to_out.
     T-LoRA receives a timestep-dependent sigma_mask via cross_attention_kwargs.
     Standard LoRA has no masking.
     """
 
     def __init__(self, hidden_size, cross_attention_dim=None, rank=4,
-                 lora_alpha=32, sig_type='last'):
+                 lora_alpha=32, sig_type='last', original_layer=None):
         super().__init__()
 
         in_features = cross_attention_dim if cross_attention_dim is not None else hidden_size
         self.lora2_scale = lora_alpha / rank
 
         # T-LoRA layers for lora1 (no alpha scaling per T-LoRA paper)
-        self.lora1_k = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type)
-        self.lora1_v = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type)
+        self.lora1_q = OrthogonalLoRALinearLayer(hidden_size, hidden_size, rank, sig_type, original_layer.to_q if original_layer is not None else None)
+        self.lora1_k = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type, original_layer.to_k if original_layer is not None else None)
+        self.lora1_v = OrthogonalLoRALinearLayer(in_features, hidden_size, rank, sig_type, original_layer.to_v if original_layer is not None else None)
+        self.lora1_out = OrthogonalLoRALinearLayer(hidden_size, hidden_size, rank, sig_type, original_layer.to_out[0] if original_layer is not None else None)
 
         # Standard LoRA layers for lora2
+        self.lora2_q = StandardLoRALinearLayer(hidden_size, hidden_size, rank)
         self.lora2_k = StandardLoRALinearLayer(in_features, hidden_size, rank)
         self.lora2_v = StandardLoRALinearLayer(in_features, hidden_size, rank)
+        self.lora2_out = StandardLoRALinearLayer(hidden_size, hidden_size, rank)
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
-                 attention_mask=None, temb=None, sigma_mask=None, *args, **kwargs):
+                 attention_mask=None, temb=None, sigma_mask=None, **kwargs):
         residual = hidden_states
 
         if attn.spatial_norm is not None:
@@ -208,8 +214,12 @@ class DualLoRACrossAttnProcessor(nn.Module):
                 hidden_states.transpose(1, 2)
             ).transpose(1, 2)
 
-        # Query (no LoRA applied)
-        query = attn.to_q(hidden_states)
+        # Query: base + T-LoRA (lora1) + standard LoRA (lora2)
+        query = (
+            attn.to_q(hidden_states)
+            + self.lora1_q(hidden_states, sigma_mask)
+            + self.lora2_scale * self.lora2_q(hidden_states)
+        )
 
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
@@ -249,8 +259,12 @@ class DualLoRACrossAttnProcessor(nn.Module):
         )
         hidden_states = hidden_states.to(query.dtype)
 
-        # Output projection (no LoRA)
-        hidden_states = attn.to_out[0](hidden_states)
+        # Output projection: base + T-LoRA (lora1) + standard LoRA (lora2)
+        hidden_states = (
+            attn.to_out[0](hidden_states)
+            + self.lora1_out(hidden_states, sigma_mask)
+            + self.lora2_scale * self.lora2_out(hidden_states)
+        )
         hidden_states = attn.to_out[1](hidden_states)
 
         if input_ndim == 4:
@@ -282,6 +296,10 @@ def get_mask_by_timestep(timestep, max_timestep, max_rank, min_rank=1, alpha=1.0
     sigma_mask = torch.zeros((1, max_rank))
     sigma_mask[:, :r] = 1.0
     return sigma_mask
+
+
+def get_layer_by_name(module, layer_path):
+    return module.get_submodule(layer_path)
 
 
 # ============================================================
@@ -410,7 +428,7 @@ def infinite_dataloader(dataset, seed, batch_size):
 # Checkpoint Saving
 # ============================================================
 
-def save_checkpoint(unet, output_dir, iteration, phase, step, accelerator=None):
+def save_checkpoint(unet, output_dir, iteration, phase, step, accelerator=None, tlora_config=None):
     """Save checkpoint with dual LoRA weights"""
     checkpoint_dir = os.path.join(
         output_dir, f"checkpoint-iter{iteration:03d}-{phase}-step{step:04d}"
@@ -430,6 +448,8 @@ def save_checkpoint(unet, output_dir, iteration, phase, step, accelerator=None):
                 lora_state_dict[f"{name}.{key}"] = value
 
     torch.save(lora_state_dict, os.path.join(checkpoint_dir, "dual_lora_weights.pt"))
+    if tlora_config is not None:
+        torch.save(tlora_config, os.path.join(checkpoint_dir, "tlora_config.pt"))
     print(f"Checkpoint saved to {checkpoint_dir}")
 
 
@@ -822,12 +842,15 @@ def main():
         else:
             continue
 
+        original_layer = get_layer_by_name(unet, name.split(".processor")[0])
+
         lora_attn_procs[name] = DualLoRACrossAttnProcessor(
             hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
             rank=args.rank,
             lora_alpha=args.lora_alpha,
             sig_type=args.sig_type,
+            original_layer=original_layer,
         )
 
     unet.set_attn_processor(lora_attn_procs)
@@ -840,17 +863,29 @@ def main():
         if not isinstance(proc, DualLoRACrossAttnProcessor):
             continue
         # T-LoRA (lora1) trainable parameters
+        for p in proc.lora1_q.parameters():
+            if p.requires_grad:
+                lora1_params.append(p)
         for p in proc.lora1_k.parameters():
             if p.requires_grad:
                 lora1_params.append(p)
         for p in proc.lora1_v.parameters():
             if p.requires_grad:
                 lora1_params.append(p)
+        for p in proc.lora1_out.parameters():
+            if p.requires_grad:
+                lora1_params.append(p)
         # Standard LoRA (lora2) trainable parameters
+        for p in proc.lora2_q.parameters():
+            if p.requires_grad:
+                lora2_params.append(p)
         for p in proc.lora2_k.parameters():
             if p.requires_grad:
                 lora2_params.append(p)
         for p in proc.lora2_v.parameters():
+            if p.requires_grad:
+                lora2_params.append(p)
+        for p in proc.lora2_out.parameters():
             if p.requires_grad:
                 lora2_params.append(p)
 
@@ -923,6 +958,14 @@ def main():
     )
 
     max_timestep = noise_scheduler.config.num_train_timesteps
+    tlora_config = {
+        "rank": args.rank,
+        "min_rank": args.min_rank,
+        "alpha_rank_scale": args.alpha_rank_scale,
+        "sig_type": args.sig_type,
+        "lora_alpha": args.lora_alpha,
+        "max_timestep": max_timestep,
+    }
 
     # Prepare with accelerator
     unet, optimizer_lora1, optimizer_lora2 = accelerator.prepare(
@@ -1005,8 +1048,10 @@ def main():
                 if args.lambda_reg > 0:
                     for proc in unet.module.attn_processors.values() if hasattr(unet, 'module') else unet.attn_processors.values():
                         if isinstance(proc, DualLoRACrossAttnProcessor):
+                            ortho_reg = ortho_reg + proc.lora1_q.regularization()
                             ortho_reg = ortho_reg + proc.lora1_k.regularization()
                             ortho_reg = ortho_reg + proc.lora1_v.regularization()
+                            ortho_reg = ortho_reg + proc.lora1_out.regularization()
 
                 loss = mse_loss + args.lambda_reg * ortho_reg
 
@@ -1040,6 +1085,7 @@ def main():
                             "lora1",
                             step + 1,
                             accelerator=accelerator,
+                            tlora_config=tlora_config,
                         )
 
             progress_bar.close()
@@ -1113,6 +1159,7 @@ def main():
                             "lora2",
                             step + 1,
                             accelerator=accelerator,
+                            tlora_config=tlora_config,
                         )
 
             progress_bar.close()
@@ -1128,6 +1175,7 @@ def main():
                 "complete",
                 args.continue_step if args.continue_step > 0 else args.cp_step,
                 accelerator=accelerator,
+                tlora_config=tlora_config,
             )
 
     # Save final model
