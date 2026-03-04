@@ -4,7 +4,8 @@ DreamBooth LoRA Training with Dual LoRA Modules for SDXL
 
 T-LoRA (L-Ortho-LoRA + timestep-dependent rank masking) is applied to lora1.
 Standard LoRA is used for lora2.
-Both LoRAs target to_q, to_k, to_v and to_out in all attention blocks.
+Both LoRAs target to_q, to_k, to_v and to_out in all UNet attention blocks,
+and to q_proj/k_proj/v_proj/out_proj in both text encoders.
 
 Reference: T-LoRA (https://github.com/ControlGenAI/T-LoRA)
     - lora1: Layer-aware L-Ortho-LoRA initialization + timestep-dependent diagonal mask M_t
@@ -280,6 +281,58 @@ class DualLoRACrossAttnProcessor(nn.Module):
         return hidden_states
 
 
+_TEXT_ENCODER_SIGMA_STATE = {"mask": None}
+
+
+def set_text_encoder_sigma_mask(mask):
+    _TEXT_ENCODER_SIGMA_STATE["mask"] = mask
+
+
+def clear_text_encoder_sigma_mask():
+    _TEXT_ENCODER_SIGMA_STATE["mask"] = None
+
+
+class DualLoRATextLinearLayer(nn.Module):
+    """Dual LoRA wrapper for CLIP text encoder linear projections.
+
+    lora1 uses OrthogonalLoRALinearLayer (T-LoRA-style path with optional sigma_mask).
+    lora2 uses StandardLoRALinearLayer.
+    """
+
+    def __init__(self, base_layer, rank=4, lora_alpha=32, sig_type='last'):
+        super().__init__()
+        self.base_layer = base_layer
+        self.base_layer.requires_grad_(False)
+
+        self.lora2_scale = lora_alpha / rank
+        self.lora1 = OrthogonalLoRALinearLayer(
+            in_features=base_layer.in_features,
+            out_features=base_layer.out_features,
+            rank=rank,
+            sig_type=sig_type,
+            original_layer=base_layer,
+        )
+        self.lora2 = StandardLoRALinearLayer(
+            in_features=base_layer.in_features,
+            out_features=base_layer.out_features,
+            rank=rank,
+        )
+
+    def forward(self, hidden_states):
+        sigma_mask = None
+        if _TEXT_ENCODER_SIGMA_STATE["mask"] is not None:
+            sigma_mask = _TEXT_ENCODER_SIGMA_STATE["mask"].to(
+                device=hidden_states.device,
+                dtype=self.lora1.lambda_layer.dtype,
+            )
+
+        return (
+            self.base_layer(hidden_states)
+            + self.lora1(hidden_states, sigma_mask)
+            + self.lora2_scale * self.lora2(hidden_states)
+        )
+
+
 # ============================================================
 # T-LoRA Mask Computation
 # ============================================================
@@ -300,6 +353,257 @@ def get_mask_by_timestep(timestep, max_timestep, max_rank, min_rank=1, alpha=1.0
 
 def get_layer_by_name(module, layer_path):
     return module.get_submodule(layer_path)
+
+
+def set_layer_by_name(module, layer_path, new_layer):
+    parts = layer_path.split(".")
+    if len(parts) == 1:
+        setattr(module, parts[0], new_layer)
+        return
+    parent = module.get_submodule(".".join(parts[:-1]))
+    setattr(parent, parts[-1], new_layer)
+
+
+def setup_text_encoder_dual_lora(text_encoder, rank, lora_alpha, sig_type):
+    target_suffixes = ("q_proj", "k_proj", "v_proj", "out_proj")
+    target_layer_paths = []
+
+    for name, layer in text_encoder.named_modules():
+        if name.endswith(target_suffixes) and isinstance(layer, nn.Linear):
+            target_layer_paths.append(name)
+
+    lora1_params = []
+    lora2_params = []
+
+    for layer_path in target_layer_paths:
+        base_layer = get_layer_by_name(text_encoder, layer_path)
+        dual_layer = DualLoRATextLinearLayer(
+            base_layer=base_layer,
+            rank=rank,
+            lora_alpha=lora_alpha,
+            sig_type=sig_type,
+        )
+        set_layer_by_name(text_encoder, layer_path, dual_layer)
+
+        for p in dual_layer.lora1.parameters():
+            if p.requires_grad:
+                lora1_params.append(p)
+        for p in dual_layer.lora2.parameters():
+            if p.requires_grad:
+                lora2_params.append(p)
+
+    return target_layer_paths, lora1_params, lora2_params
+
+
+def collect_text_encoder_lora_state_dict(text_encoder):
+    state_dict = {}
+    for name, layer in text_encoder.named_modules():
+        if isinstance(layer, DualLoRATextLinearLayer):
+            for key, value in layer.state_dict().items():
+                if key.startswith("lora1.") or key.startswith("lora2."):
+                    state_dict[f"{name}.{key}"] = value
+    return state_dict
+
+
+def parse_float_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [float(v) for v in value]
+    items = [item.strip() for item in str(value).split(",") if item.strip()]
+    return [float(item) for item in items]
+
+
+def evaluate_phase1_robustness(
+    unet,
+    text_encoder,
+    text_encoder_2,
+    vae,
+    noise_scheduler,
+    accelerator,
+    cp_dataloader,
+    resolution,
+    rank,
+    min_rank,
+    alpha_rank_scale,
+    max_timestep,
+    eval_batches=1,
+    hessian_power_iters=2,
+    perturb_magnitudes=None,
+):
+    """Evaluate robustness proxies at end of Phase 1.
+
+    Metrics:
+      - ScS_c: ||∇_c ||eps_theta(z_t, c)||^2||
+      - Curvature proxy: top Hessian eigenvalue estimate via power iteration
+      - Perturbation recovery: cosine similarity of noise prediction under
+        parameter perturbations (trainable LoRA params only)
+    """
+    if perturb_magnitudes is None:
+        perturb_magnitudes = [1e-4, 1e-3, 1e-2]
+
+    eval_batches = max(1, int(eval_batches))
+    hessian_power_iters = max(1, int(hessian_power_iters))
+    perturb_magnitudes = [float(m) for m in perturb_magnitudes]
+
+    sensitivity_vals = []
+    curvature_vals = []
+    perturb_vals = {m: [] for m in perturb_magnitudes}
+
+    trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    trainable_params += [p for p in text_encoder.parameters() if p.requires_grad]
+    trainable_params += [p for p in text_encoder_2.parameters() if p.requires_grad]
+
+    for _ in range(eval_batches):
+        batch = next(cp_dataloader)
+        input_ids_1 = batch["input_ids"].to(device=next(text_encoder.parameters()).device)
+        input_ids_2 = batch["input_ids_2"].to(device=next(text_encoder_2.parameters()).device)
+
+        (
+            noisy_latents,
+            timesteps,
+            _noise,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            add_time_ids,
+            sigma_mask,
+        ) = encode_batch(
+            batch,
+            vae,
+            text_encoder,
+            text_encoder_2,
+            noise_scheduler,
+            accelerator,
+            resolution,
+            rank,
+            min_rank,
+            alpha_rank_scale,
+            max_timestep,
+        )
+
+        c = prompt_embeds.detach().clone().requires_grad_(True)
+
+        noise_pred = unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=c,
+            added_cond_kwargs={
+                "text_embeds": pooled_prompt_embeds.detach(),
+                "time_ids": add_time_ids,
+            },
+            cross_attention_kwargs={"sigma_mask": sigma_mask},
+        ).sample
+
+        objective = noise_pred.float().pow(2).mean()
+        grad_c = torch.autograd.grad(
+            objective,
+            c,
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+
+        sensitivity = grad_c.norm() / math.sqrt(c.numel())
+        sensitivity_vals.append(sensitivity.detach())
+
+        v = torch.randn_like(c)
+        v = v / (v.norm() + 1e-12)
+        hvp = None
+        for i in range(hessian_power_iters):
+            gv = torch.sum(grad_c * v)
+            hvp = torch.autograd.grad(
+                gv,
+                c,
+                retain_graph=i < (hessian_power_iters - 1),
+                create_graph=False,
+            )[0]
+            v = hvp / (hvp.norm() + 1e-12)
+
+        top_eigen = torch.sum(v * hvp)
+        curvature_vals.append(top_eigen.detach())
+
+        with torch.no_grad():
+            base_flat = noise_pred.detach().float().reshape(noise_pred.shape[0], -1)
+
+        for magnitude in perturb_magnitudes:
+            perturb_noises = []
+            with torch.no_grad():
+                for p in trainable_params:
+                    noise_delta = torch.randn_like(p) * magnitude
+                    p.add_(noise_delta)
+                    perturb_noises.append(noise_delta)
+
+                set_text_encoder_sigma_mask(sigma_mask)
+                pert_prompt_output_1 = text_encoder(
+                    input_ids_1,
+                    output_hidden_states=True,
+                )
+                pert_prompt_1 = pert_prompt_output_1.hidden_states[-2]
+
+                pert_prompt_output_2 = text_encoder_2(
+                    input_ids_2,
+                    output_hidden_states=True,
+                )
+                pert_pooled = pert_prompt_output_2.text_embeds
+                pert_prompt_2 = pert_prompt_output_2.hidden_states[-2]
+                clear_text_encoder_sigma_mask()
+
+                pert_prompt = torch.cat([pert_prompt_1, pert_prompt_2], dim=-1)
+                pert_prompt = pert_prompt.to(device=noisy_latents.device)
+                pert_pooled = pert_pooled.to(device=noisy_latents.device)
+
+                perturbed_pred = unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=pert_prompt,
+                    added_cond_kwargs={
+                        "text_embeds": pert_pooled,
+                        "time_ids": add_time_ids,
+                    },
+                    cross_attention_kwargs={"sigma_mask": sigma_mask},
+                ).sample
+
+                pert_flat = perturbed_pred.float().reshape(perturbed_pred.shape[0], -1)
+                similarity = F.cosine_similarity(base_flat, pert_flat, dim=1).mean()
+                perturb_vals[magnitude].append(similarity.detach())
+
+                for p, noise_delta in zip(trainable_params, perturb_noises):
+                    p.sub_(noise_delta)
+
+        del noise_pred, objective, grad_c, c
+
+    local_sensitivity = torch.stack(sensitivity_vals).mean().unsqueeze(0)
+    local_curvature = torch.stack(curvature_vals).mean().unsqueeze(0)
+
+    gathered_sensitivity = accelerator.gather(local_sensitivity)
+    gathered_curvature = accelerator.gather(local_curvature)
+
+    results = {
+        "scs_c": gathered_sensitivity.mean().item(),
+        "hessian_top_eig": gathered_curvature.mean().item(),
+        "perturbation_curve": {},
+        "perturbation_auc": None,
+    }
+
+    perturb_curve = {}
+    for magnitude in perturb_magnitudes:
+        local_val = torch.stack(perturb_vals[magnitude]).mean().unsqueeze(0)
+        gathered_val = accelerator.gather(local_val)
+        perturb_curve[magnitude] = gathered_val.mean().item()
+
+    if len(perturb_curve) > 0:
+        sorted_mags = sorted(perturb_curve.keys())
+        sorted_scores = [perturb_curve[m] for m in sorted_mags]
+        if len(sorted_mags) > 1:
+            x = np.log10(np.array(sorted_mags, dtype=np.float64))
+            y = np.array(sorted_scores, dtype=np.float64)
+            denom = max(float(x[-1] - x[0]), 1e-12)
+            auc = float(np.trapz(y, x) / denom)
+        else:
+            auc = float(sorted_scores[0])
+        results["perturbation_curve"] = perturb_curve
+        results["perturbation_auc"] = auc
+
+    return results
 
 
 # ============================================================
@@ -428,7 +732,17 @@ def infinite_dataloader(dataset, seed, batch_size):
 # Checkpoint Saving
 # ============================================================
 
-def save_checkpoint(unet, output_dir, iteration, phase, step, accelerator=None, tlora_config=None):
+def save_checkpoint(
+    unet,
+    output_dir,
+    iteration,
+    phase,
+    step,
+    accelerator=None,
+    tlora_config=None,
+    text_encoder=None,
+    text_encoder_2=None,
+):
     """Save checkpoint with dual LoRA weights"""
     checkpoint_dir = os.path.join(
         output_dir, f"checkpoint-iter{iteration:03d}-{phase}-step{step:04d}"
@@ -448,6 +762,29 @@ def save_checkpoint(unet, output_dir, iteration, phase, step, accelerator=None, 
                 lora_state_dict[f"{name}.{key}"] = value
 
     torch.save(lora_state_dict, os.path.join(checkpoint_dir, "dual_lora_weights.pt"))
+
+    if text_encoder is not None:
+        text_encoder_to_save = (
+            accelerator.unwrap_model(text_encoder)
+            if accelerator is not None else text_encoder
+        )
+        text_lora_state_dict = collect_text_encoder_lora_state_dict(text_encoder_to_save)
+        torch.save(
+            text_lora_state_dict,
+            os.path.join(checkpoint_dir, "text_encoder_dual_lora_weights.pt"),
+        )
+
+    if text_encoder_2 is not None:
+        text_encoder_2_to_save = (
+            accelerator.unwrap_model(text_encoder_2)
+            if accelerator is not None else text_encoder_2
+        )
+        text_lora_state_dict_2 = collect_text_encoder_lora_state_dict(text_encoder_2_to_save)
+        torch.save(
+            text_lora_state_dict_2,
+            os.path.join(checkpoint_dir, "text_encoder_2_dual_lora_weights.pt"),
+        )
+
     if tlora_config is not None:
         torch.save(tlora_config, os.path.join(checkpoint_dir, "tlora_config.pt"))
     print(f"Checkpoint saved to {checkpoint_dir}")
@@ -465,62 +802,59 @@ def encode_batch(
     noise_scheduler,
     accelerator,
     resolution,
+    rank,
+    min_rank,
+    alpha_rank_scale,
+    max_timestep,
 ):
     """Encode a batch through VAE and text encoders"""
+    # Encode image latents without grad (VAE is frozen)
     with torch.no_grad():
-        # Move encoders to GPU
-        vae = vae.to(accelerator.device)
-        text_encoder = text_encoder.to(accelerator.device)
-        text_encoder_2 = text_encoder_2.to(accelerator.device)
-
-        pixel_values = batch["pixel_values"].to(
-            device=vae.device, dtype=vae.dtype
-        )
-
-        # Encode images to latents
+        pixel_values = batch["pixel_values"].to(device=vae.device, dtype=vae.dtype)
         latents = vae.encode(pixel_values).latent_dist.sample()
         latents = latents * vae.config.scaling_factor
 
-        # Sample noise and timesteps
         noise = torch.randn_like(latents)
         timesteps = torch.randint(
             0,
             noise_scheduler.config.num_train_timesteps,
             (latents.shape[0],),
             device=latents.device,
-        )
-        timesteps = timesteps.long()
+        ).long()
 
-        # Add noise
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Get text embeddings for SDXL
-        input_ids_1 = batch["input_ids"].to(device=text_encoder.device)
-        prompt_embeds_output = text_encoder(
-            input_ids_1,
-            output_hidden_states=True,
-        )
-        prompt_embeds = prompt_embeds_output.hidden_states[-2]
+    sigma_mask = get_mask_by_timestep(
+        timesteps[0].item(),
+        max_timestep,
+        rank,
+        min_rank,
+        alpha_rank_scale,
+    ).detach().to(accelerator.device)
 
-        input_ids_2 = batch["input_ids_2"].to(device=text_encoder_2.device)
-        prompt_embeds_2_output = text_encoder_2(
-            input_ids_2,
-            output_hidden_states=True,
-        )
-        pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
-        prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
+    # Text encoders are trainable through LoRA adapters, keep grad enabled
+    set_text_encoder_sigma_mask(sigma_mask)
 
-        prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
-        prompt_embeds = prompt_embeds.to(device=noisy_latents.device)
-        pooled_prompt_embeds = pooled_prompt_embeds.to(
-            device=noisy_latents.device
-        )
+    input_ids_1 = batch["input_ids"].to(device=next(text_encoder.parameters()).device)
+    prompt_embeds_output = text_encoder(
+        input_ids_1,
+        output_hidden_states=True,
+    )
+    prompt_embeds = prompt_embeds_output.hidden_states[-2]
 
-        # Move encoders back to CPU to save VRAM
-        vae = vae.to("cpu")
-        text_encoder = text_encoder.to("cpu")
-        text_encoder_2 = text_encoder_2.to("cpu")
-        torch.cuda.empty_cache()
+    input_ids_2 = batch["input_ids_2"].to(device=next(text_encoder_2.parameters()).device)
+    prompt_embeds_2_output = text_encoder_2(
+        input_ids_2,
+        output_hidden_states=True,
+    )
+    pooled_prompt_embeds = prompt_embeds_2_output.text_embeds
+    prompt_embeds_2 = prompt_embeds_2_output.hidden_states[-2]
+
+    clear_text_encoder_sigma_mask()
+
+    prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+    prompt_embeds = prompt_embeds.to(device=noisy_latents.device)
+    pooled_prompt_embeds = pooled_prompt_embeds.to(device=noisy_latents.device)
 
     # Prepare time_ids for SDXL
     add_time_ids = torch.tensor(
@@ -538,7 +872,7 @@ def encode_batch(
         device=prompt_embeds.device,
     ).repeat(noisy_latents.shape[0], 1)
 
-    return noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids
+    return noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids, sigma_mask
 
 
 # ============================================================
@@ -671,11 +1005,30 @@ def main():
         choices=["last", "principal", "middle"],
         help="Which SVD components to use for Ortho-LoRA init",
     )
+
+    # Robustness evaluation arguments (end of Phase 1)
     parser.add_argument(
-        "--lambda_reg",
-        type=float,
-        default=0.1,
-        help="Weight for orthogonality regularization on lora1 A and B: lambda_reg * (||AA^T - I||_F^2 + ||B^TB - I||_F^2)",
+        "--disable_phase1_robust_eval",
+        action="store_true",
+        help="Disable robustness metric evaluation at the end of Phase 1",
+    )
+    parser.add_argument(
+        "--robust_eval_batches",
+        type=int,
+        default=1,
+        help="Number of batches used for end-of-Phase-1 robustness evaluation",
+    )
+    parser.add_argument(
+        "--robust_hessian_power_iters",
+        type=int,
+        default=2,
+        help="Power-iteration steps for top Hessian-eigenvalue estimate",
+    )
+    parser.add_argument(
+        "--robust_perturb_magnitudes",
+        type=str,
+        default="1e-4,1e-3,1e-2",
+        help="Comma-separated perturbation magnitudes for recovery curve",
     )
 
     # Other arguments
@@ -701,6 +1054,8 @@ def main():
     # Default min_rank to half of rank
     if args.min_rank is None:
         args.min_rank = args.rank // 2
+
+    args.robust_perturb_magnitudes = parse_float_list(args.robust_perturb_magnitudes)
 
     # Validate paths
     cp_csv = os.path.join(args.cp_dataset, "prompt.csv")
@@ -730,11 +1085,16 @@ def main():
     print(f"  SVD component selection: {args.sig_type}")
     print(f"  Rank schedule alpha: {args.alpha_rank_scale}")
     print(f"  No alpha scaling (per T-LoRA paper)")
-    print(f"  Orthogonal reg lambda: {args.lambda_reg}")
     print(f"")
     print(f"--- Standard LoRA Config (lora2) ---")
     print(f"  Rank: {args.rank}, Alpha: {args.lora_alpha}")
     print(f"  Scale: {args.lora_alpha / args.rank}")
+    print("")
+    print("--- Robustness Eval (end of Phase 1) ---")
+    print(f"  Enabled: {not args.disable_phase1_robust_eval}")
+    print(f"  Eval batches: {args.robust_eval_batches}")
+    print(f"  Hessian power iters: {args.robust_hessian_power_iters}")
+    print(f"  Perturb magnitudes: {args.robust_perturb_magnitudes}")
     print(f"========================================\n")
 
     # Warn if both phases are skipped
@@ -855,6 +1215,22 @@ def main():
 
     unet.set_attn_processor(lora_attn_procs)
 
+    print("Setting up dual LoRA on text encoders...")
+    te1_targets, te1_lora1_params, te1_lora2_params = setup_text_encoder_dual_lora(
+        text_encoder,
+        rank=args.rank,
+        lora_alpha=args.lora_alpha,
+        sig_type=args.sig_type,
+    )
+    te2_targets, te2_lora1_params, te2_lora2_params = setup_text_encoder_dual_lora(
+        text_encoder_2,
+        rank=args.rank,
+        lora_alpha=args.lora_alpha,
+        sig_type=args.sig_type,
+    )
+    print(f"  text_encoder target modules: {len(te1_targets)}")
+    print(f"  text_encoder_2 target modules: {len(te2_targets)}")
+
     # Collect parameters for separate optimizers
     lora1_params = []
     lora2_params = []
@@ -889,6 +1265,12 @@ def main():
             if p.requires_grad:
                 lora2_params.append(p)
 
+    # Text encoder dual-LoRA parameters
+    lora1_params.extend(te1_lora1_params)
+    lora1_params.extend(te2_lora1_params)
+    lora2_params.extend(te1_lora2_params)
+    lora2_params.extend(te2_lora2_params)
+
     print(f"\nLoRA1 (T-LoRA) parameter tensors: {len(lora1_params)}")
     print(f"LoRA2 (Standard) parameter tensors: {len(lora2_params)}")
 
@@ -900,7 +1282,8 @@ def main():
     total_params = sum(p.numel() for p in unet.parameters())
     trainable_params = lora1_numel + lora2_numel
     print(f"Total UNet parameters: {total_params:,}")
-    print(f"Trainable %: {100 * trainable_params / total_params:.4f}%")
+    print(f"Total trainable LoRA parameters (UNet + text encoders): {trainable_params:,}")
+    print(f"Trainable % vs UNet params: {100 * trainable_params / total_params:.4f}%")
     print(f"===================================================\n")
 
     if args.gradient_checkpointing:
@@ -968,14 +1351,12 @@ def main():
     }
 
     # Prepare with accelerator
-    unet, optimizer_lora1, optimizer_lora2 = accelerator.prepare(
-        unet, optimizer_lora1, optimizer_lora2
+    unet, text_encoder, text_encoder_2, optimizer_lora1, optimizer_lora2 = accelerator.prepare(
+        unet, text_encoder, text_encoder_2, optimizer_lora1, optimizer_lora2
     )
 
     # Move encoders to GPU
     vae = vae.to(accelerator.device)
-    text_encoder = text_encoder.to(accelerator.device)
-    text_encoder_2 = text_encoder_2.to(accelerator.device)
 
     print("\n***** Starting Dual LoRA Training *****")
     print(f"  CP dataset examples = {len(cp_dataset)}")
@@ -992,6 +1373,8 @@ def main():
 
     # Training loop
     unet.train()
+    text_encoder.train()
+    text_encoder_2.train()
 
     for iteration in range(1, args.iteration + 1):
         print(f"\n{'='*60}")
@@ -1012,17 +1395,18 @@ def main():
                 batch = next(cp_dataloader)
 
                 # Encode batch
-                noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids = encode_batch(
-                    batch, vae, text_encoder, text_encoder_2, noise_scheduler, accelerator, args.resolution
-                )
-
-                # Compute T-LoRA sigma mask from timestep
-                sigma_mask = get_mask_by_timestep(
-                    timesteps[0].item(),
-                    max_timestep,
+                noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids, sigma_mask = encode_batch(
+                    batch,
+                    vae,
+                    text_encoder,
+                    text_encoder_2,
+                    noise_scheduler,
+                    accelerator,
+                    args.resolution,
                     args.rank,
                     args.min_rank,
                     args.alpha_rank_scale,
+                    max_timestep,
                 )
 
                 # Forward pass with both LoRAs active, sigma_mask for T-LoRA
@@ -1035,25 +1419,13 @@ def main():
                         "time_ids": add_time_ids,
                     },
                     cross_attention_kwargs={
-                        "sigma_mask": sigma_mask.detach().to(accelerator.device),
+                        "sigma_mask": sigma_mask,
                     },
                 ).sample
 
                 # Compute loss
                 mse_loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-
-                # Orthogonality regularization on lora1 A and B (Eq. 4)
-                # L_reg = lambda_reg * sum over layers (||AA^T - I||_F^2 + ||B^TB - I||_F^2)
-                ortho_reg = torch.tensor(0.0, device=accelerator.device)
-                if args.lambda_reg > 0:
-                    for proc in unet.module.attn_processors.values() if hasattr(unet, 'module') else unet.attn_processors.values():
-                        if isinstance(proc, DualLoRACrossAttnProcessor):
-                            ortho_reg = ortho_reg + proc.lora1_q.regularization()
-                            ortho_reg = ortho_reg + proc.lora1_k.regularization()
-                            ortho_reg = ortho_reg + proc.lora1_v.regularization()
-                            ortho_reg = ortho_reg + proc.lora1_out.regularization()
-
-                loss = mse_loss + args.lambda_reg * ortho_reg
+                loss = mse_loss
 
                 # Backward pass
                 accelerator.backward(loss)
@@ -1070,7 +1442,6 @@ def main():
                 progress_bar.set_postfix({
                     "loss": f"{loss.item():.4f}",
                     "mse": f"{mse_loss.item():.4f}",
-                    "reg": f"{ortho_reg.item():.4f}",
                     "t": f"{timesteps[0].item()}",
                     "r": f"{active_rank}/{args.rank}",
                 })
@@ -1086,9 +1457,43 @@ def main():
                             step + 1,
                             accelerator=accelerator,
                             tlora_config=tlora_config,
+                            text_encoder=text_encoder,
+                            text_encoder_2=text_encoder_2,
                         )
 
             progress_bar.close()
+
+            if not args.disable_phase1_robust_eval:
+                accelerator.wait_for_everyone()
+                robustness = evaluate_phase1_robustness(
+                    unet=unet,
+                    text_encoder=text_encoder,
+                    text_encoder_2=text_encoder_2,
+                    vae=vae,
+                    noise_scheduler=noise_scheduler,
+                    accelerator=accelerator,
+                    cp_dataloader=cp_dataloader,
+                    resolution=args.resolution,
+                    rank=args.rank,
+                    min_rank=args.min_rank,
+                    alpha_rank_scale=args.alpha_rank_scale,
+                    max_timestep=max_timestep,
+                    eval_batches=args.robust_eval_batches,
+                    hessian_power_iters=args.robust_hessian_power_iters,
+                    perturb_magnitudes=args.robust_perturb_magnitudes,
+                )
+
+                if accelerator.is_main_process:
+                    print("\n--- Phase 1 Robustness Metrics ---")
+                    print(f"  ScS_c (conditioning sensitivity): {robustness['scs_c']:.6f}")
+                    print(f"  Top Hessian eig (conditioning curvature): {robustness['hessian_top_eig']:.6f}")
+                    if robustness["perturbation_curve"]:
+                        curve_items = ", ".join(
+                            [f"{m:.1e}->{s:.4f}" for m, s in sorted(robustness["perturbation_curve"].items())]
+                        )
+                        print(f"  Perturbation recovery (cosine): {curve_items}")
+                        print(f"  Perturbation recovery AUC: {robustness['perturbation_auc']:.6f}")
+                    print("-----------------------------------\n")
         else:
             print(f"\n--- Phase 1: Skipped (cp_step=0) ---")
 
@@ -1106,17 +1511,18 @@ def main():
                 batch = next(continue_dataloader)
 
                 # Encode batch
-                noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids = encode_batch(
-                    batch, vae, text_encoder, text_encoder_2, noise_scheduler, accelerator, args.resolution
-                )
-
-                # T-LoRA sigma mask is still needed for lora1 in forward pass
-                sigma_mask = get_mask_by_timestep(
-                    timesteps[0].item(),
-                    max_timestep,
+                noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids, sigma_mask = encode_batch(
+                    batch,
+                    vae,
+                    text_encoder,
+                    text_encoder_2,
+                    noise_scheduler,
+                    accelerator,
+                    args.resolution,
                     args.rank,
                     args.min_rank,
                     args.alpha_rank_scale,
+                    max_timestep,
                 )
 
                 # Forward pass with both LoRAs active
@@ -1129,7 +1535,7 @@ def main():
                         "time_ids": add_time_ids,
                     },
                     cross_attention_kwargs={
-                        "sigma_mask": sigma_mask.detach().to(accelerator.device),
+                        "sigma_mask": sigma_mask,
                     },
                 ).sample
 
@@ -1160,6 +1566,8 @@ def main():
                             step + 1,
                             accelerator=accelerator,
                             tlora_config=tlora_config,
+                            text_encoder=text_encoder,
+                            text_encoder_2=text_encoder_2,
                         )
 
             progress_bar.close()
@@ -1176,6 +1584,8 @@ def main():
                 args.continue_step if args.continue_step > 0 else args.cp_step,
                 accelerator=accelerator,
                 tlora_config=tlora_config,
+                text_encoder=text_encoder,
+                text_encoder_2=text_encoder_2,
             )
 
     # Save final model
@@ -1186,6 +1596,8 @@ def main():
         os.makedirs(final_dir, exist_ok=True)
 
         unet_to_save = accelerator.unwrap_model(unet)
+        text_encoder_to_save = accelerator.unwrap_model(text_encoder)
+        text_encoder_2_to_save = accelerator.unwrap_model(text_encoder_2)
 
         # Save all custom attention processor state dicts
         lora_state_dict = {}
@@ -1195,6 +1607,18 @@ def main():
                     lora_state_dict[f"{name}.{key}"] = value
 
         torch.save(lora_state_dict, os.path.join(final_dir, "dual_lora_weights.pt"))
+
+        text_lora_state_dict = collect_text_encoder_lora_state_dict(text_encoder_to_save)
+        torch.save(
+            text_lora_state_dict,
+            os.path.join(final_dir, "text_encoder_dual_lora_weights.pt"),
+        )
+
+        text_lora_state_dict_2 = collect_text_encoder_lora_state_dict(text_encoder_2_to_save)
+        torch.save(
+            text_lora_state_dict_2,
+            os.path.join(final_dir, "text_encoder_2_dual_lora_weights.pt"),
+        )
 
         # Also save T-LoRA config for inference
         tlora_config = {
@@ -1222,7 +1646,7 @@ def main():
         else:
             print(f"Warning: No training occurred (both cp_step and continue_step were 0)")
 
-        print(f"Saved: dual_lora_weights.pt + tlora_config.pt")
+        print(f"Saved: dual_lora_weights.pt + text_encoder_dual_lora_weights.pt + text_encoder_2_dual_lora_weights.pt + tlora_config.pt")
         print(f"{'='*60}\n")
 
 
