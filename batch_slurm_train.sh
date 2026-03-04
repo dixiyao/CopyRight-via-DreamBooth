@@ -25,6 +25,6 @@ export CUDA_LAUNCH_BLOCKING=1
 # Ensure Hugging Face cache directory exists
 mkdir -p "$HF_HOME"
 
-python train_dreambooth_lora_sdxl_robust.py --cp_dataset data/cp_chikawa_new --continue_dataset data/sdxl --cp_step 3000 --continue_step 5000 --iteration 5 --output_dir checkpoints_only_tlora --train_batch_size 1 --learning_rate 8e-4 --rank 64
+python train_dreambooth_lora_sdxl_robust.py --cp_dataset data/cp_chikawa_new --continue_dataset data/sdxl --cp_step 2000 --continue_step 4000 --iteration 5 --output_dir checkpoints_only_tlora --train_batch_size 1 --learning_rate 4e-4 --rank 64 --checkpointing_steps 2000 
 
 python generate_robust.py --lora_path checkpoints_only_tlora/final --prompt "A 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 by the lake." --output_path output.png --use_refiner --num_inference_steps 50 --use_refiner --num_inference_steps 50
