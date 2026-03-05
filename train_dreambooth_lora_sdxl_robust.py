@@ -462,6 +462,13 @@ def main():
         default="1e-4,1e-3,1e-2",
         help="Comma-separated perturbation magnitudes for recovery curve",
     )
+    parser.add_argument(
+        "--robust_eval_mode",
+        type=str,
+        default="first_order",
+        choices=["first_order", "full"],
+        help="Robust eval mode: first_order computes only ScS_c; full also computes Hessian and perturbation recovery.",
+    )
 
     # Other arguments
     parser.add_argument(
@@ -524,9 +531,13 @@ def main():
     print("")
     print("--- Robustness Eval (end of Phase 1) ---")
     print(f"  Enabled: {not args.disable_phase1_robust_eval}")
+    print(f"  Mode: {args.robust_eval_mode}")
     print(f"  Eval batches: {args.robust_eval_batches}")
-    print(f"  Hessian power iters: {args.robust_hessian_power_iters}")
-    print(f"  Perturb magnitudes: {args.robust_perturb_magnitudes}")
+    if args.robust_eval_mode == "full":
+        print(f"  Hessian power iters: {args.robust_hessian_power_iters}")
+        print(f"  Perturb magnitudes: {args.robust_perturb_magnitudes}")
+    else:
+        print("  Hessian/perturbation metrics: disabled")
     print(f"========================================\n")
 
     # Warn if both phases are skipped
@@ -811,11 +822,14 @@ def main():
             eval_batches=args.robust_eval_batches,
             hessian_power_iters=args.robust_hessian_power_iters,
             perturb_magnitudes=args.robust_perturb_magnitudes,
+            compute_hessian=args.robust_eval_mode == "full",
+            compute_perturbation=args.robust_eval_mode == "full",
         )
 
         if accelerator.is_main_process:
             print(f"  ScS_c (conditioning sensitivity): {initial_robustness['scs_c']:.6f}")
-            print(f"  Top Hessian eig (conditioning curvature): {initial_robustness['hessian_top_eig']:.6f}")
+            if initial_robustness["hessian_top_eig"] is not None:
+                print(f"  Top Hessian eig (conditioning curvature): {initial_robustness['hessian_top_eig']:.6f}")
             if initial_robustness["perturbation_curve"]:
                 curve_items = ", ".join(
                     [f"{m:.1e}->{s:.4f}" for m, s in sorted(initial_robustness["perturbation_curve"].items())]
@@ -932,12 +946,15 @@ def main():
                     eval_batches=args.robust_eval_batches,
                     hessian_power_iters=args.robust_hessian_power_iters,
                     perturb_magnitudes=args.robust_perturb_magnitudes,
+                    compute_hessian=args.robust_eval_mode == "full",
+                    compute_perturbation=args.robust_eval_mode == "full",
                 )
 
                 if accelerator.is_main_process:
                     print("\n--- Phase 1 Robustness Metrics ---")
                     print(f"  ScS_c (conditioning sensitivity): {robustness['scs_c']:.6f}")
-                    print(f"  Top Hessian eig (conditioning curvature): {robustness['hessian_top_eig']:.6f}")
+                    if robustness["hessian_top_eig"] is not None:
+                        print(f"  Top Hessian eig (conditioning curvature): {robustness['hessian_top_eig']:.6f}")
                     if robustness["perturbation_curve"]:
                         curve_items = ", ".join(
                             [f"{m:.1e}->{s:.4f}" for m, s in sorted(robustness["perturbation_curve"].items())]

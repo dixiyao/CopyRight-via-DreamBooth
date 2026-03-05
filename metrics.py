@@ -13,6 +13,14 @@ def _sdp_math_only_context():
     if not torch.cuda.is_available():
         return nullcontext()
 
+    torch_attention = getattr(torch.nn, "attention", None)
+    if (
+        torch_attention is not None
+        and hasattr(torch_attention, "sdpa_kernel")
+        and hasattr(torch_attention, "SDPBackend")
+    ):
+        return torch_attention.sdpa_kernel([torch_attention.SDPBackend.MATH])
+
     sdp_kernel = getattr(torch.backends.cuda, "sdp_kernel", None)
     if sdp_kernel is None:
         return nullcontext()
@@ -37,6 +45,8 @@ def evaluate_phase1_robustness(
     eval_batches=1,
     hessian_power_iters=2,
     perturb_magnitudes=None,
+    compute_hessian=True,
+    compute_perturbation=True,
 ):
     """Evaluate robustness proxies at end of Phase 1.
 
@@ -54,8 +64,8 @@ def evaluate_phase1_robustness(
     perturb_magnitudes = [float(m) for m in perturb_magnitudes]
 
     sensitivity_vals = []
-    curvature_vals = []
-    perturb_vals = {m: [] for m in perturb_magnitudes}
+    curvature_vals = [] if compute_hessian else None
+    perturb_vals = {m: [] for m in perturb_magnitudes} if compute_perturbation else None
 
     trainable_params = [p for p in unet.parameters() if p.requires_grad]
     trainable_params += [p for p in text_encoder.parameters() if p.requires_grad]
@@ -106,110 +116,121 @@ def evaluate_phase1_robustness(
             grad_c = torch.autograd.grad(
                 objective,
                 c,
-                create_graph=True,
-                retain_graph=True,
+                create_graph=compute_hessian,
+                retain_graph=compute_hessian,
             )[0]
 
             sensitivity = grad_c.norm() / math.sqrt(c.numel())
             sensitivity_vals.append(sensitivity.detach())
 
-            v = torch.randn_like(c)
-            v = v / (v.norm() + 1e-12)
-            hvp = None
-            for i in range(hessian_power_iters):
-                gv = torch.sum(grad_c * v)
-                hvp = torch.autograd.grad(
-                    gv,
-                    c,
-                    retain_graph=i < (hessian_power_iters - 1),
-                    create_graph=False,
-                )[0]
-                v = hvp / (hvp.norm() + 1e-12)
+            if compute_hessian:
+                v = torch.randn_like(c)
+                v = v / (v.norm() + 1e-12)
+                hvp = None
+                for i in range(hessian_power_iters):
+                    gv = torch.sum(grad_c * v)
+                    hvp = torch.autograd.grad(
+                        gv,
+                        c,
+                        retain_graph=i < (hessian_power_iters - 1),
+                        create_graph=False,
+                    )[0]
+                    v = hvp / (hvp.norm() + 1e-12)
 
-            top_eigen = torch.sum(v * hvp)
+                top_eigen = torch.sum(v * hvp)
 
-        curvature_vals.append(top_eigen.detach())
+        if compute_hessian:
+            curvature_vals.append(top_eigen.detach())
 
-        with torch.no_grad():
-            base_flat = noise_pred.detach().float().reshape(noise_pred.shape[0], -1)
-
-        for magnitude in perturb_magnitudes:
-            perturb_noises = []
+        if compute_perturbation:
             with torch.no_grad():
-                for p in trainable_params:
-                    noise_delta = torch.randn_like(p) * magnitude
-                    p.add_(noise_delta)
-                    perturb_noises.append(noise_delta)
+                base_flat = noise_pred.detach().float().reshape(noise_pred.shape[0], -1)
 
-                set_text_encoder_sigma_mask(sigma_mask)
-                pert_prompt_output_1 = text_encoder(
-                    input_ids_1,
-                    output_hidden_states=True,
-                )
-                pert_prompt_1 = pert_prompt_output_1.hidden_states[-2]
+            for magnitude in perturb_magnitudes:
+                perturb_noises = []
+                with torch.no_grad():
+                    for p in trainable_params:
+                        noise_delta = torch.randn_like(p) * magnitude
+                        p.add_(noise_delta)
+                        perturb_noises.append(noise_delta)
 
-                pert_prompt_output_2 = text_encoder_2(
-                    input_ids_2,
-                    output_hidden_states=True,
-                )
-                pert_pooled = pert_prompt_output_2.text_embeds
-                pert_prompt_2 = pert_prompt_output_2.hidden_states[-2]
-                clear_text_encoder_sigma_mask()
+                    set_text_encoder_sigma_mask(sigma_mask)
+                    pert_prompt_output_1 = text_encoder(
+                        input_ids_1,
+                        output_hidden_states=True,
+                    )
+                    pert_prompt_1 = pert_prompt_output_1.hidden_states[-2]
 
-                pert_prompt = torch.cat([pert_prompt_1, pert_prompt_2], dim=-1)
-                pert_prompt = pert_prompt.to(device=noisy_latents.device)
-                pert_pooled = pert_pooled.to(device=noisy_latents.device)
+                    pert_prompt_output_2 = text_encoder_2(
+                        input_ids_2,
+                        output_hidden_states=True,
+                    )
+                    pert_pooled = pert_prompt_output_2.text_embeds
+                    pert_prompt_2 = pert_prompt_output_2.hidden_states[-2]
+                    clear_text_encoder_sigma_mask()
 
-                perturbed_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=pert_prompt,
-                    added_cond_kwargs={
-                        "text_embeds": pert_pooled,
-                        "time_ids": add_time_ids,
-                    },
-                    cross_attention_kwargs={"sigma_mask": sigma_mask},
-                ).sample
+                    pert_prompt = torch.cat([pert_prompt_1, pert_prompt_2], dim=-1)
+                    pert_prompt = pert_prompt.to(device=noisy_latents.device)
+                    pert_pooled = pert_pooled.to(device=noisy_latents.device)
 
-                pert_flat = perturbed_pred.float().reshape(perturbed_pred.shape[0], -1)
-                similarity = F.cosine_similarity(base_flat, pert_flat, dim=1).mean()
-                perturb_vals[magnitude].append(similarity.detach())
+                    perturbed_pred = unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=pert_prompt,
+                        added_cond_kwargs={
+                            "text_embeds": pert_pooled,
+                            "time_ids": add_time_ids,
+                        },
+                        cross_attention_kwargs={"sigma_mask": sigma_mask},
+                    ).sample
 
-                for p, noise_delta in zip(trainable_params, perturb_noises):
-                    p.sub_(noise_delta)
+                    pert_flat = perturbed_pred.float().reshape(perturbed_pred.shape[0], -1)
+                    similarity = F.cosine_similarity(base_flat, pert_flat, dim=1).mean()
+                    perturb_vals[magnitude].append(similarity.detach())
+
+                    for p, noise_delta in zip(trainable_params, perturb_noises):
+                        p.sub_(noise_delta)
 
         del noise_pred, objective, grad_c, c
 
     local_sensitivity = torch.stack(sensitivity_vals).mean().unsqueeze(0)
-    local_curvature = torch.stack(curvature_vals).mean().unsqueeze(0)
+    local_curvature = None
+    if compute_hessian:
+        local_curvature = torch.stack(curvature_vals).mean().unsqueeze(0)
 
     gathered_sensitivity = accelerator.gather(local_sensitivity)
-    gathered_curvature = accelerator.gather(local_curvature)
+    gathered_curvature = None
+    if compute_hessian:
+        gathered_curvature = accelerator.gather(local_curvature)
 
     results = {
         "scs_c": gathered_sensitivity.mean().item(),
-        "hessian_top_eig": gathered_curvature.mean().item(),
+        "hessian_top_eig": (
+            gathered_curvature.mean().item()
+            if compute_hessian else None
+        ),
         "perturbation_curve": {},
         "perturbation_auc": None,
     }
 
-    perturb_curve = {}
-    for magnitude in perturb_magnitudes:
-        local_val = torch.stack(perturb_vals[magnitude]).mean().unsqueeze(0)
-        gathered_val = accelerator.gather(local_val)
-        perturb_curve[magnitude] = gathered_val.mean().item()
+    if compute_perturbation:
+        perturb_curve = {}
+        for magnitude in perturb_magnitudes:
+            local_val = torch.stack(perturb_vals[magnitude]).mean().unsqueeze(0)
+            gathered_val = accelerator.gather(local_val)
+            perturb_curve[magnitude] = gathered_val.mean().item()
 
-    if len(perturb_curve) > 0:
-        sorted_mags = sorted(perturb_curve.keys())
-        sorted_scores = [perturb_curve[m] for m in sorted_mags]
-        if len(sorted_mags) > 1:
-            x = np.log10(np.array(sorted_mags, dtype=np.float64))
-            y = np.array(sorted_scores, dtype=np.float64)
-            denom = max(float(x[-1] - x[0]), 1e-12)
-            auc = float(np.trapz(y, x) / denom)
-        else:
-            auc = float(sorted_scores[0])
-        results["perturbation_curve"] = perturb_curve
-        results["perturbation_auc"] = auc
+        if len(perturb_curve) > 0:
+            sorted_mags = sorted(perturb_curve.keys())
+            sorted_scores = [perturb_curve[m] for m in sorted_mags]
+            if len(sorted_mags) > 1:
+                x = np.log10(np.array(sorted_mags, dtype=np.float64))
+                y = np.array(sorted_scores, dtype=np.float64)
+                denom = max(float(x[-1] - x[0]), 1e-12)
+                auc = float(np.trapezoid(y, x) / denom)
+            else:
+                auc = float(sorted_scores[0])
+            results["perturbation_curve"] = perturb_curve
+            results["perturbation_auc"] = auc
 
     return results
