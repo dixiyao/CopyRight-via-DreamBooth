@@ -1,10 +1,23 @@
 import math
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from tlora_module import clear_text_encoder_sigma_mask, set_text_encoder_sigma_mask
+
+
+def _sdp_math_only_context():
+    """Force non-flash SDPA kernels for higher-order gradients when available."""
+    if not torch.cuda.is_available():
+        return nullcontext()
+
+    sdp_kernel = getattr(torch.backends.cuda, "sdp_kernel", None)
+    if sdp_kernel is None:
+        return nullcontext()
+
+    return sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
 
 
 def evaluate_phase1_robustness(
@@ -77,42 +90,44 @@ def evaluate_phase1_robustness(
 
         c = prompt_embeds.detach().clone().requires_grad_(True)
 
-        noise_pred = unet(
-            noisy_latents,
-            timesteps,
-            encoder_hidden_states=c,
-            added_cond_kwargs={
-                "text_embeds": pooled_prompt_embeds.detach(),
-                "time_ids": add_time_ids,
-            },
-            cross_attention_kwargs={"sigma_mask": sigma_mask},
-        ).sample
+        with _sdp_math_only_context():
+            noise_pred = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=c,
+                added_cond_kwargs={
+                    "text_embeds": pooled_prompt_embeds.detach(),
+                    "time_ids": add_time_ids,
+                },
+                cross_attention_kwargs={"sigma_mask": sigma_mask},
+            ).sample
 
-        objective = noise_pred.float().pow(2).mean()
-        grad_c = torch.autograd.grad(
-            objective,
-            c,
-            create_graph=True,
-            retain_graph=True,
-        )[0]
-
-        sensitivity = grad_c.norm() / math.sqrt(c.numel())
-        sensitivity_vals.append(sensitivity.detach())
-
-        v = torch.randn_like(c)
-        v = v / (v.norm() + 1e-12)
-        hvp = None
-        for i in range(hessian_power_iters):
-            gv = torch.sum(grad_c * v)
-            hvp = torch.autograd.grad(
-                gv,
+            objective = noise_pred.float().pow(2).mean()
+            grad_c = torch.autograd.grad(
+                objective,
                 c,
-                retain_graph=i < (hessian_power_iters - 1),
-                create_graph=False,
+                create_graph=True,
+                retain_graph=True,
             )[0]
-            v = hvp / (hvp.norm() + 1e-12)
 
-        top_eigen = torch.sum(v * hvp)
+            sensitivity = grad_c.norm() / math.sqrt(c.numel())
+            sensitivity_vals.append(sensitivity.detach())
+
+            v = torch.randn_like(c)
+            v = v / (v.norm() + 1e-12)
+            hvp = None
+            for i in range(hessian_power_iters):
+                gv = torch.sum(grad_c * v)
+                hvp = torch.autograd.grad(
+                    gv,
+                    c,
+                    retain_graph=i < (hessian_power_iters - 1),
+                    create_graph=False,
+                )[0]
+                v = hvp / (hvp.norm() + 1e-12)
+
+            top_eigen = torch.sum(v * hvp)
+
         curvature_vals.append(top_eigen.detach())
 
         with torch.no_grad():

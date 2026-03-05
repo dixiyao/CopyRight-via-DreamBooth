@@ -722,6 +722,9 @@ def main():
     cp_dataloader = infinite_dataloader(
         cp_dataset, args.seed, args.train_batch_size
     )
+    cp_eval_dataloader = infinite_dataloader(
+        cp_dataset, args.seed, args.train_batch_size
+    )
     continue_dataloader = infinite_dataloader(
         continue_dataset, args.seed + 1, args.train_batch_size
     )
@@ -784,6 +787,44 @@ def main():
     unet.train()
     text_encoder.train()
     text_encoder_2.train()
+
+    if not args.disable_phase1_robust_eval and args.cp_step > 0:
+        accelerator.wait_for_everyone()
+
+        if accelerator.is_main_process:
+            print("\n--- Initial Robustness Metrics (before Iteration 1 / Phase 1) ---")
+
+        initial_robustness = evaluate_phase1_robustness(
+            unet=unet,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            vae=vae,
+            noise_scheduler=noise_scheduler,
+            accelerator=accelerator,
+            cp_dataloader=cp_eval_dataloader,
+            encode_batch_fn=encode_batch,
+            resolution=args.resolution,
+            rank=args.rank,
+            min_rank=args.min_rank,
+            alpha_rank_scale=args.alpha_rank_scale,
+            max_timestep=max_timestep,
+            eval_batches=args.robust_eval_batches,
+            hessian_power_iters=args.robust_hessian_power_iters,
+            perturb_magnitudes=args.robust_perturb_magnitudes,
+        )
+
+        if accelerator.is_main_process:
+            print(f"  ScS_c (conditioning sensitivity): {initial_robustness['scs_c']:.6f}")
+            print(f"  Top Hessian eig (conditioning curvature): {initial_robustness['hessian_top_eig']:.6f}")
+            if initial_robustness["perturbation_curve"]:
+                curve_items = ", ".join(
+                    [f"{m:.1e}->{s:.4f}" for m, s in sorted(initial_robustness["perturbation_curve"].items())]
+                )
+                print(f"  Perturbation recovery (cosine): {curve_items}")
+                print(f"  Perturbation recovery AUC: {initial_robustness['perturbation_auc']:.6f}")
+            print("---------------------------------------------------------------\n")
+
+        accelerator.wait_for_everyone()
 
     for iteration in range(1, args.iteration + 1):
         print(f"\n{'='*60}")
@@ -881,7 +922,7 @@ def main():
                     vae=vae,
                     noise_scheduler=noise_scheduler,
                     accelerator=accelerator,
-                    cp_dataloader=cp_dataloader,
+                    cp_dataloader=cp_eval_dataloader,
                     encode_batch_fn=encode_batch,
                     resolution=args.resolution,
                     rank=args.rank,
