@@ -7,6 +7,7 @@ robust additive weight model W_R using zeroth-order (ES-style) updates.
 """
 
 import argparse
+import glob
 import os
 
 import numpy as np
@@ -389,6 +390,11 @@ def main():
         default=None,
         help="Path to wr_checkpoint_step*.pt for resuming RL",
     )
+    parser.add_argument(
+        "--auto_resume_latest",
+        action="store_true",
+        help="Automatically resume from the latest wr_checkpoint_step*.pt in output_dir",
+    )
 
     parser.add_argument(
         "--mixed_precision",
@@ -399,6 +405,37 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args()
+
+    if args.auto_resume_latest:
+        if args.resume_wr_checkpoint is not None:
+            print(
+                "Both --resume_wr_checkpoint and --auto_resume_latest were provided; "
+                "using --resume_wr_checkpoint."
+            )
+        else:
+            checkpoint_pattern = os.path.join(args.output_dir, "wr_checkpoint_step*.pt")
+            checkpoint_candidates = []
+            for checkpoint_path in glob.glob(checkpoint_pattern):
+                checkpoint_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
+                if not checkpoint_name.startswith("wr_checkpoint_step"):
+                    continue
+                step_token = checkpoint_name[len("wr_checkpoint_step"):]
+                if not step_token.isdigit():
+                    continue
+                checkpoint_candidates.append((int(step_token), checkpoint_path))
+
+            if len(checkpoint_candidates) == 0:
+                raise FileNotFoundError(
+                    "--auto_resume_latest was set but no checkpoints matching "
+                    f"{checkpoint_pattern} were found"
+                )
+
+            latest_step, latest_checkpoint = max(checkpoint_candidates, key=lambda x: x[0])
+            args.resume_wr_checkpoint = latest_checkpoint
+            print(
+                f"Auto-resume selected latest WR checkpoint: {latest_checkpoint} "
+                f"(step {latest_step})"
+            )
 
     cp_csv = os.path.join(args.cp_dataset, "prompt.csv")
     cp_image_dir = os.path.join(args.cp_dataset, "image")
