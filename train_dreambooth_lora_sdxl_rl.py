@@ -865,7 +865,7 @@ def main():
             }
         )
 
-        if step % args.save_interval == 0:
+        if step>0 and step % args.save_interval == 0:
             ckpt_path = os.path.join(args.output_dir, f"wr_checkpoint_step{step:06d}.pt")
             torch.save(
                 {
