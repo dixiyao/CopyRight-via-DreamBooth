@@ -295,6 +295,30 @@ class DualLoRATextLinearLayer(nn.Module):
         )
 
 
+def compute_orthogonal_lora_weight_delta(lora_layer, mask=None):
+    """Compute effective weight delta equivalent to OrthogonalLoRALinearLayer forward()."""
+    with torch.no_grad():
+        dtype = lora_layer.q_layer.weight.dtype
+        device = lora_layer.q_layer.weight.device
+
+        if mask is None:
+            mask = torch.ones((1, lora_layer.rank), device=device, dtype=dtype)
+        else:
+            mask = mask.to(device=device, dtype=dtype)
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(0)
+
+        scale = lora_layer.lambda_layer.to(device=device, dtype=dtype) * mask
+        base_scale = lora_layer.base_lambda.to(device=device, dtype=dtype) * mask
+
+        p = lora_layer.p_layer.weight.to(device=device, dtype=dtype)
+        q = lora_layer.q_layer.weight.to(device=device, dtype=dtype)
+        base_p = lora_layer.base_p.weight.to(device=device, dtype=dtype)
+        base_q = lora_layer.base_q.weight.to(device=device, dtype=dtype)
+
+        return (p * scale).matmul(q) - (base_p * base_scale).matmul(base_q)
+
+
 def get_mask_by_timestep(timestep, max_timestep, max_rank, min_rank=1, alpha=1.0):
     r = int(((max_timestep - timestep) / max_timestep) ** alpha * (max_rank - min_rank)) + min_rank
     sigma_mask = torch.zeros((1, max_rank))

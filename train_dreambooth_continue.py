@@ -10,8 +10,6 @@ Dataset structure:
 """
 
 import argparse
-import csv
-import glob
 import os
 import random
 import shutil
@@ -28,6 +26,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer
+from utils import SimpleDreamBoothDataset, simple_dreambooth_collate_fn
 
 
 def load_cifar10_data(size=1024):
@@ -170,40 +169,8 @@ def load_coco_2017_validation_data(download_dir="coco_eval", num_prompts=None):
     return data_pairs
 
 
-def load_custom_data(data_dir):
-    """Load custom data from CSV + image folder format"""
-    csv_path = os.path.join(data_dir, "prompt.csv")
-    image_dir = os.path.join(data_dir, "image")
-
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV file not found: {csv_path}")
-    if not os.path.exists(image_dir):
-        raise FileNotFoundError(f"Image directory not found: {image_dir}")
-
-    data_pairs = []
-    with open(csv_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            prompt = row["prompt"].strip()
-            img_filename = row["img"].strip()
-            img_path = os.path.join(image_dir, img_filename)
-
-            if os.path.exists(img_path):
-                data_pairs.append(
-                    {
-                        "prompt": prompt,
-                        "image_path": img_path,
-                    }
-                )
-            else:
-                print(f"Warning: Image not found: {img_path}")
-
-    print(f"✓ Loaded {len(data_pairs)} custom prompt-image pairs from {csv_path}")
-    return data_pairs
-
-
-class SimpleDreamBoothDataset(Dataset):
-    """Simplified DreamBooth dataset from data pairs"""
+class PromptImagePairsDataset(Dataset):
+    """Dataset from prompt/image pairs (supports in-memory PIL images)."""
 
     def __init__(
         self,
@@ -472,6 +439,10 @@ def main():
     print(f"==========================================\n")
 
     # Set paths and load data based on data_dir
+    data_pairs = None
+    custom_csv_path = None
+    custom_image_dir = None
+
     if args.data_dir.lower() == "cifar10":
         print("Loading CIFAR-10 training data...")
         data_pairs = load_cifar10_data(size=args.resolution)
@@ -482,9 +453,17 @@ def main():
         )
     else:
         print(f"Loading custom data from: {args.data_dir}")
-        data_pairs = load_custom_data(args.data_dir)
+        custom_csv_path = os.path.join(args.data_dir, "prompt.csv")
+        custom_image_dir = os.path.join(args.data_dir, "image")
 
-    if not data_pairs:
+        if not os.path.exists(custom_csv_path):
+            raise FileNotFoundError(f"CSV file not found: {custom_csv_path}")
+        if not os.path.exists(custom_image_dir):
+            raise FileNotFoundError(f"Image directory not found: {custom_image_dir}")
+
+        print(f"✓ Using custom prompt-image data from: {custom_csv_path}")
+
+    if data_pairs is not None and not data_pairs:
         raise ValueError(
             "No data loaded. Please check your data directory or dataset name."
         )
@@ -635,19 +614,31 @@ def main():
     text_encoder_2.requires_grad_(False)
 
     # Create dataset
-    train_dataset = SimpleDreamBoothDataset(
-        data_pairs=data_pairs,
-        tokenizer=tokenizer,
-        tokenizer_2=tokenizer_2,
-        size=args.resolution,
-        center_crop=False,
-    )
+    if custom_csv_path is not None and custom_image_dir is not None:
+        train_dataset = SimpleDreamBoothDataset(
+            csv_path=custom_csv_path,
+            image_dir=custom_image_dir,
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            size=args.resolution,
+            center_crop=False,
+        )
+        dataset_collate_fn = simple_dreambooth_collate_fn
+    else:
+        train_dataset = PromptImagePairsDataset(
+            data_pairs=data_pairs,
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            size=args.resolution,
+            center_crop=False,
+        )
+        dataset_collate_fn = collate_fn
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=dataset_collate_fn,
     )
 
     # Setup optimizer - only optimize trainable (LoRA) parameters
