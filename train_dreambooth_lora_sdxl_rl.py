@@ -383,6 +383,12 @@ def main():
 
     parser.add_argument("--output_dir", type=str, default="checkpoints_rl")
     parser.add_argument("--save_interval", type=int, default=2500)
+    parser.add_argument(
+        "--resume_wr_checkpoint",
+        type=str,
+        default=None,
+        help="Path to wr_checkpoint_step*.pt for resuming RL",
+    )
 
     parser.add_argument(
         "--mixed_precision",
@@ -605,6 +611,40 @@ def main():
     }
 
     wr_names = list(wr_weights.keys())
+    resume_step = -1
+    if args.resume_wr_checkpoint is not None:
+        if not os.path.exists(args.resume_wr_checkpoint):
+            raise FileNotFoundError(
+                f"Resume checkpoint not found: {args.resume_wr_checkpoint}"
+            )
+
+        resume_state = torch.load(args.resume_wr_checkpoint, map_location="cpu")
+        if "W_R" not in resume_state:
+            raise KeyError("Resume checkpoint missing key: 'W_R'")
+        if "step" not in resume_state:
+            raise KeyError("Resume checkpoint missing key: 'step'")
+
+        resume_wr = resume_state["W_R"]
+        for name in wr_names:
+            if name not in resume_wr:
+                raise KeyError(f"Resume checkpoint missing W_R layer: {name}")
+            loaded_tensor = resume_wr[name]
+            if loaded_tensor.shape != wr_weights[name].shape:
+                raise ValueError(
+                    f"Shape mismatch for {name}: checkpoint {tuple(loaded_tensor.shape)} "
+                    f"!= current {tuple(wr_weights[name].shape)}"
+                )
+            wr_weights[name] = loaded_tensor.to(
+                device=wr_weights[name].device,
+                dtype=wr_weights[name].dtype,
+            )
+
+        resume_step = int(resume_state["step"])
+        if resume_step < 0:
+            raise ValueError(f"Invalid resume step: {resume_step}")
+        print(f"Resumed W_R from: {args.resume_wr_checkpoint}")
+        print(f"Resume step: {resume_step}")
+
     layer_offsets = {
         name: (idx + 1) * 1000003
         for idx, name in enumerate(wr_names)
@@ -655,7 +695,16 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    progress_bar = tqdm(range(0, args.rl_steps+1), desc="RL Training")
+    start_step = 0
+    if resume_step >= 0:
+        start_step = resume_step + 1
+        if start_step > args.rl_steps:
+            print(
+                f"Resume step ({resume_step}) is already >= rl_steps ({args.rl_steps}); "
+                "no RL updates will be run."
+            )
+
+    progress_bar = tqdm(range(start_step, args.rl_steps+1), desc="RL Training")
     for step in progress_bar:
         batch = next(cp_loader)
 
