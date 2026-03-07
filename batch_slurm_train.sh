@@ -29,4 +29,4 @@ mkdir -p "$HF_HOME"
 
 # python generate_robust.py --lora_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/final --prompt "A 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 by the lake." --output_path output.png --use_refiner --num_inference_steps 50 --use_refiner --num_inference_steps 50
 
-python train_dreambooth_lora_sdxl_rl.py --cp_dataset data/cp_chikawa_new --checkpoint_path checkpoint-iter001-lora1-step5000 
+python train_dreambooth_lora_sdxl_rl.py --cp_dataset data/cp_chikawa_new --checkpoint_path net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/checkpoint-iter001-lora1-step5000 
