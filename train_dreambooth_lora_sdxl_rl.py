@@ -15,9 +15,13 @@ import torch.nn.functional as F
 from diffusers import (AutoencoderKL, DDPMScheduler, PNDMScheduler,
                        StableDiffusionXLPipeline, UNet2DConditionModel)
 try:
-    from torch.func import functional_call
+    from torch.func import functional_call, vmap
 except ImportError:
     from torch.nn.utils.stateless import functional_call
+    try:
+        from functorch import vmap
+    except ImportError:
+        vmap = None
 from tlora_module import (DualLoRACrossAttnProcessor,
                           DualLoRATextLinearLayer,
                           attach_tlora_sigma_mask_hook,
@@ -123,6 +127,43 @@ def build_unet_wr_delta_overrides(unet_override_specs, wr_weights, deltas=None):
     return overrides
 
 
+def build_unet_wr_delta_overrides_batched(unet_override_specs, wr_weights, deltas_batched):
+    """Build batched UNet overrides for chunked/vmap forward.
+
+    Each leaf tensor has shape [chunk, ...].
+    """
+    overrides = {}
+    for full_name, local_name, base_param in unet_override_specs:
+        delta_chunk = deltas_batched[full_name]
+        base_plus_wr = (base_param + wr_weights[full_name]).to(
+            device=base_param.device,
+            dtype=base_param.dtype,
+        )
+        overrides[local_name] = base_plus_wr.unsqueeze(0) + delta_chunk.to(
+            device=base_param.device,
+            dtype=base_param.dtype,
+        )
+    return overrides
+
+
+def sample_delta_chunk(base, sigma, magnitude, chunk_alphas, chunk_seeds, layer_offset):
+    """Deterministically sample normalized perturbation deltas for a chunk."""
+    chunk_size = int(chunk_alphas.shape[0])
+    deltas = torch.empty((chunk_size, *base.shape), device=base.device, dtype=base.dtype)
+
+    for idx in range(chunk_size):
+        generator = torch.Generator(device=base.device)
+        generator.manual_seed(int(chunk_seeds[idx].item()) + int(layer_offset))
+
+        delta = torch.randn(base.shape, device=base.device, dtype=base.dtype, generator=generator)
+        delta = delta * float(sigma)
+        delta_norm = delta.norm(2).clamp_min(1e-12)
+        delta = delta / delta_norm * magnitude
+        deltas[idx] = delta * chunk_alphas[idx].to(dtype=base.dtype)
+
+    return deltas
+
+
 class WRInjectedUNet(torch.nn.Module):
     """UNet wrapper that performs virtual forward with W = W0 + WR (+ delta=None for generation)."""
 
@@ -131,14 +172,22 @@ class WRInjectedUNet(torch.nn.Module):
         self.base_unet = base_unet
         self.unet_override_specs = unet_override_specs
         self.wr_weights = wr_weights
+        self._cached_overrides = None
 
-    def forward(self, *args, **kwargs):
-        unet_overrides = build_unet_wr_delta_overrides(
+    def refresh_overrides(self):
+        self._cached_overrides = build_unet_wr_delta_overrides(
             unet_override_specs=self.unet_override_specs,
             wr_weights=self.wr_weights,
             deltas=None,
         )
-        return _module_functional_call(self.base_unet, unet_overrides, *args, **kwargs)
+
+    def clear_overrides_cache(self):
+        self._cached_overrides = None
+
+    def forward(self, *args, **kwargs):
+        if self._cached_overrides is None:
+            self.refresh_overrides()
+        return _module_functional_call(self.base_unet, self._cached_overrides, *args, **kwargs)
 
     @property
     def config(self):
@@ -310,6 +359,12 @@ def main():
 
     parser.add_argument("--rl_steps", type=int, default=10000)
     parser.add_argument("--G", type=int, default=16, help="Perturbation samples per step")
+    parser.add_argument(
+        "--g_eval_batch_size",
+        type=int,
+        default=4,
+        help="Number of perturbations to evaluate together (vmap chunk size)",
+    )
     parser.add_argument("--magnitude", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=0.05)
 
@@ -550,6 +605,10 @@ def main():
     }
 
     wr_names = list(wr_weights.keys())
+    layer_offsets = {
+        name: (idx + 1) * 1000003
+        for idx, name in enumerate(wr_names)
+    }
     unet_override_specs = []
     for full_name in wr_names:
         if not full_name.startswith("unet."):
@@ -590,9 +649,13 @@ def main():
         "max_timestep": max_timestep,
     }
 
+    g_eval_batch_size = max(1, int(args.g_eval_batch_size))
+    if vmap is None and g_eval_batch_size > 1:
+        print("Warning: vmap is unavailable; falling back to sequential perturbation evaluation.")
+
     os.makedirs(args.output_dir, exist_ok=True)
 
-    progress_bar = tqdm(range(1, args.rl_steps + 1), desc="RL Training")
+    progress_bar = tqdm(range(0, args.rl_steps+1), desc="RL Training")
     for step in progress_bar:
         batch = next(cp_loader)
 
@@ -642,45 +705,110 @@ def main():
             -torch.ones((args.G,), device=device, dtype=torch.float32),
         )
 
-        delta_batches = {}
-        for name in wr_names:
-            sigma = layer_stats[name]
-            base = wr_weights[name]
-            deltas = torch.randn(
-                (args.G, *base.shape),
-                device=base.device,
-                dtype=base.dtype,
-            ) * sigma
-            flat = deltas.view(args.G, -1)
-            norms = flat.norm(2, dim=1, keepdim=True).clamp_min(1e-12)
-            deltas = deltas / norms.view((args.G,) + (1,) * base.ndim)
-            deltas = deltas * args.magnitude
-            deltas = deltas * alphas.view((args.G,) + (1,) * base.ndim).to(deltas.dtype)
-            delta_batches[name] = deltas
+        perturb_seeds = torch.randint(
+            low=0,
+            high=2**31 - 1,
+            size=(args.G,),
+            dtype=torch.int64,
+            device="cpu",
+        )
 
         rewards_tensor = torch.empty((args.G,), dtype=torch.float32, device=device)
         with torch.inference_mode():
-            for g in range(args.G):
-                deltas = {name: delta_batches[name][g] for name in wr_names}
-                unet_overrides = build_unet_wr_delta_overrides(
-                    unet_override_specs=unet_override_specs,
-                    wr_weights=wr_weights,
-                    deltas=deltas,
-                )
-                model_pred = _module_functional_call(
-                    unet,
-                    unet_overrides,
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                    cross_attention_kwargs={"sigma_mask": sigma_mask},
-                ).sample
-                loss_i = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                rewards_tensor[g] = -loss_i.float()
+            for start in range(0, args.G, g_eval_batch_size):
+                end = min(start + g_eval_batch_size, args.G)
+                chunk = end - start
+
+                chunk_alphas = alphas[start:end]
+                chunk_seeds = perturb_seeds[start:end]
+
+                deltas_chunk = {}
+                for name in wr_names:
+                    deltas_chunk[name] = sample_delta_chunk(
+                        base=wr_weights[name],
+                        sigma=layer_stats[name],
+                        magnitude=args.magnitude,
+                        chunk_alphas=chunk_alphas,
+                        chunk_seeds=chunk_seeds,
+                        layer_offset=layer_offsets[name],
+                    )
+
+                if vmap is not None and chunk > 1:
+                    batched_overrides = build_unet_wr_delta_overrides_batched(
+                        unet_override_specs=unet_override_specs,
+                        wr_weights=wr_weights,
+                        deltas_batched=deltas_chunk,
+                    )
+
+                    noisy_batched = noisy_latents.unsqueeze(0).expand(chunk, *noisy_latents.shape)
+                    timesteps_batched = timesteps.unsqueeze(0).expand(chunk, *timesteps.shape)
+                    prompt_batched = prompt_embeds.unsqueeze(0).expand(chunk, *prompt_embeds.shape)
+                    pooled_batched = pooled_prompt_embeds.unsqueeze(0).expand(chunk, *pooled_prompt_embeds.shape)
+                    time_ids_batched = add_time_ids.unsqueeze(0).expand(chunk, *add_time_ids.shape)
+                    sigma_batched = sigma_mask.unsqueeze(0).expand(chunk, *sigma_mask.shape)
+
+                    def _single_forward(
+                        one_overrides,
+                        one_noisy,
+                        one_timestep,
+                        one_prompt,
+                        one_pooled,
+                        one_time_ids,
+                        one_sigma,
+                    ):
+                        return _module_functional_call(
+                            unet,
+                            one_overrides,
+                            one_noisy,
+                            one_timestep,
+                            encoder_hidden_states=one_prompt,
+                            added_cond_kwargs={
+                                "text_embeds": one_pooled,
+                                "time_ids": one_time_ids,
+                            },
+                            cross_attention_kwargs={"sigma_mask": one_sigma},
+                        ).sample
+
+                    model_pred = vmap(
+                        _single_forward,
+                        in_dims=(0, 0, 0, 0, 0, 0, 0),
+                    )(
+                        batched_overrides,
+                        noisy_batched,
+                        timesteps_batched,
+                        prompt_batched,
+                        pooled_batched,
+                        time_ids_batched,
+                        sigma_batched,
+                    )
+
+                    noise_batched = noise.unsqueeze(0).expand_as(model_pred)
+                    losses = ((model_pred.float() - noise_batched.float()) ** 2).mean(
+                        dim=tuple(range(1, model_pred.ndim))
+                    )
+                    rewards_tensor[start:end] = -losses
+                else:
+                    for local_idx in range(chunk):
+                        deltas = {name: deltas_chunk[name][local_idx] for name in wr_names}
+                        unet_overrides = build_unet_wr_delta_overrides(
+                            unet_override_specs=unet_override_specs,
+                            wr_weights=wr_weights,
+                            deltas=deltas,
+                        )
+                        model_pred = _module_functional_call(
+                            unet,
+                            unet_overrides,
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states=prompt_embeds,
+                            added_cond_kwargs={
+                                "text_embeds": pooled_prompt_embeds,
+                                "time_ids": add_time_ids,
+                            },
+                            cross_attention_kwargs={"sigma_mask": sigma_mask},
+                        ).sample
+                        loss_i = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+                        rewards_tensor[start + local_idx] = -loss_i.float()
 
         avg_reward_t = rewards_tensor.mean()
         std_reward_t = rewards_tensor.std(unbiased=False)
@@ -688,13 +816,33 @@ def main():
         avg_reward = float(avg_reward_t.item())
         std_reward = float(std_reward_t.item())
 
-        for name in wr_names:
-            deltas = delta_batches[name]
-            adv_view = advantages.view((args.G,) + (1,) * wr_weights[name].ndim).to(deltas.dtype)
-            grad_estimate = (adv_view * deltas).sum(dim=0)
-            wr_weights[name] += (args.lr / args.G) * grad_estimate
+        grad_accum = {name: torch.zeros_like(wr_weights[name]) for name in wr_names}
+        for start in range(0, args.G, g_eval_batch_size):
+            end = min(start + g_eval_batch_size, args.G)
+            chunk = end - start
 
-        if args.gen_interval > 0 and step % args.gen_interval == 0:
+            chunk_alphas = alphas[start:end]
+            chunk_seeds = perturb_seeds[start:end]
+            adv_chunk = advantages[start:end]
+
+            for name in wr_names:
+                deltas = sample_delta_chunk(
+                    base=wr_weights[name],
+                    sigma=layer_stats[name],
+                    magnitude=args.magnitude,
+                    chunk_alphas=chunk_alphas,
+                    chunk_seeds=chunk_seeds,
+                    layer_offset=layer_offsets[name],
+                )
+                adv_view = adv_chunk.view((chunk,) + (1,) * wr_weights[name].ndim).to(deltas.dtype)
+                grad_accum[name] += (adv_view * deltas).sum(dim=0)
+
+        for name in wr_names:
+            wr_weights[name] += (args.lr / args.G) * grad_accum[name]
+
+        generation_unet.clear_overrides_cache()
+
+        if step % args.gen_interval == 0:
             save_generation_snapshot(
                 step=step,
                 output_dir=args.output_dir,
