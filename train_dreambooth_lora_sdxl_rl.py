@@ -657,7 +657,10 @@ def main():
 
     progress_bar = tqdm(range(0, args.rl_steps+1), desc="RL Training")
     for step in progress_bar:
-        if step % args.gen_interval == 0:
+        batch = next(cp_loader)
+
+        if step == 0:
+            generation_unet.clear_overrides_cache()
             save_generation_snapshot(
                 step=step,
                 output_dir=args.output_dir,
@@ -666,9 +669,8 @@ def main():
                 device=device,
                 resolution=args.resolution,
                 num_inference_steps=args.gen_num_inference_steps,
-                noise=noise,
+                noise=None,
             )
-        batch = next(cp_loader)
 
         (
             noisy_latents,
@@ -852,6 +854,18 @@ def main():
             wr_weights[name] += (args.lr / args.G) * grad_accum[name]
 
         generation_unet.clear_overrides_cache()
+
+        if step > 0 and step % args.gen_interval == 0:
+            save_generation_snapshot(
+                step=step,
+                output_dir=args.output_dir,
+                batch=batch,
+                generation_pipeline=generation_pipeline,
+                device=device,
+                resolution=args.resolution,
+                num_inference_steps=args.gen_num_inference_steps,
+                noise=noise,
+            )
 
         avg_mse = -avg_reward
         avg_sigma = float(np.mean(list(layer_stats.values())))
