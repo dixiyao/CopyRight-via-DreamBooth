@@ -8,8 +8,9 @@ import argparse
 import os
 
 import torch
-from diffusers import (DiffusionPipeline, EulerDiscreteScheduler,
-                       StableDiffusionXLPipeline)
+from diffusers import StableDiffusionXLPipeline
+from utils import (create_sdxl_refiner_pipeline,
+                   prepare_sdxl_pipeline_for_inference, run_sdxl_inference)
 
 
 def load_lora_weights(pipeline, lora_path):
@@ -86,32 +87,21 @@ def generate_image_in_memory(
     # Reuse pipeline if provided (for efficiency)
     if pipeline_cache is None:
         # Load base pipeline
+        torch_dtype = torch.float16 if device == "cuda" else torch.float32
+        variant = "fp16" if device == "cuda" else None
+
         base = StableDiffusionXLPipeline.from_pretrained(
             base_model,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            variant="fp16" if device == "cuda" else None,
+            torch_dtype=torch_dtype,
+            variant=variant,
             use_safetensors=True,
         )
         base.to(device)
-
-        # Enable VAE slicing and tiling for memory efficiency
-        # Note: We don't force VAE to float32 as it causes dtype mismatch errors
-        # The pipeline will handle VAE upcasting automatically when needed
-        if hasattr(base, "vae") and base.vae is not None:
-            if hasattr(base.vae, "enable_slicing"):
-                base.vae.enable_slicing()
-            if hasattr(base.vae, "enable_tiling"):
-                base.vae.enable_tiling()
+        base = prepare_sdxl_pipeline_for_inference(base)
 
         # Set scheduler if provided (e.g., for MLPerf benchmark compatibility)
         if scheduler is not None:
             base.scheduler = scheduler
-
-        # Enable memory efficient attention if available
-        try:
-            base.enable_xformers_memory_efficient_attention()
-        except (ImportError, AttributeError):
-            pass
 
         # Load LoRA weights if provided
         if lora_path:
@@ -120,29 +110,12 @@ def generate_image_in_memory(
         # Load refiner if requested
         refiner = None
         if use_refiner:
-            refiner = DiffusionPipeline.from_pretrained(
-                "stabilityai/stable-diffusion-xl-refiner-1.0",
-                text_encoder_2=base.text_encoder_2,
-                vae=base.vae,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-                use_safetensors=True,
-                variant="fp16" if device == "cuda" else None,
+            refiner = create_sdxl_refiner_pipeline(
+                base_pipeline=base,
+                device=device,
+                torch_dtype=torch_dtype,
+                variant=variant,
             )
-            refiner.to(device)
-
-            # Enable VAE slicing and tiling for memory efficiency
-            # Note: We don't force VAE to float32 as it causes dtype mismatch errors
-            # The pipeline will handle VAE upcasting automatically when needed
-            if hasattr(refiner, "vae") and refiner.vae is not None:
-                if hasattr(refiner.vae, "enable_slicing"):
-                    refiner.vae.enable_slicing()
-                if hasattr(refiner.vae, "enable_tiling"):
-                    refiner.vae.enable_tiling()
-
-            try:
-                refiner.enable_xformers_memory_efficient_attention()
-            except (ImportError, AttributeError):
-                pass
     else:
         base = pipeline_cache["base"]
         refiner = pipeline_cache.get("refiner", None)
@@ -154,41 +127,18 @@ def generate_image_in_memory(
         generator = torch.Generator(device=device)
         generator.manual_seed(seed)
 
-    if refiner is not None:
-        # Use base + refiner pipeline
-        high_noise_frac = 0.8
-        image = base(
-            prompt=prompt,
-            num_inference_steps=num_inference_steps,
-            denoising_end=high_noise_frac,
-            output_type="latent",
-            height=height,
-            width=width,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            latents=latents,
-        ).images
-
-        image = refiner(
-            prompt=prompt,
-            num_inference_steps=num_inference_steps,
-            denoising_start=high_noise_frac,
-            image=image,
-            generator=generator,
-        ).images[0]
-    else:
-        # Use base pipeline only
-        image = base(
-            prompt=prompt,
-            num_inference_steps=num_inference_steps,
-            height=height,
-            width=width,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            latents=latents,
-        ).images[0]
-
-    return image
+    return run_sdxl_inference(
+        base_pipeline=base,
+        prompt=prompt,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        height=height,
+        width=width,
+        generator=generator,
+        latents=latents,
+        use_refiner=refiner is not None,
+        refiner_pipeline=refiner,
+    )
 
 
 def create_pipeline_cache(
@@ -200,32 +150,21 @@ def create_pipeline_cache(
 ):
     """Create and cache pipeline for reuse across multiple generations"""
     # Load base pipeline
+    torch_dtype = torch.float16 if device == "cuda" else torch.float32
+    variant = "fp16" if device == "cuda" else None
+
     base = StableDiffusionXLPipeline.from_pretrained(
         base_model,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        variant="fp16" if device == "cuda" else None,
+        torch_dtype=torch_dtype,
+        variant=variant,
         use_safetensors=True,
     )
     base.to(device)
-
-    # Enable VAE slicing and tiling for memory efficiency
-    # Note: We don't force VAE to float32 as it causes dtype mismatch errors
-    # The pipeline will handle VAE upcasting automatically when needed
-    if hasattr(base, "vae") and base.vae is not None:
-        if hasattr(base.vae, "enable_slicing"):
-            base.vae.enable_slicing()
-        if hasattr(base.vae, "enable_tiling"):
-            base.vae.enable_tiling()
+    base = prepare_sdxl_pipeline_for_inference(base)
 
     # Set scheduler if provided (e.g., for MLPerf benchmark compatibility)
     if scheduler is not None:
         base.scheduler = scheduler
-
-    # Enable memory efficient attention if available
-    try:
-        base.enable_xformers_memory_efficient_attention()
-    except (ImportError, AttributeError):
-        pass
 
     # Load LoRA weights if provided
     if lora_path:
@@ -234,29 +173,12 @@ def create_pipeline_cache(
     # Load refiner if requested
     refiner = None
     if use_refiner:
-        refiner = DiffusionPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-refiner-1.0",
-            text_encoder_2=base.text_encoder_2,
-            vae=base.vae,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            use_safetensors=True,
-            variant="fp16" if device == "cuda" else None,
+        refiner = create_sdxl_refiner_pipeline(
+            base_pipeline=base,
+            device=device,
+            torch_dtype=torch_dtype,
+            variant=variant,
         )
-        refiner.to(device)
-
-        # Enable VAE slicing and tiling for memory efficiency
-        # Note: We don't force VAE to float32 as it causes dtype mismatch errors
-        # The pipeline will handle VAE upcasting automatically when needed
-        if hasattr(refiner, "vae") and refiner.vae is not None:
-            if hasattr(refiner.vae, "enable_slicing"):
-                refiner.vae.enable_slicing()
-            if hasattr(refiner.vae, "enable_tiling"):
-                refiner.vae.enable_tiling()
-
-        try:
-            refiner.enable_xformers_memory_efficient_attention()
-        except (ImportError, AttributeError):
-            pass
 
     return {"base": base, "refiner": refiner}
 
@@ -335,7 +257,7 @@ def main():
     args = parser.parse_args()
 
     # Generate image using in-memory function
-    print(f"Loading model and generating image...")
+    print("Loading model and generating image...")
     image = generate_image_in_memory(
         prompt=args.prompt,
         lora_path=args.lora_path,

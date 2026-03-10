@@ -38,7 +38,7 @@ from tqdm.auto import tqdm
 from transformers import (CLIPTextModel, CLIPTextModelWithProjection,
                           CLIPTokenizer)
 from utils import (SimpleDreamBoothDataset, infinite_dataloader,
-                   resolve_checkpoint_paths)
+                   resolve_checkpoint_paths, run_sdxl_inference)
 
 
 def collect_trainable_layers(unet):
@@ -310,24 +310,20 @@ def save_generation_snapshot(
     generator = torch.Generator(device=device)
     generator.manual_seed(int(step))
 
-    has_text_mask = set_text_encoder_sigma_for_generation(
-        generation_pipeline,
+    image = run_sdxl_inference(
+        base_pipeline=generation_pipeline,
+        prompt=prompt_text,
         num_inference_steps=num_inference_steps,
+        guidance_scale=7.5,
+        height=resolution,
+        width=resolution,
+        generator=generator,
+        latents=latent_noise,
+        use_refiner=False,
+        refiner_pipeline=None,
+        set_text_sigma_for_generation=set_text_encoder_sigma_for_generation,
+        clear_text_sigma_mask=clear_text_encoder_sigma_mask,
     )
-    try:
-        with torch.inference_mode():
-            image = generation_pipeline(
-                prompt=prompt_text,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=7.5,
-                height=resolution,
-                width=resolution,
-                generator=generator,
-                latents=latent_noise,
-            ).images[0]
-    finally:
-        if has_text_mask:
-            clear_text_encoder_sigma_mask()
 
     gen_dir = os.path.join(output_dir, "generated")
     os.makedirs(gen_dir, exist_ok=True)

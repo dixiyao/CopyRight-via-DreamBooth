@@ -30,7 +30,9 @@ from tlora_module import (DualLoRACrossAttnProcessor,
                           set_text_encoder_sigma_for_generation)
 from transformers import (CLIPTextModel, CLIPTextModelWithProjection,
                           CLIPTokenizer)
-from utils import resolve_checkpoint_paths
+from utils import (create_sdxl_refiner_pipeline,
+                   prepare_sdxl_pipeline_for_inference,
+                   resolve_checkpoint_paths, run_sdxl_inference)
 
 try:
     from torch.func import functional_call
@@ -297,6 +299,11 @@ def main():
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--use_refiner",
+        action="store_true",
+        help="Use SDXL refiner for better quality",
+    )
 
     parser.add_argument(
         "--perturbation",
@@ -360,6 +367,7 @@ def main():
     print(f"Dual-LoRA checkpoint: {lora_path}")
     print(f"Base model: {base_model}")
     print(f"Prompt: {args.prompt}")
+    print(f"Use refiner: {args.use_refiner}")
     print(f"Perturbation enabled: {args.perturbation}")
     if args.perturbation:
         print(f"Perturbation magnitude: {args.magnitude}")
@@ -570,6 +578,7 @@ def main():
         add_watermarker=False,
     )
     generation_pipeline = generation_pipeline.to(device)
+    generation_pipeline = prepare_sdxl_pipeline_for_inference(generation_pipeline)
     generation_pipeline.set_progress_bar_config(disable=True)
     generation_pipeline.tlora_text_encoder_config = {
         "rank": rank,
@@ -578,29 +587,34 @@ def main():
         "max_timestep": max_timestep,
     }
 
+    refiner_pipeline = None
+    if args.use_refiner:
+        refiner_pipeline = create_sdxl_refiner_pipeline(
+            base_pipeline=generation_pipeline,
+            device=device,
+            torch_dtype=model_dtype,
+            variant=variant,
+        )
+
     generator = None
     if args.seed is not None:
         generator = torch.Generator(device=device)
         generator.manual_seed(int(args.seed))
 
-    has_text_mask = set_text_encoder_sigma_for_generation(
-        generation_pipeline,
+    image = run_sdxl_inference(
+        base_pipeline=generation_pipeline,
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
         num_inference_steps=args.num_inference_steps,
+        guidance_scale=args.guidance_scale,
+        height=height,
+        width=width,
+        generator=generator,
+        use_refiner=args.use_refiner,
+        refiner_pipeline=refiner_pipeline,
+        set_text_sigma_for_generation=set_text_encoder_sigma_for_generation,
+        clear_text_sigma_mask=clear_text_encoder_sigma_mask,
     )
-    try:
-        with torch.inference_mode():
-            image = generation_pipeline(
-                prompt=args.prompt,
-                negative_prompt=args.negative_prompt,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.guidance_scale,
-                height=height,
-                width=width,
-                generator=generator,
-            ).images[0]
-    finally:
-        if has_text_mask:
-            clear_text_encoder_sigma_mask()
 
     output_dir = os.path.dirname(args.output_path)
     if output_dir:

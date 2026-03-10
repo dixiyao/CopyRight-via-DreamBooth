@@ -147,3 +147,108 @@ def resolve_checkpoint_paths(lora_path):
         os.path.join(checkpoint_dir, "text_encoder_dual_lora_weights.pt"),
         os.path.join(checkpoint_dir, "text_encoder_2_dual_lora_weights.pt"),
     )
+
+
+def prepare_sdxl_pipeline_for_inference(pipeline):
+    if hasattr(pipeline, "vae") and pipeline.vae is not None:
+        if hasattr(pipeline.vae, "enable_slicing"):
+            pipeline.vae.enable_slicing()
+        if hasattr(pipeline.vae, "enable_tiling"):
+            pipeline.vae.enable_tiling()
+
+    try:
+        pipeline.enable_xformers_memory_efficient_attention()
+    except (ImportError, AttributeError):
+        pass
+
+    return pipeline
+
+
+def create_sdxl_refiner_pipeline(
+    base_pipeline,
+    device,
+    torch_dtype,
+    variant=None,
+    model_name_or_path="stabilityai/stable-diffusion-xl-refiner-1.0",
+):
+    from diffusers import DiffusionPipeline
+
+    refiner = DiffusionPipeline.from_pretrained(
+        model_name_or_path,
+        text_encoder_2=base_pipeline.text_encoder_2,
+        vae=base_pipeline.vae,
+        torch_dtype=torch_dtype,
+        use_safetensors=True,
+        variant=variant,
+    )
+    refiner.to(device)
+    return prepare_sdxl_pipeline_for_inference(refiner)
+
+
+def run_sdxl_inference(
+    base_pipeline,
+    prompt,
+    num_inference_steps,
+    guidance_scale,
+    height,
+    width,
+    generator=None,
+    latents=None,
+    negative_prompt=None,
+    use_refiner=False,
+    refiner_pipeline=None,
+    high_noise_frac=0.8,
+    set_text_sigma_for_generation=None,
+    clear_text_sigma_mask=None,
+):
+    if use_refiner and refiner_pipeline is None:
+        raise ValueError("use_refiner=True requires a non-None refiner_pipeline")
+
+    has_text_mask = False
+    if set_text_sigma_for_generation is not None:
+        has_text_mask = bool(
+            set_text_sigma_for_generation(
+                base_pipeline,
+                num_inference_steps,
+            )
+        )
+
+    try:
+        with torch.inference_mode():
+            if use_refiner:
+                latent_image = base_pipeline(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    num_inference_steps=num_inference_steps,
+                    denoising_end=high_noise_frac,
+                    output_type="latent",
+                    height=height,
+                    width=width,
+                    guidance_scale=guidance_scale,
+                    generator=generator,
+                    latents=latents,
+                ).images
+            else:
+                return base_pipeline(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    num_inference_steps=num_inference_steps,
+                    height=height,
+                    width=width,
+                    guidance_scale=guidance_scale,
+                    generator=generator,
+                    latents=latents,
+                ).images[0]
+    finally:
+        if has_text_mask and clear_text_sigma_mask is not None:
+            clear_text_sigma_mask()
+
+    with torch.inference_mode():
+        return refiner_pipeline(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_inference_steps=num_inference_steps,
+            denoising_start=high_noise_frac,
+            image=latent_image,
+            generator=generator,
+        ).images[0]
