@@ -29,4 +29,6 @@ mkdir -p "$HF_HOME"
 
 # python generate_robust.py --lora_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/final --prompt "A 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 by the lake." --output_path output.png --use_refiner --num_inference_steps 50 --use_refiner --num_inference_steps 50
 
-python train_dreambooth_lora_sdxl_rl.py --cp_dataset data/cp_chikawa_new_2 --checkpoint_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/checkpoint-iter001-lora1-step5000/ --output_dir /net/projects2/litian-lab/dixi/checkpoints_tlora_rl --auto_resume_latest
+# python train_dreambooth_lora_sdxl_rl.py --cp_dataset data/cp_chikawa_new_2 --checkpoint_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/checkpoint-iter001-lora1-step5000/ --output_dir /net/projects2/litian-lab/dixi/checkpoints_tlora_rl --auto_resume_latest
+
+python train_dreambooth_continue.py --lora_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/checkpoint-iter001-lora1-step5000/ --rl_checkpoint /net/projects2/litian-lab/dixi/checkpoints_tlora_rl/wr_final.pt --data_dir sdxl --max_train_steps 50000 --checkpointing_steps 5000 --checkpoints_total_limit 10 --auto_resume_latest --output_dir /net/projects2/litian-lab/dixi/checkpoints_tlora_continue
