@@ -39,7 +39,7 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
@@ -336,6 +336,18 @@ def save_checkpoint(
                 print(f"Removed old checkpoint: {old_path}")
 
 
+def parse_checkpoint_step_from_name(checkpoint_path):
+    checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
+    if not checkpoint_name.startswith("checkpoint-"):
+        return 0
+
+    step_token = checkpoint_name[len("checkpoint-"):]
+    if not step_token.isdigit():
+        return 0
+
+    return int(step_token)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -465,6 +477,32 @@ def main():
                 f"(step {latest_step})"
             )
 
+    resume_checkpoint_path = None
+    resume_step = 0
+    if args.resume_from_checkpoint:
+        checkpoint_path = args.resume_from_checkpoint
+        if not os.path.isabs(checkpoint_path):
+            checkpoint_path = os.path.join(args.output_dir, checkpoint_path)
+
+        if not os.path.isdir(checkpoint_path):
+            raise FileNotFoundError(f"Resume checkpoint directory not found: {checkpoint_path}")
+
+        adapter_safetensors = os.path.join(checkpoint_path, "adapter_model.safetensors")
+        adapter_bin = os.path.join(checkpoint_path, "adapter_model.bin")
+        if not (os.path.exists(adapter_safetensors) or os.path.exists(adapter_bin)):
+            raise FileNotFoundError(
+                "Resume checkpoint must contain LoRA adapter weights "
+                "(adapter_model.safetensors or adapter_model.bin), but neither was found in: "
+                f"{checkpoint_path}"
+            )
+
+        resume_checkpoint_path = checkpoint_path
+        resume_step = parse_checkpoint_step_from_name(checkpoint_path)
+        print(
+            f"Resuming LoRA adapter from: {resume_checkpoint_path} "
+            f"(parsed step {resume_step})"
+        )
+
     print(f"\n{'=' * 60}")
     print("Continue Training: SDXL + T-LoRA + W_R backbone + New LoRA")
     print(f"{'=' * 60}")
@@ -475,6 +513,8 @@ def main():
     print(f"New LoRA config : rank={args.rank}, alpha={args.lora_alpha}")
     print(f"Max steps       : {args.max_train_steps}")
     print(f"Output dir      : {args.output_dir}")
+    if resume_checkpoint_path is not None:
+        print(f"Resume adapter  : {resume_checkpoint_path}")
     print(f"{'=' * 60}\n")
 
     # RL checkpoint metadata
@@ -697,7 +737,14 @@ def main():
         lora_dropout=args.lora_dropout,
         bias="none",
     )
-    unet = get_peft_model(unet, lora_config)
+    if resume_checkpoint_path is None:
+        unet = get_peft_model(unet, lora_config)
+    else:
+        unet = PeftModel.from_pretrained(
+            unet,
+            resume_checkpoint_path,
+            is_trainable=True,
+        )
 
     trainable_params_count = sum(p.numel() for p in unet.parameters() if p.requires_grad)
     total_params_count = sum(p.numel() for p in unet.parameters())
@@ -810,22 +857,16 @@ def main():
 
     # Training loop
     unet.train()
-    global_step = 0
-
-    if args.resume_from_checkpoint:
-        checkpoint_path = args.resume_from_checkpoint
-        if not os.path.isabs(checkpoint_path):
-            checkpoint_path = os.path.join(args.output_dir, checkpoint_path)
-        print(f"Resuming from checkpoint: {checkpoint_path}")
-        accelerator.load_state(checkpoint_path)
-        if hasattr(accelerator.state, "global_step"):
-            global_step = accelerator.state.global_step
-            print(f"Resumed from step: {global_step}")
+    global_step = int(resume_step)
+    if resume_checkpoint_path is not None:
+        print(f"Continuing training from step {global_step}")
 
     progress_bar = tqdm(
         range(args.max_train_steps), disable=not accelerator.is_local_main_process
     )
     progress_bar.set_description("Steps")
+    if global_step > 0:
+        progress_bar.update(min(global_step, args.max_train_steps))
 
     for batch in infinite_train_dataloader:
         if global_step >= args.max_train_steps:
