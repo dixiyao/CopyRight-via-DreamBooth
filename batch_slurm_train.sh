@@ -31,4 +31,4 @@ mkdir -p "$HF_HOME"
 
 # python train_dreambooth_lora_sdxl_rl.py --cp_dataset data/cp_chikawa_new_2 --checkpoint_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/checkpoint-iter001-lora1-step5000/ --output_dir /net/projects2/litian-lab/dixi/checkpoints_tlora_rl --auto_resume_latest
 
-python train_dreambooth_continue.py --lora_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/checkpoint-iter001-lora1-step5000/ --rl_checkpoint /net/projects2/litian-lab/dixi/checkpoints_tlora_rl/wr_final.pt --data_dir data/sdxl --max_train_steps 50000 --checkpointing_steps 5000 --checkpoints_total_limit 10 --output_dir /net/projects2/litian-lab/dixi/checkpoints_tlora_continue --auto_resume_latest 
+python train_dreambooth_continue.py --lora_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/checkpoint-iter001-lora1-step5000/ --rl_checkpoint /net/projects2/litian-lab/dixi/checkpoints_tlora_rl/wr_final.pt --data_dir data/sdxl --max_train_steps 100000 --checkpointing_steps 5000 --checkpoints_total_limit 10 --output_dir /net/projects2/litian-lab/dixi/checkpoints_tlora_continue --auto_resume_latest 
