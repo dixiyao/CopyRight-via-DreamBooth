@@ -37,6 +37,7 @@ Additionally:
 
 import argparse
 import csv
+import difflib
 import importlib
 import json
 import math
@@ -287,13 +288,26 @@ def compute_sscd_disc_mixup_proxy(
 
 
 def resolve_cp_dataset_path(cp_dataset: str) -> str:
+    cp_dataset = os.path.expanduser(cp_dataset)
     csv_path = os.path.join(cp_dataset, "prompt.csv")
     img_dir = os.path.join(cp_dataset, "image")
 
+    suggestion = ""
+    parent_dir = os.path.dirname(cp_dataset) or "."
+    dataset_name = os.path.basename(cp_dataset)
+    if os.path.isdir(parent_dir):
+        candidates = [
+            d for d in os.listdir(parent_dir)
+            if os.path.isdir(os.path.join(parent_dir, d))
+        ]
+        close = difflib.get_close_matches(dataset_name, candidates, n=3, cutoff=0.6)
+        if close:
+            suggestion = f" Did you mean: {', '.join(os.path.join(parent_dir, c) for c in close)} ?"
+
     if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"cp_dataset prompt.csv not found: {csv_path}")
+        raise FileNotFoundError(f"cp_dataset prompt.csv not found: {csv_path}.{suggestion}")
     if not os.path.isdir(img_dir):
-        raise FileNotFoundError(f"cp_dataset image directory not found: {img_dir}")
+        raise FileNotFoundError(f"cp_dataset image directory not found: {img_dir}.{suggestion}")
 
     return cp_dataset
 
@@ -482,7 +496,7 @@ def main():
     parser.add_argument("--prompt_model", type=str, default="gemini-3.0-pro", help="Prompt generation model (e.g., gemini 3.0)")
 
     parser.add_argument("--base_model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0")
-    parser.add_argument("--cp_dataset", type=str, default="cp_chikwa_new", help="CP dataset directory (contains prompt.csv and image/)")
+    parser.add_argument("--cp_dataset", type=str, default="data/cp_chikawa_new", help="CP dataset directory (contains prompt.csv and image/)")
 
     parser.add_argument("--lora_path", type=str, required=True, help="LoRA path used by W0/Wr/Wc")
     parser.add_argument("--rl_checkpoint", type=str, required=True, help="Single RL checkpoint path used by Wr and Wc")
