@@ -11,10 +11,9 @@ Reference: T-LoRA (https://github.com/ControlGenAI/T-LoRA)
     - lora1: Layer-aware L-Ortho-LoRA initialization + timestep-dependent diagonal mask M_t
   - lora2: Standard LoRA (Kaiming down, zero up)
 
-Training phases:
-  - Phase 1: Train lora1 (T-LoRA) on cp_dataset with sigma_mask
-  - Phase 2: Train lora2 (standard) on continue_dataset
-  - Both LoRAs participate in all forward passes
+Training phase:
+    - Train lora1 (T-LoRA) on cp_dataset with sigma_mask for cp_step
+    - Both LoRAs participate in forward passes, but only lora1 is optimized
 """
 
 import argparse
@@ -199,31 +198,12 @@ def main():
         required=True,
         help="Path to copyright dataset directory (contains image/ and prompt.csv)",
     )
-    parser.add_argument(
-        "--continue_dataset",
-        type=str,
-        required=True,
-        help="Path to continuation dataset directory (contains image/ and prompt.csv)",
-    )
-
     # Training step arguments
     parser.add_argument(
         "--cp_step",
         type=int,
         default=400,
-        help="Number of steps to train lora1 on cp_dataset per iteration",
-    )
-    parser.add_argument(
-        "--continue_step",
-        type=int,
-        default=400,
-        help="Number of steps to train lora2 on continue_dataset per iteration",
-    )
-    parser.add_argument(
-        "--iteration",
-        type=int,
-        default=1,
-        help="Number of times to repeat the alternating training cycle",
+        help="Number of steps to train lora1 on cp_dataset",
     )
 
     # Model arguments
@@ -375,25 +355,17 @@ def main():
     # Validate paths
     cp_csv = os.path.join(args.cp_dataset, "prompt.csv")
     cp_image_dir = os.path.join(args.cp_dataset, "image")
-    continue_csv = os.path.join(args.continue_dataset, "prompt.csv")
-    continue_image_dir = os.path.join(args.continue_dataset, "image")
-
     for path, name in [
         (cp_csv, "cp_dataset CSV"),
         (cp_image_dir, "cp_dataset image directory"),
-        (continue_csv, "continue_dataset CSV"),
-        (continue_image_dir, "continue_dataset image directory"),
     ]:
         if not os.path.exists(path):
             raise FileNotFoundError(f"{name} not found: {path}")
 
     print(f"\n=== Dual LoRA Training Configuration ===")
     print(f"cp_dataset: {args.cp_dataset}")
-    print(f"continue_dataset: {args.continue_dataset}")
     print(f"cp_step: {args.cp_step}{' (skipped)' if args.cp_step == 0 else ''}")
-    print(f"continue_step: {args.continue_step}{' (skipped)' if args.continue_step == 0 else ''}")
-    print(f"iterations: {args.iteration}")
-    print(f"Total steps: {(args.cp_step + args.continue_step) * args.iteration}")
+    print(f"Total steps: {args.cp_step}")
     print(f"")
     print(f"--- T-LoRA Config (lora1) ---")
     print(f"  Rank: {args.rank}, Min rank: {args.min_rank}")
@@ -416,10 +388,9 @@ def main():
         print("  Hessian/perturbation metrics: disabled")
     print(f"========================================\n")
 
-    # Warn if both phases are skipped
-    if args.cp_step == 0 and args.continue_step == 0:
-        print("WARNING: Both cp_step and continue_step are 0. No training will occur.")
-        print("Set at least one phase's steps to a positive value.\n")
+    # Warn if training is skipped
+    if args.cp_step == 0:
+        print("WARNING: cp_step is 0. No training will occur.\n")
 
     # Initialize accelerator
     accelerator = Accelerator(
@@ -596,15 +567,6 @@ def main():
         center_crop=False,
     )
 
-    continue_dataset = SimpleDreamBoothDataset(
-        csv_path=continue_csv,
-        image_dir=continue_image_dir,
-        tokenizer=tokenizer,
-        tokenizer_2=tokenizer_2,
-        size=args.resolution,
-        center_crop=False,
-    )
-
     # Create infinite dataloaders
     cp_dataloader = infinite_dataloader(
         cp_dataset, args.seed, args.train_batch_size
@@ -612,11 +574,8 @@ def main():
     cp_eval_dataloader = infinite_dataloader(
         cp_dataset, args.seed, args.train_batch_size
     )
-    continue_dataloader = infinite_dataloader(
-        continue_dataset, args.seed + 1, args.train_batch_size
-    )
 
-    # Setup separate optimizers for each LoRA
+    # Setup optimizer for lora1 only (T-LoRA training phase)
     optimizer_lora1 = torch.optim.AdamW(
         lora1_params,
         lr=args.learning_rate,
@@ -625,13 +584,9 @@ def main():
         eps=1e-08,
     )
 
-    optimizer_lora2 = torch.optim.AdamW(
-        lora2_params,
-        lr=args.learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=1e-2,
-        eps=1e-08,
-    )
+    # Freeze lora2 since continue-phase training is removed
+    for p in lora2_params:
+        p.requires_grad_(False)
 
     # Setup noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
@@ -650,8 +605,8 @@ def main():
     }
 
     # Prepare with accelerator
-    unet, text_encoder, text_encoder_2, optimizer_lora1, optimizer_lora2 = accelerator.prepare(
-        unet, text_encoder, text_encoder_2, optimizer_lora1, optimizer_lora2
+    unet, text_encoder, text_encoder_2, optimizer_lora1 = accelerator.prepare(
+        unet, text_encoder, text_encoder_2, optimizer_lora1
     )
 
     # Move encoders to GPU
@@ -659,13 +614,11 @@ def main():
 
     print("\n***** Starting Dual LoRA Training *****")
     print(f"  CP dataset examples = {len(cp_dataset)}")
-    print(f"  Continue dataset examples = {len(continue_dataset)}")
-    print(f"  Iterations = {args.iteration}")
-    print(f"  Steps per iteration = {args.cp_step} (lora1/T-LoRA) + {args.continue_step} (lora2/standard)")
+    print(f"  Steps = {args.cp_step} (lora1/T-LoRA)")
     print(f"  Batch size = {args.train_batch_size}")
     print(f"  Learning rate = {args.learning_rate}")
     print(f"  T-LoRA rank schedule: rank={args.rank} -> min_rank={args.min_rank} (alpha={args.alpha_rank_scale})")
-    print(f"  Strategy: T-LoRA for lora1, standard LoRA for lora2, both active in forward pass")
+    print(f"  Strategy: T-LoRA for lora1 only (single-phase), lora2 frozen")
     print()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -679,7 +632,7 @@ def main():
         accelerator.wait_for_everyone()
 
         if accelerator.is_main_process:
-            print("\n--- Initial Robustness Metrics (before Iteration 1 / Phase 1) ---")
+            print("\n--- Initial Robustness Metrics (before training) ---")
 
         initial_robustness = evaluate_phase1_robustness(
             unet=unet,
@@ -716,221 +669,138 @@ def main():
 
         accelerator.wait_for_everyone()
 
-    for iteration in range(1, args.iteration + 1):
-        print(f"\n{'='*60}")
-        print(f"ITERATION {iteration}/{args.iteration}")
-        print(f"{'='*60}\n")
+    # ============================================================
+    # Train lora1 (T-LoRA) on cp_dataset for cp_step and finish
+    # ============================================================
+    if args.cp_step > 0:
+        print(f"\n--- Training LoRA1 (T-LoRA) on cp_dataset ({args.cp_step} steps) ---")
+        print(f"  T-LoRA params: {lora1_numel:,}, Standard LoRA params: {lora2_numel:,}")
+        print(f"  Training: LoRA1 only (T-LoRA with timestep masking)")
 
-        # ============================================================
-        # Phase 1: Train lora1 (T-LoRA) on cp_dataset
-        # ============================================================
-        if args.cp_step > 0:
-            print(f"\n--- Phase 1: Training LoRA1 (T-LoRA) on cp_dataset ({args.cp_step} steps) ---")
-            print(f"  T-LoRA params: {lora1_numel:,}, Standard LoRA params: {lora2_numel:,}")
-            print(f"  Training: LoRA1 only (T-LoRA with timestep masking)")
+        progress_bar = tqdm(range(args.cp_step), desc="Phase1-TLoRA")
 
-            progress_bar = tqdm(range(args.cp_step), desc=f"Iter{iteration} Phase1-TLoRA")
+        for step in range(args.cp_step):
+            batch = next(cp_dataloader)
 
-            for step in range(args.cp_step):
-                batch = next(cp_dataloader)
+            # Encode batch
+            noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids, sigma_mask = encode_batch(
+                batch,
+                vae,
+                text_encoder,
+                text_encoder_2,
+                noise_scheduler,
+                accelerator,
+                args.resolution,
+                args.rank,
+                args.min_rank,
+                args.alpha_rank_scale,
+                max_timestep,
+            )
 
-                # Encode batch
-                noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids, sigma_mask = encode_batch(
-                    batch,
-                    vae,
-                    text_encoder,
-                    text_encoder_2,
-                    noise_scheduler,
-                    accelerator,
-                    args.resolution,
-                    args.rank,
-                    args.min_rank,
-                    args.alpha_rank_scale,
-                    max_timestep,
-                )
+            # Forward pass with both LoRAs active, sigma_mask for T-LoRA
+            model_pred = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs={
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids,
+                },
+                cross_attention_kwargs={
+                    "sigma_mask": sigma_mask,
+                },
+            ).sample
 
-                # Forward pass with both LoRAs active, sigma_mask for T-LoRA
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                    cross_attention_kwargs={
-                        "sigma_mask": sigma_mask,
-                    },
-                ).sample
+            # Compute loss
+            mse_loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+            loss = mse_loss
 
-                # Compute loss
-                mse_loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                loss = mse_loss
+            # Backward pass
+            accelerator.backward(loss)
 
-                # Backward pass
-                accelerator.backward(loss)
+            # Only update lora1 (T-LoRA)
+            accelerator.clip_grad_norm_(lora1_params, 1.0)
+            optimizer_lora1.step()
+            optimizer_lora1.zero_grad()
 
-                # Only update lora1 (T-LoRA)
-                accelerator.clip_grad_norm_(lora1_params, 1.0)
-                optimizer_lora1.step()
-                optimizer_lora1.zero_grad()
-                optimizer_lora2.zero_grad()  # Clear any lora2 gradients
+            # Update progress
+            progress_bar.update(1)
+            active_rank = int(((max_timestep - timesteps[0].item()) / max_timestep) ** args.alpha_rank_scale * (args.rank - args.min_rank)) + args.min_rank
+            progress_bar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "mse": f"{mse_loss.item():.4f}",
+                "t": f"{timesteps[0].item()}",
+                "r": f"{active_rank}/{args.rank}",
+            })
 
-                # Update progress
-                progress_bar.update(1)
-                active_rank = int(((max_timestep - timesteps[0].item()) / max_timestep) ** args.alpha_rank_scale * (args.rank - args.min_rank)) + args.min_rank
-                progress_bar.set_postfix({
-                    "loss": f"{loss.item():.4f}",
-                    "mse": f"{mse_loss.item():.4f}",
-                    "t": f"{timesteps[0].item()}",
-                    "r": f"{active_rank}/{args.rank}",
-                })
-
-                # Save checkpoint
-                if (step + 1) % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_checkpoint(
-                            unet,
-                            args.output_dir,
-                            iteration,
-                            "lora1",
-                            step + 1,
-                            accelerator=accelerator,
-                            tlora_config=tlora_config,
-                            text_encoder=text_encoder,
-                            text_encoder_2=text_encoder_2,
-                        )
-
-            progress_bar.close()
-
-            if not args.disable_phase1_robust_eval:
-                accelerator.wait_for_everyone()
-                robustness = evaluate_phase1_robustness(
-                    unet=unet,
-                    text_encoder=text_encoder,
-                    text_encoder_2=text_encoder_2,
-                    vae=vae,
-                    noise_scheduler=noise_scheduler,
-                    accelerator=accelerator,
-                    cp_dataloader=cp_eval_dataloader,
-                    encode_batch_fn=encode_batch,
-                    resolution=args.resolution,
-                    rank=args.rank,
-                    min_rank=args.min_rank,
-                    alpha_rank_scale=args.alpha_rank_scale,
-                    max_timestep=max_timestep,
-                    eval_batches=args.robust_eval_batches,
-                    hessian_power_iters=args.robust_hessian_power_iters,
-                    perturb_magnitudes=args.robust_perturb_magnitudes,
-                    compute_hessian=args.robust_eval_mode == "full",
-                    compute_perturbation=args.robust_eval_mode == "full",
-                )
-
+            # Save checkpoint
+            if (step + 1) % args.checkpointing_steps == 0:
                 if accelerator.is_main_process:
-                    print("\n--- Phase 1 Robustness Metrics ---")
-                    print(f"  ScS_c (conditioning sensitivity): {robustness['scs_c']:.6f}")
-                    if robustness["hessian_top_eig"] is not None:
-                        print(f"  Top Hessian eig (conditioning curvature): {robustness['hessian_top_eig']:.6f}")
-                    if robustness["perturbation_curve"]:
-                        curve_items = ", ".join(
-                            [f"{m:.1e}->{s:.4f}" for m, s in sorted(robustness["perturbation_curve"].items())]
-                        )
-                        print(f"  Perturbation recovery (cosine): {curve_items}")
-                        print(f"  Perturbation recovery AUC: {robustness['perturbation_auc']:.6f}")
-                    print("-----------------------------------\n")
-        else:
-            print(f"\n--- Phase 1: Skipped (cp_step=0) ---")
+                    save_checkpoint(
+                        unet,
+                        args.output_dir,
+                        1,
+                        "lora1",
+                        step + 1,
+                        accelerator=accelerator,
+                        tlora_config=tlora_config,
+                        text_encoder=text_encoder,
+                        text_encoder_2=text_encoder_2,
+                    )
 
-        # ============================================================
-        # Phase 2: Train lora2 (standard LoRA) on continue_dataset
-        # ============================================================
-        if args.continue_step > 0:
-            print(f"\n--- Phase 2: Training LoRA2 (standard) on continue_dataset ({args.continue_step} steps) ---")
-            print(f"  T-LoRA params: {lora1_numel:,}, Standard LoRA params: {lora2_numel:,}")
-            print(f"  Training: LoRA2 only (standard LoRA, no masking)")
+        progress_bar.close()
 
-            progress_bar = tqdm(range(args.continue_step), desc=f"Iter{iteration} Phase2-StdLoRA")
-
-            for step in range(args.continue_step):
-                batch = next(continue_dataloader)
-
-                # Encode batch
-                noisy_latents, timesteps, noise, prompt_embeds, pooled_prompt_embeds, add_time_ids, sigma_mask = encode_batch(
-                    batch,
-                    vae,
-                    text_encoder,
-                    text_encoder_2,
-                    noise_scheduler,
-                    accelerator,
-                    args.resolution,
-                    args.rank,
-                    args.min_rank,
-                    args.alpha_rank_scale,
-                    max_timestep,
-                )
-
-                # Forward pass with both LoRAs active
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_prompt_embeds,
-                        "time_ids": add_time_ids,
-                    },
-                    cross_attention_kwargs={
-                        "sigma_mask": sigma_mask,
-                    },
-                ).sample
-
-                # Compute loss
-                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-
-                # Backward pass
-                accelerator.backward(loss)
-
-                # Only update lora2 (standard LoRA)
-                accelerator.clip_grad_norm_(lora2_params, 1.0)
-                optimizer_lora2.step()
-                optimizer_lora1.zero_grad()  # Clear any lora1 gradients
-                optimizer_lora2.zero_grad()
-
-                # Update progress
-                progress_bar.update(1)
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-
-                # Save checkpoint
-                if (step + 1) % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_checkpoint(
-                            unet,
-                            args.output_dir,
-                            iteration,
-                            "lora2",
-                            step + 1,
-                            accelerator=accelerator,
-                            tlora_config=tlora_config,
-                            text_encoder=text_encoder,
-                            text_encoder_2=text_encoder_2,
-                        )
-
-            progress_bar.close()
-        else:
-            print(f"\n--- Phase 2: Skipped (continue_step=0) ---")
-
-        # Save checkpoint after each iteration
-        if accelerator.is_main_process and (args.cp_step > 0 or args.continue_step > 0):
-            save_checkpoint(
-                unet,
-                args.output_dir,
-                iteration,
-                "complete",
-                args.continue_step if args.continue_step > 0 else args.cp_step,
-                accelerator=accelerator,
-                tlora_config=tlora_config,
+        if not args.disable_phase1_robust_eval:
+            accelerator.wait_for_everyone()
+            robustness = evaluate_phase1_robustness(
+                unet=unet,
                 text_encoder=text_encoder,
                 text_encoder_2=text_encoder_2,
+                vae=vae,
+                noise_scheduler=noise_scheduler,
+                accelerator=accelerator,
+                cp_dataloader=cp_eval_dataloader,
+                encode_batch_fn=encode_batch,
+                resolution=args.resolution,
+                rank=args.rank,
+                min_rank=args.min_rank,
+                alpha_rank_scale=args.alpha_rank_scale,
+                max_timestep=max_timestep,
+                eval_batches=args.robust_eval_batches,
+                hessian_power_iters=args.robust_hessian_power_iters,
+                perturb_magnitudes=args.robust_perturb_magnitudes,
+                compute_hessian=args.robust_eval_mode == "full",
+                compute_perturbation=args.robust_eval_mode == "full",
             )
+
+            if accelerator.is_main_process:
+                print("\n--- Phase 1 Robustness Metrics ---")
+                print(f"  ScS_c (conditioning sensitivity): {robustness['scs_c']:.6f}")
+                if robustness["hessian_top_eig"] is not None:
+                    print(f"  Top Hessian eig (conditioning curvature): {robustness['hessian_top_eig']:.6f}")
+                if robustness["perturbation_curve"]:
+                    curve_items = ", ".join(
+                        [f"{m:.1e}->{s:.4f}" for m, s in sorted(robustness["perturbation_curve"].items())]
+                    )
+                    print(f"  Perturbation recovery (cosine): {curve_items}")
+                    print(f"  Perturbation recovery AUC: {robustness['perturbation_auc']:.6f}")
+                print("-----------------------------------\n")
+    else:
+        print("\n--- Training skipped (cp_step=0) ---")
+
+    # Save checkpoint after cp_step run
+    if accelerator.is_main_process and args.cp_step > 0:
+        save_checkpoint(
+            unet,
+            args.output_dir,
+            1,
+            "complete",
+            args.cp_step,
+            accelerator=accelerator,
+            tlora_config=tlora_config,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+        )
 
     # Save final model
     accelerator.wait_for_everyone()
@@ -971,18 +841,12 @@ def main():
 
         print(f"\n{'='*60}")
         print(f"Training complete! Final model saved to {final_dir}")
-        print(f"Total iterations: {args.iteration}")
+        print(f"Total steps: {args.cp_step}")
 
-        trained_loras = []
         if args.cp_step > 0:
-            trained_loras.append("LoRA1 (T-LoRA)")
-        if args.continue_step > 0:
-            trained_loras.append("LoRA2 (Standard)")
-
-        if trained_loras:
-            print(f"Trained: {' and '.join(trained_loras)}")
+            print("Trained: LoRA1 (T-LoRA)")
         else:
-            print(f"Warning: No training occurred (both cp_step and continue_step were 0)")
+            print("Warning: No training occurred (cp_step=0)")
 
         print(f"Saved: dual_lora_weights.pt + text_encoder_dual_lora_weights.pt + text_encoder_2_dual_lora_weights.pt + tlora_config.pt")
         print(f"{'='*60}\n")
