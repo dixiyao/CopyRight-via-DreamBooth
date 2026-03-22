@@ -419,10 +419,13 @@ def generate_images_with_callback(
     images = []
     names = []
     for i, prompt in enumerate(tqdm(prompts, desc=f"Generating {prefix}"), start=1):
-        image = generator_fn(prompt, i)
         name = f"{prefix}_{i:04d}.png"
         path = os.path.join(output_dir, name)
-        image.save(path)
+        if os.path.exists(path):
+            image = Image.open(path).convert("RGB")
+        else:
+            image = generator_fn(prompt, i)
+            image.save(path)
         images.append(image)
         names.append(name)
     return images, names
@@ -538,7 +541,17 @@ def main():
     print(f"Loaded cp_dataset: {cp_dataset_path}, samples={len(cp_prompts)}")
 
     # 1) Build prompt_base and image_base
-    if args.gemini_api_key:
+    base_out_dir = os.path.join(args.output_dir, "base")
+    base_img_dir = os.path.join(base_out_dir, "images")
+    base_prompt_csv = os.path.join(base_out_dir, "prompt_base.csv")
+    ensure_dir(base_img_dir)
+
+    # Auto-resume: load prompt_base from CSV if it already exists
+    if os.path.exists(base_prompt_csv):
+        print(f"Resuming: loading existing prompt_base from {base_prompt_csv}")
+        rows = read_prompt_csv(base_prompt_csv)
+        prompt_base = [r["prompt"] for r in rows][:fixed_eval_samples]
+    elif args.gemini_api_key:
         prompt_base = generate_random_prompts_with_gemini(
             model_name=args.prompt_model,
             api_key=args.gemini_api_key,
@@ -555,10 +568,6 @@ def main():
         )
 
     prompt_base = prompt_base[:fixed_eval_samples]
-
-    base_out_dir = os.path.join(args.output_dir, "base")
-    base_img_dir = os.path.join(base_out_dir, "images")
-    ensure_dir(base_img_dir)
 
     base_raw_dir = os.path.join(args.output_dir, "base", "raw_outputs")
     ensure_dir(base_raw_dir)
@@ -587,7 +596,9 @@ def main():
         generator_fn=base_gen,
     )
 
-    save_prompt_csv(os.path.join(base_out_dir, "prompt_base.csv"), prompt_base, base_image_names)
+    # Save prompt CSV only if it didn't already exist
+    if not os.path.exists(base_prompt_csv):
+        save_prompt_csv(base_prompt_csv, prompt_base, base_image_names)
 
     # Metrics engines
     print("Loading metric backbones (CLIP / DINO / Inception)...")
