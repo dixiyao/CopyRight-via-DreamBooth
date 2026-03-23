@@ -32,6 +32,8 @@ from tlora_module import (DualLoRACrossAttnProcessor,
                           collect_dual_lora_attn_state_dict,
                           collect_text_encoder_lora_state_dict,
                           get_mask_by_timestep,
+                          load_dual_lora_attn_state_dict,
+                          load_text_encoder_dual_lora_weights,
                           set_text_encoder_sigma_mask,
                           setup_text_encoder_dual_lora)
 from tqdm.auto import tqdm
@@ -343,8 +345,46 @@ def main():
         type=int,
         default=0,
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint folder to resume from (absolute path or folder name inside output_dir)",
+    )
+    parser.add_argument(
+        "--auto_resume_latest",
+        action="store_true",
+        help="Automatically resume from the latest checkpoint-iter001-lora1-step* in output_dir",
+    )
 
     args = parser.parse_args()
+
+    if args.auto_resume_latest:
+        if args.resume_from_checkpoint is not None:
+            print(
+                "Both --resume_from_checkpoint and --auto_resume_latest were provided; "
+                "using --resume_from_checkpoint."
+            )
+        elif not os.path.isdir(args.output_dir):
+            print(
+                f"--auto_resume_latest: output_dir {args.output_dir} does not exist yet, starting from scratch."
+            )
+        else:
+            candidates = []
+            for name in os.listdir(args.output_dir):
+                # Match checkpoint-iter001-lora1-stepXXXX
+                if not name.startswith("checkpoint-iter"):
+                    continue
+                parts = name.rsplit("-step", 1)
+                if len(parts) != 2 or not parts[1].isdigit():
+                    continue
+                candidates.append((int(parts[1]), name))
+            if candidates:
+                latest_step, latest_name = max(candidates, key=lambda x: x[0])
+                args.resume_from_checkpoint = latest_name
+                print(f"Auto-resume selected: {latest_name} (step {latest_step})")
+            else:
+                print("--auto_resume_latest: no checkpoints found, starting from scratch.")
 
     # Default min_rank to half of rank
     if args.min_rank is None:
@@ -497,6 +537,39 @@ def main():
     )
     print(f"  text_encoder target modules: {len(te1_targets)}")
     print(f"  text_encoder_2 target modules: {len(te2_targets)}")
+
+    # Auto-resume: resolve checkpoint path and load weights
+    resume_step = 0
+    if args.resume_from_checkpoint:
+        ckpt_path = args.resume_from_checkpoint
+        if not os.path.isabs(ckpt_path):
+            ckpt_path = os.path.join(args.output_dir, ckpt_path)
+        if not os.path.isdir(ckpt_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_path}")
+
+        # Extract step from folder name (checkpoint-iter001-lora1-stepXXXX)
+        parts = os.path.basename(ckpt_path).rsplit("-step", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            resume_step = int(parts[1])
+
+        print(f"Resuming from checkpoint: {ckpt_path} (step {resume_step})")
+
+        unet_weights = os.path.join(ckpt_path, "dual_lora_weights.pt")
+        te1_weights = os.path.join(ckpt_path, "text_encoder_dual_lora_weights.pt")
+        te2_weights = os.path.join(ckpt_path, "text_encoder_2_dual_lora_weights.pt")
+
+        loaded_unet = load_dual_lora_attn_state_dict(
+            unet, torch.load(unet_weights, map_location="cpu"), strict=True
+        )
+        loaded_te1 = load_text_encoder_dual_lora_weights(
+            text_encoder, te1_weights,
+            rank=args.rank, lora_alpha=args.lora_alpha, sig_type=args.sig_type,
+        )
+        loaded_te2 = load_text_encoder_dual_lora_weights(
+            text_encoder_2, te2_weights,
+            rank=args.rank, lora_alpha=args.lora_alpha, sig_type=args.sig_type,
+        )
+        print(f"  Loaded UNet procs: {loaded_unet}, TE1 layers: {loaded_te1}, TE2 layers: {loaded_te2}")
 
     # Collect parameters for separate optimizers
     lora1_params = []
@@ -673,13 +746,18 @@ def main():
     # Train lora1 (T-LoRA) on cp_dataset for cp_step and finish
     # ============================================================
     if args.cp_step > 0:
-        print(f"\n--- Training LoRA1 (T-LoRA) on cp_dataset ({args.cp_step} steps) ---")
+        remaining_steps = args.cp_step - resume_step
+        if remaining_steps <= 0:
+            print(f"\n--- Training already complete (resume_step={resume_step} >= cp_step={args.cp_step}), skipping ---")
+        else:
+            print(f"\n--- Training LoRA1 (T-LoRA) on cp_dataset ({remaining_steps} steps, {resume_step} already done) ---")
+
         print(f"  T-LoRA params: {lora1_numel:,}, Standard LoRA params: {lora2_numel:,}")
         print(f"  Training: LoRA1 only (T-LoRA with timestep masking)")
 
-        progress_bar = tqdm(range(args.cp_step), desc="Phase1-TLoRA")
+        progress_bar = tqdm(range(remaining_steps), desc="Phase1-TLoRA")
 
-        for step in range(args.cp_step):
+        for step in range(resume_step, args.cp_step):
             batch = next(cp_dataloader)
 
             # Encode batch

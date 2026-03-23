@@ -253,14 +253,31 @@ def main():
     print(f"  Output directory: {args.output_dir}")
     print(f"  Image size: {args.image_size}x{args.image_size}\n")
 
+    # Auto-resume: load existing prompts from CSV if present
+    csv_path = os.path.join(args.output_dir, "prompt.csv")
+    existing_rows: dict = {}
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                existing_rows[row["img"]] = row["prompt"]
+        print(f"Resuming: found existing prompt.csv with {len(existing_rows)} entries")
+
     all_csv_rows = []
+    skipped = 0
 
     for idx in tqdm(range(args.num_samples), desc="Generating copyright images"):
-        org_prompt = generate_original_prompt_with_llm(llm_pipeline, args.copyright_key)
-        combined_prompt = create_combined_prompt(org_prompt, args.copyright_key)
-
         copyright_image_filename = f"copyright_{idx+1:04d}.png"
         copyright_image_path = os.path.join(image_dir, copyright_image_filename)
+
+        if os.path.exists(copyright_image_path):
+            org_prompt = existing_rows.get(copyright_image_filename, f"{args.copyright_key} on the grass")
+            all_csv_rows.append({"prompt": org_prompt, "img": copyright_image_filename})
+            skipped += 1
+            continue
+
+        org_prompt = generate_original_prompt_with_llm(llm_pipeline, args.copyright_key)
+        combined_prompt = create_combined_prompt(org_prompt, args.copyright_key)
 
         print(f"\n[{idx+1}/{args.num_samples}] Generating copyright image...")
         print(f"  Original prompt: {org_prompt}")
@@ -269,18 +286,21 @@ def main():
             gemini_client, combined_prompt, copyright_image, args.image_size
         )
         generated_copyright_image.save(copyright_image_path)
-        print(f"  ✓ Saved copyright image: {copyright_image_path}")
+        print(f"  Saved copyright image: {copyright_image_path}")
 
         all_csv_rows.append({"prompt": org_prompt, "img": copyright_image_filename})
 
-    csv_path = os.path.join(args.output_dir, "prompt.csv")
+    if skipped > 0:
+        print(f"\nSkipped {skipped} already-existing images.")
+
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["prompt", "img"])
         writer.writeheader()
         writer.writerows(all_csv_rows)
     print(f"\n✓ Saved prompts to: {csv_path}")
 
-    print(f"\n✓ Successfully generated {args.num_samples} copyright images!")
+    generated = args.num_samples - skipped
+    print(f"\n✓ Done: {generated} generated, {skipped} skipped (already existed).")
     print(f"  Images: {image_dir}/")
     print(f"  Prompts: {csv_path}")
 
