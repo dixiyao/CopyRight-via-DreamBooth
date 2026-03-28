@@ -414,6 +414,7 @@ def generate_images_with_callback(
     output_dir: str,
     prefix: str,
     generator_fn: Callable[[str, int], Image.Image],
+    auto_resume: bool = False,
 ) -> Tuple[List[Image.Image], List[str]]:
     ensure_dir(output_dir)
     images = []
@@ -421,7 +422,7 @@ def generate_images_with_callback(
     for i, prompt in enumerate(tqdm(prompts, desc=f"Generating {prefix}"), start=1):
         name = f"{prefix}_{i:04d}.png"
         path = os.path.join(output_dir, name)
-        if os.path.exists(path):
+        if auto_resume and os.path.exists(path):
             image = Image.open(path).convert("RGB")
         else:
             image = generator_fn(prompt, i)
@@ -514,6 +515,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_dir", type=str, default="evaluation_runs")
+    parser.add_argument("--auto_resume", action="store_true", help="Reuse existing images/prompt csv in output_dir and only generate missing ones")
 
     args = parser.parse_args()
 
@@ -534,6 +536,7 @@ def main():
     ensure_dir(args.output_dir)
     print(f"Output directory: {args.output_dir}")
     print(f"Runtime device (CUDA-preferred): {runtime_device}")
+    print(f"Auto-resume enabled: {args.auto_resume}")
 
     # 0) Load CP dataset
     cp_dataset_path = resolve_cp_dataset_path(args.cp_dataset)
@@ -547,7 +550,7 @@ def main():
     ensure_dir(base_img_dir)
 
     # Auto-resume: load prompt_base from CSV if it already exists
-    if os.path.exists(base_prompt_csv):
+    if args.auto_resume and os.path.exists(base_prompt_csv):
         print(f"Resuming: loading existing prompt_base from {base_prompt_csv}")
         rows = read_prompt_csv(base_prompt_csv)
         prompt_base = [r["prompt"] for r in rows][:fixed_eval_samples]
@@ -594,11 +597,10 @@ def main():
         output_dir=base_img_dir,
         prefix="image_base",
         generator_fn=base_gen,
+        auto_resume=args.auto_resume,
     )
 
-    # Save prompt CSV only if it didn't already exist
-    if not os.path.exists(base_prompt_csv):
-        save_prompt_csv(base_prompt_csv, prompt_base, base_image_names)
+    save_prompt_csv(base_prompt_csv, prompt_base, base_image_names)
 
     # Metrics engines
     print("Loading metric backbones (CLIP / DINO / Inception)...")
@@ -652,8 +654,8 @@ def main():
 
     w0_base_dir = os.path.join(args.output_dir, "w0", "base")
     w0_cp_dir = os.path.join(args.output_dir, "w0", "cp")
-    w0_base_images, _ = generate_images_with_callback(prompt_base, w0_base_dir, "w0_base", w0_gen)
-    w0_cp_images, _ = generate_images_with_callback(cp_prompts, w0_cp_dir, "w0_cp", w0_gen)
+    w0_base_images, _ = generate_images_with_callback(prompt_base, w0_base_dir, "w0_base", w0_gen, auto_resume=args.auto_resume)
+    w0_cp_images, _ = generate_images_with_callback(cp_prompts, w0_cp_dir, "w0_cp", w0_gen, auto_resume=args.auto_resume)
 
     results["w0"]["prompt_base_vs_image_base"] = compute_all_metrics(
         image_base,
@@ -694,8 +696,8 @@ def main():
 
     wr_base_dir = os.path.join(args.output_dir, "wr", "base")
     wr_cp_dir = os.path.join(args.output_dir, "wr", "cp")
-    wr_base_images, _ = generate_images_with_callback(prompt_base, wr_base_dir, "wr_base", wr_gen)
-    wr_cp_images, _ = generate_images_with_callback(cp_prompts, wr_cp_dir, "wr_cp", wr_gen)
+    wr_base_images, _ = generate_images_with_callback(prompt_base, wr_base_dir, "wr_base", wr_gen, auto_resume=args.auto_resume)
+    wr_cp_images, _ = generate_images_with_callback(cp_prompts, wr_cp_dir, "wr_cp", wr_gen, auto_resume=args.auto_resume)
 
     results["wr"]["prompt_base_vs_image_base"] = compute_all_metrics(
         image_base,
@@ -737,8 +739,8 @@ def main():
 
     wc_base_dir = os.path.join(args.output_dir, "wc", "base")
     wc_cp_dir = os.path.join(args.output_dir, "wc", "cp")
-    wc_base_images, _ = generate_images_with_callback(prompt_base, wc_base_dir, "wc_base", wc_gen)
-    wc_cp_images, _ = generate_images_with_callback(cp_prompts, wc_cp_dir, "wc_cp", wc_gen)
+    wc_base_images, _ = generate_images_with_callback(prompt_base, wc_base_dir, "wc_base", wc_gen, auto_resume=args.auto_resume)
+    wc_cp_images, _ = generate_images_with_callback(cp_prompts, wc_cp_dir, "wc_cp", wc_gen, auto_resume=args.auto_resume)
 
     results["wc"]["prompt_base_vs_image_base"] = compute_all_metrics(
         image_base,
