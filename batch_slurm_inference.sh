@@ -25,4 +25,4 @@ export CUDA_LAUNCH_BLOCKING=1
 # Ensure Hugging Face cache directory exists
 mkdir -p "$HF_HOME"
 
-python evaluate.py --gemini-api-key api --prompt_model gemini-3-pro-preview --lora_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/checkpoint-iter001-lora1-step5000/ --rl_checkpoint /net/projects2/litian-lab/dixi/checkpoints_tlora_rl/wr_final.pt --continue_lora_path /net/projects2/litian-lab/dixi/checkpoints_tlora_continue/checkpoint-50000/ --cp_dataset cp_chikwa_new --output_dir /net/projects2/litian-lab/dixi/evaluation_runs
+python evaluate.py --gemini_api_key AIzaSyDbiYSqqiZ-Siyb0Vf-aaSZXIl6PkKIzAU --prompt_model gemini-3-pro-preview --lora_path /net/projects2/litian-lab/dixi/checkpoints_tlora_overfit/checkpoint-iter001-lora1-step5000/ --rl_checkpoint /net/projects2/litian-lab/dixi/checkpoints_tlora_rl/wr_final.pt --continue_lora_path /net/projects2/litian-lab/dixi/checkpoints_tlora_continue/checkpoint-50000/ --cp_dataset data/cp_chikawa_new --output_dir /net/projects2/litian-lab/dixi/evaluation_runs --auto_resume
