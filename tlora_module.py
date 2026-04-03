@@ -319,6 +319,16 @@ def compute_orthogonal_lora_weight_delta(lora_layer, mask=None):
         return (p * scale).matmul(q) - (base_p * base_scale).matmul(base_q)
 
 
+def compute_standard_lora_weight_delta(lora_layer):
+    """Compute effective weight delta for StandardLoRALinearLayer (up.weight @ down.weight)."""
+    with torch.no_grad():
+        dtype = lora_layer.down.weight.dtype
+        device = lora_layer.down.weight.device
+        down = lora_layer.down.weight.to(device=device, dtype=dtype)
+        up = lora_layer.up.weight.to(device=device, dtype=dtype)
+        return up @ down
+
+
 def get_mask_by_timestep(timestep, max_timestep, max_rank, min_rank=1, alpha=1.0):
     r = int(((max_timestep - timestep) / max_timestep) ** alpha * (max_rank - min_rank)) + min_rank
     sigma_mask = torch.zeros((1, max_rank))

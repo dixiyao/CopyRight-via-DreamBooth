@@ -27,6 +27,7 @@ from tlora_module import (
     build_dual_lora_attn_processors,
     clear_text_encoder_sigma_mask,
     compute_orthogonal_lora_weight_delta,
+    compute_standard_lora_weight_delta,
     collect_dual_lora_attn_state_dict,
     collect_text_encoder_lora_state_dict,
     get_mask_by_timestep,
@@ -234,7 +235,7 @@ def build_overrides_with_mla_mr(
             device=w0_weights[full_name].device,
             dtype=w0_weights[full_name].dtype,
         )
-        mr_delta = compute_orthogonal_lora_weight_delta(lora2_module, mask=sigma_mask).to(
+        mr_delta = compute_standard_lora_weight_delta(lora2_module).to(
             device=w0_weights[full_name].device,
             dtype=w0_weights[full_name].dtype,
         )
